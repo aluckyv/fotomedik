@@ -297,6 +297,29 @@ def main():
 
 
 @main.command()
+@click.argument("repaired", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("truth", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--picture", type=click.Path(path_type=Path), help="save truth | repaired | error map here (PNG/JPEG)")
+@click.option("--runs", is_flag=True, help="list the runs of decoded MCUs that are wrong")
+def compare(repaired: Path, truth: Path, picture: Path | None, runs: bool):
+    """Measure a repair against an intact copy of the same picture (see fotomedik.compare).
+    Uses the .report.json next to REPAIRED (written with --reports) to tell holes from decoded parts."""
+    from . import compare as C
+
+    rep = C.report_for(repaired)
+    cmp = C.compare(repaired, truth, rep)
+    click.echo(cmp.format_text())
+    if rep is None:
+        click.echo("(no .report.json next to the repaired photo: holes and decoded parts not told apart)")
+    if runs:
+        for r, c0, c1, e in cmp.wrong_runs():
+            click.echo(f"  wrong: row {r}, MCUs {c0}-{c1 - 1}, error {e:.1f}")
+    if picture:
+        C.side_by_side(repaired, truth, cmp).save(picture)
+        click.echo(f"picture: {picture}")
+
+
+@main.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
 def scan(path: Path, lang: str):

@@ -360,8 +360,15 @@ class MainWindow(QMainWindow):
         self.stepsb.setToolTip("How this photo was recovered: the picture after every repair step")
         self.stepsb.setEnabled(False)
         self.stepsb.clicked.connect(self._show_steps)
+        self.cmpb = QPushButton("Compare with the original…")
+        self.cmpb.setToolTip("Have an intact copy of this photo (another backup, an edited copy)?\n"
+                             "Measures the repair against it: which decoded parts are right, how far the\n"
+                             "filled holes are from the truth, with a map of the error.")
+        self.cmpb.setEnabled(False)
+        self.cmpb.clicked.connect(self._compare)
         tools.addWidget(self.stepsb)
         tools.addWidget(self.handb)
+        tools.addWidget(self.cmpb)
         tools.addStretch(1)
         rl.addLayout(tools)
         self.report = QPlainTextEdit()
@@ -523,6 +530,7 @@ class MainWindow(QMainWindow):
         r = self.results[idx]
         self.selected = r
         self.handb.setEnabled(r.output is not None)
+        self.cmpb.setEnabled(r.output is not None)
         self.stepsb.setEnabled(True)
         self.before.show_image(load_preview(r.source), "Does not open in a normal viewer")
         self.after.show_image(load_preview(r.output) if r.output else None, "Nothing could be saved")
@@ -561,6 +569,24 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, f"This photo cannot be edited by hand: {e}")
             return
         self.manual = dlg
+        dlg.show()
+
+    def _compare(self) -> None:
+        r = getattr(self, "selected", None)
+        if r is None or r.output is None:
+            return
+        f, _ = QFileDialog.getOpenFileName(self, f"Intact copy of {r.source.name}", str(r.source.parent),
+                                           "Photos (*.jpg *.jpeg *.png *.tif *.tiff);;All files (*)")
+        if not f:
+            return
+        from .compare_dialog import CompareDialog
+
+        try:
+            dlg = CompareDialog(self, r, Path(f))
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, f"The photos cannot be compared: {e}")
+            return
+        self.compare_dlg = dlg
         dlg.show()
 
     def _open_output(self) -> None:
