@@ -57,6 +57,7 @@ class Interval:
     decoded: int = 0  # MCUs decoded cleanly
     ok: bool = False
     error: DecodeError | None = None
+    resync_at: int | None = None  # for a failed interval: offset of the RST marker decoding resumed at
 
 
 @dataclass
@@ -191,6 +192,30 @@ def _hamming(a: int, b: int) -> int:
 # --------------------------------------------------------------------------- main entry
 
 
+def preds_before_mcu(sr: ScanResult, ft: FrameTables, mcu_index: int) -> dict[int, int]:
+    """DC predictor state right before `mcu_index`, from a previous decode of the same scan.
+
+    Within a restart interval the predictor is the DC of the last block of the
+    previous MCU per component; at an interval start it is zero.
+    """
+    frame, scan = ft.frame, ft.scan
+    dri = ft.restart_interval
+    comps = [frame.component(sc.id) for sc in scan.components]
+    interleaved = len(comps) > 1
+    if mcu_index == 0 or (dri and mcu_index % dri == 0):
+        return {c.id: 0 for c in comps}
+    prev = mcu_index - 1
+    out: dict[int, int] = {}
+    for c in comps:
+        h, v = (c.h, c.v) if interleaved else (1, 1)
+        arr = sr.dc[c.id]
+        per_row = arr.shape[1] // h
+        mrow, mcol = divmod(prev, per_row)
+        val = arr[mrow * v + v - 1, mcol * h + h - 1]
+        out[c.id] = 0 if np.isnan(val) else int(val)
+    return out
+
+
 def decode_scan(
     data: bytes,
     parse: M.ParseResult,
@@ -199,6 +224,8 @@ def decode_scan(
     end_byte: int | None = None,
     first_mcu: int = 0,
     max_mcus: int | None = None,
+    start_bit: int = 0,
+    init_preds: dict[int, int] | None = None,
 ) -> ScanResult:
     frame = ft.frame
     if frame.progressive or frame.marker not in (0xC0, 0xC1):
@@ -226,9 +253,12 @@ def decode_scan(
     first_error: DecodeError | None = None
 
     br = BitReader(data, start, end)
+    if start_bit:
+        br.read_bits(start_bit)
     mcu = first_mcu
     iv_index = first_mcu // dri if dri else 0
     pred = {c.cid: 0 for c in comps}
+    resume_preds = dict(init_preds) if init_preds else None
 
     def block(c: _Comp, brow: int, bcol: int) -> None:
         t = _decode_symbol(br, c.dc_t, c.dc_fast)
@@ -263,9 +293,14 @@ def decode_scan(
         iv_count = min(dri, limit - mcu) if dri else (limit - mcu)
         if dri and (iv_first // dri + 1) * dri < total:
             iv_count = min(iv_count, (iv_first // dri + 1) * dri - iv_first)
-        iv = Interval(iv_index, iv_first, iv_count, br.byte_pos)
-        for cid in pred:
-            pred[cid] = 0
+        iv_start_off, iv_start_bit = br.tell()
+        iv = Interval(iv_index, iv_first, iv_count, iv_start_off)
+        if resume_preds is not None:
+            pred.update(resume_preds)  # resuming mid-interval: predictors carried in
+            resume_preds = None
+        else:
+            for cid in pred:
+                pred[cid] = 0
         err: DecodeError | None = None
         stop = False
         try:
@@ -334,27 +369,47 @@ def decode_scan(
                 if not dri:
                     iv.byte_end = end if parse.eoi_offset is None or end_byte is not None else parse.eoi_offset
                     break
-            # Resync: find next RST marker and work out which interval it closes.
-            hit = _find_rst(data, max(err.byte_offset, iv.byte_start + 1), end)
+            # Resync: find the next RST marker and work out which interval it closes.
+            # A flipped bit can also *create* a fake FF Dn; a marker whose sequence
+            # number does not fit the byte distance is skipped.
+            done = [x for x in intervals if x.ok and x.byte_end is not None and x.mcu_count == dri]
+            if done:
+                avg = sum(x.byte_end - x.byte_start for x in done) / len(done)
+            else:
+                avg = max(1.0, (end - start) / max(1, -(-total // dri)))
+            k = iv_index
+            search_from = max(err.byte_offset, iv.byte_start + 1)
+            hit = None
+            j = k
+            while True:
+                found = _find_rst(data, search_from, end)
+                if found is None:
+                    break
+                n, moff = found
+                spans_est = max(1.0, (moff - iv.byte_start) / avg)
+                base = k + ((n - k) % 8)
+                cands = sorted(
+                    (abs((c - k + 1) - spans_est) / spans_est, c) for c in (base, base + 8, base + 16, base + 24)
+                )
+                rel_err, cand = cands[0]
+                plausible = rel_err <= 0.6 or (cand == k and (moff - iv.byte_start) <= 3 * avg)
+                if plausible and (cand + 1) * dri < total:
+                    # A flipped bit can create a fake FF Dn inside the data: the bytes after a
+                    # real marker decode cleanly for a few MCUs, those after a fake one rarely do.
+                    probe = decode_scan(data, parse, ft, start_byte=moff + 2, end_byte=end,
+                                        first_mcu=(cand + 1) * dri, max_mcus=min(3, dri))
+                    if probe.error is not None and probe.error.reason != "eof":
+                        plausible = False
+                if plausible:
+                    hit, j = found, cand
+                    break
+                search_from = moff + 2  # implausible: probably a fake marker, keep looking
             if hit is None:
                 iv.byte_end = end if end_byte is not None else (parse.eoi_offset or end)
                 break
             n, moff = hit
             iv.byte_end = moff if iv.byte_end is None else iv.byte_end
-            k = iv_index
-            j = k + ((n - k) % 8)
-            # choose among j, j+8, j+16 by byte distance plausibility
-            done = [x for x in intervals if x.ok and x.byte_end is not None]
-            if done:
-                avg = sum(x.byte_end - x.byte_start for x in done) / len(done)
-            else:
-                avg = max(1.0, (end - start) / max(1, -(-total // dri)))
-            best_j, best_d = j, abs((moff - iv.byte_start) - (j - k + 1) * avg)
-            for cand in (j + 8, j + 16):
-                d = abs((moff - iv.byte_start) - (cand - k + 1) * avg)
-                if d < best_d:
-                    best_j, best_d = cand, d
-            j = best_j
+            iv.resync_at = moff
             # intervals k+1..j are lost
             for skipped in range(k + 1, j + 1):
                 sf = skipped * dri
