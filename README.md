@@ -16,6 +16,13 @@ py -m venv .venv
 pip install -e ".[dev]"
 ```
 
+### Brzi dekoder (preporučeno)
+
+Jezgro dekodera postoji i kao C kernel (`fotomedik/jpeg/_fastdec.c`), ~15× brže od čistog
+Pythona — bez njega sve radi, samo sporije. Kompajliranje: `python build_fastdec.py`
+(treba gcc/clang/MSVC). Na Windows-u bez kompajlera: skini `_fastdec.dll` iz
+GitHub Actions artefakata (workflow *build*) i stavi ga u `fotomedik/jpeg/`.
+
 ## Upotreba
 
 ```

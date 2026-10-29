@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: python build_fastdec.py
+      - run: pytest -q
+      - name: tests also pass with the pure-Python decoder
+        run: FOTOMEDIK_PURE=1 pytest -q
+
+  dll-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: build _fastdec.dll (mingw gcc ships with the runner)
+        run: python build_fastdec.py
+      - run: pytest -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastdec-windows-x64
+          path: fotomedik/jpeg/_fastdec.dll

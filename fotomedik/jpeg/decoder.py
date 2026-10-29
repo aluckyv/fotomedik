@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import markers as M
+from . import fastdec
 from .bitreader import BitReader, MarkerHit
 from .tables import FrameTables, HuffmanTable
 
@@ -291,6 +292,12 @@ def decode_scan(
     intervals: list[Interval] = []
     first_error: DecodeError | None = None
 
+    use_fast = fastdec.available()
+    if use_fast:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        pk = fastdec.packed_for(ft)
+        geom = [(c.cid, c.h, c.v) for c in comps]
+
     br = BitReader(data, start, end)
     if start_bit:
         br.read_bits(start_bit)
@@ -342,26 +349,58 @@ def decode_scan(
                 pred[cid] = 0
         err: DecodeError | None = None
         stop = False
-        try:
-            for _ in range(iv_count):
+        if use_fast:
+            # C kernel decodes the interval's MCUs; Python keeps the structure around it.
+            s_off, s_bit = br.tell()
+            preds_arr = np.array([pred[cid] for cid, _h, _v in geom], dtype=np.int32)
+            n, ename, e_off, e_bit, e_marker, end_off, end_bit, bitstarts, dcv = fastdec.decode_mcus(
+                arr, s_off, s_bit, end, pk, preds_arr, iv_count
+            )
+            for i in range(n):
+                mcus.append(MCUInfo(mcu + i, int(bitstarts[i])))
+            if n:
+                idx = np.arange(mcu, mcu + n)
+                mrow, mcol = np.divmod(idx, mcus_per_row)
+                bi = 0
+                for cid, h, v in geom:
+                    for by in range(v):
+                        for bx in range(h):
+                            dc_arrays[cid][mrow * v + by, mcol * h + bx] = dcv[:, bi]
+                            bi += 1
+                mcu_ok[mcu : mcu + n] = True
+            iv.decoded = n
+            mcu += n
+            for (cid, _h, _v), pv in zip(geom, preds_arr):
+                pred[cid] = int(pv)
+            if ename is None:
+                br.seek(end_off)
+                if end_bit:
+                    br.read_bits(end_bit)
+            elif ename == "marker":
+                err = DecodeError("unexpected_marker", mcu, e_off, 0, f"marker 0xFF{e_marker:02X} inside MCU")
+            else:
+                err = DecodeError(ename, mcu, e_off, e_bit, "")
+        else:
+            try:
+                for _ in range(iv_count):
+                    off, bit = br.tell()
+                    mcus.append(MCUInfo(mcu, off * 8 + bit))
+                    mrow, mcol = divmod(mcu, mcus_per_row)
+                    for c in comps:
+                        for by in range(c.v):
+                            for bx in range(c.h):
+                                block(c, mrow * c.v + by, mcol * c.h + bx)
+                    mcu_ok[mcu] = True
+                    iv.decoded += 1
+                    mcu += 1
+            except _Bad as e:
                 off, bit = br.tell()
-                mcus.append(MCUInfo(mcu, off * 8 + bit))
-                mrow, mcol = divmod(mcu, mcus_per_row)
-                for c in comps:
-                    for by in range(c.v):
-                        for bx in range(c.h):
-                            block(c, mrow * c.v + by, mcol * c.h + bx)
-                mcu_ok[mcu] = True
-                iv.decoded += 1
-                mcu += 1
-        except _Bad as e:
-            off, bit = br.tell()
-            err = DecodeError(e.reason, mcu, off, bit, e.detail)
-        except MarkerHit as e:
-            err = DecodeError("unexpected_marker", mcu, e.offset, 0, f"marker 0xFF{e.marker:02X} inside MCU")
-        except EOFError:
-            off, bit = br.tell()
-            err = DecodeError("eof", mcu, off, bit, "data ended inside interval")
+                err = DecodeError(e.reason, mcu, off, bit, e.detail)
+            except MarkerHit as e:
+                err = DecodeError("unexpected_marker", mcu, e.offset, 0, f"marker 0xFF{e.marker:02X} inside MCU")
+            except EOFError:
+                off, bit = br.tell()
+                err = DecodeError("eof", mcu, off, bit, "data ended inside interval")
 
         if err is None:
             # Interval decoded; now the boundary: marker, range end, or EOI.
