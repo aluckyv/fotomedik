@@ -65,6 +65,7 @@ def encode_flat_mcus(
     targets: dict[int, int],
     preds: dict[int, int],
     per_block: dict[int, list[int]] | None = None,
+    writer: "BitWriter | None" = None,
 ) -> bytes:
     """Entropy data for `mcu_count` MCUs of DC-only blocks.
 
@@ -72,10 +73,11 @@ def encode_flat_mcus(
     unless per_block[cid] gives one value per block (consumed in scan order).
     preds: DC predictor state at the start (mutated to the state at the end),
     so the bytes can be glued after existing data without a restart marker.
+    With `writer`, bits are appended to it unpadded (more data may follow) and b"" is returned.
     """
     frame, scan = ft.frame, ft.scan
     interleaved = len(scan.components) > 1
-    w = BitWriter()
+    w = writer if writer is not None else BitWriter()
     comps = []
     for sc in scan.components:
         fc = frame.component(sc.id)
@@ -108,7 +110,7 @@ def encode_flat_mcus(
                 preds[cid] += diff
                 ln, code = eob
                 w.put_bits(code, ln)
-    return w.finish()
+    return b"" if writer is not None else w.finish()
 
 
 def gray_dc(ft: FrameTables, cid: int, sample: int) -> int:

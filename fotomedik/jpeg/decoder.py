@@ -363,6 +363,9 @@ def decode_scan(
             hit = None
             j = k
             fuzzy_hit = False
+            # Candidates in file order. A damaged look-alike must prove itself over the
+            # whole next interval (measured on real photos: random positions in Huffman
+            # data often decode 8+ MCUs cleanly, so short probes accept fakes).
             for n, moff, fuzzy in _marker_candidates(data, search_from, end, k % 8, max_ham=FUZZY_RST_BITS):
                 dist = moff - iv.byte_start
                 spans_est = max(1.0, dist / avg)
@@ -371,7 +374,7 @@ def decode_scan(
                     if not (0.3 * avg <= dist <= 2.5 * avg):
                         continue
                     cand = k
-                    probe_len = min(8, dri)
+                    probe_len = dri  # whole next interval, must end on its own marker
                 else:
                     base = k + ((n - k) % 8)
                     cands = sorted(
@@ -381,7 +384,7 @@ def decode_scan(
                     if not (rel_err <= 0.6 or (cand == k and dist <= 3 * avg)):
                         continue
                     # An intact FF Dn with exactly the number this interval must end with, at a
-                    # plausible distance, is trusted as is: fake markers need several unlucky
+                    # plausible distance, is trusted as is: fake ones need several unlucky
                     # flips, while a probe would wrongly reject it whenever the *next* interval
                     # happens to be damaged too. Markers that skip intervals must prove themselves.
                     probe_len = 0 if cand == k else min(3, dri)
@@ -390,6 +393,9 @@ def decode_scan(
                     probe = decode_scan(data, parse, ft, start_byte=moff + 2, end_byte=end,
                                         first_mcu=(cand + 1) * dri, max_mcus=probe_len, resync=False)
                     if probe.error is not None and probe.error.reason != "eof":
+                        continue
+                    if fuzzy and not (probe.intervals and probe.intervals[0].ok
+                                      and probe.intervals[0].end_marker is not None):
                         continue
                 hit, j, fuzzy_hit = (n, moff), cand, fuzzy
                 break

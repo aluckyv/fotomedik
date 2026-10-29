@@ -25,7 +25,7 @@
 #define EXPORT
 #endif
 
-#define FASTDEC_ABI 3  /* bump whenever an exported signature changes; fastdec.py checks it */
+#define FASTDEC_ABI 4  /* bump whenever an exported signature changes; fastdec.py checks it */
 
 EXPORT int fastdec_abi(void) { return FASTDEC_ABI; }
 
@@ -141,62 +141,72 @@ static inline int decode_symbol(reader_t *r, int slot, const tables_t *t, int *s
     return ERR_BAD_HUFFMAN;
 }
 
+/* Decode one MCU; DC values go to dc_out[0..bpm). Returns 0 or an error code. */
+static inline int decode_mcu(reader_t *r, const comp_t *comps, int ncomp, const tables_t *t,
+                             int32_t *preds, int32_t *dc_out) {
+    int err = 0;
+    int bi = 0;
+    for (int c = 0; c < ncomp; c++) {
+        const comp_t *cp = &comps[c];
+        int nb = cp->h * cp->v;
+        for (int b = 0; b < nb; b++) {
+            int s0;
+            err = decode_symbol(r, cp->dc_t, t, &s0);
+            if (err) return err;
+            if (s0 > 11) return ERR_BAD_HUFFMAN;
+            int32_t v;
+            err = read_bits(r, s0, &v);
+            if (err) return err;
+            if (s0 && v < (1 << (s0 - 1))) v -= (1 << s0) - 1;
+            preds[c] += v;
+            int32_t dcv = preds[c];
+            int64_t mag = (int64_t)dcv * cp->qdc;
+            if (mag < 0) mag = -mag;
+            if (mag > 1024 + cp->qdc) return ERR_DC_RANGE;
+            int k = 1;
+            while (k < 64) {
+                int rs;
+                err = decode_symbol(r, 4 + cp->ac_t, t, &rs);
+                if (err) return err;
+                int s = rs & 15, run = rs >> 4;
+                if (s == 0) {
+                    if (run == 15) { k += 16; continue; }
+                    break;
+                }
+                k += run;
+                if (k > 63) return ERR_COEF_OVERFLOW;
+                if (s > 10) return ERR_BAD_HUFFMAN;
+                err = skip(r, s);
+                if (err) return err;
+                k++;
+            }
+            dc_out[bi++] = dcv;
+        }
+    }
+    return 0;
+}
+
+static void reader_init(reader_t *r, const uint8_t *data, int64_t start_byte, int64_t end) {
+    memset(r, 0, sizeof *r);
+    r->data = data; r->pos = start_byte; r->end = end;
+}
+
 /* Core loop. Returns MCUs decoded; fills out[0..5] as documented on decode_mcus. */
 static int64_t run_decode(const uint8_t *data, int64_t start_byte, int start_bit, int64_t end,
                           const comp_t *comps, int ncomp, const tables_t *t,
                           int64_t max_mcus, int32_t *preds,
                           int64_t *mcu_bitstart, int32_t *dc_vals, int64_t *out) {
     reader_t r;
-    memset(&r, 0, sizeof r);
-    r.data = data; r.pos = start_byte; r.end = end;
+    reader_init(&r, data, start_byte, end);
     int err = 0;
     if (start_bit) { int32_t dummy; err = read_bits(&r, start_bit, &dummy); }
-    int blocks_per_mcu = 0;
-    for (int c = 0; c < ncomp; c++) blocks_per_mcu += comps[c].h * comps[c].v;
+    int bpm = 0;
+    for (int c = 0; c < ncomp; c++) bpm += comps[c].h * comps[c].v;
     int64_t n = 0;
     int64_t eb; int ebit;
     for (n = 0; n < max_mcus && !err; n++) {
         if (mcu_bitstart) { tell(&r, &eb, &ebit); mcu_bitstart[n] = eb * 8 + ebit; }
-        int bi = 0;
-        for (int c = 0; c < ncomp && !err; c++) {
-            const comp_t *cp = &comps[c];
-            int nb = cp->h * cp->v;
-            for (int b = 0; b < nb && !err; b++) {
-                int s0;
-                err = decode_symbol(&r, cp->dc_t, t, &s0);
-                if (err) break;
-                if (s0 > 11) { err = ERR_BAD_HUFFMAN; break; }
-                int32_t v;
-                err = read_bits(&r, s0, &v);
-                if (err) break;
-                if (s0 && v < (1 << (s0 - 1))) v -= (1 << s0) - 1;
-                preds[c] += v;
-                int32_t dcv = preds[c];
-                int64_t mag = (int64_t)dcv * cp->qdc;
-                if (mag < 0) mag = -mag;
-                if (mag > 1024 + cp->qdc) { err = ERR_DC_RANGE; break; }
-                int k = 1;
-                while (k < 64) {
-                    int rs;
-                    err = decode_symbol(&r, 4 + cp->ac_t, t, &rs);
-                    if (err) break;
-                    int s = rs & 15, run = rs >> 4;
-                    if (s == 0) {
-                        if (run == 15) { k += 16; continue; }
-                        break;
-                    }
-                    k += run;
-                    if (k > 63) { err = ERR_COEF_OVERFLOW; break; }
-                    if (s > 10) { err = ERR_BAD_HUFFMAN; break; }
-                    err = skip(&r, s);
-                    if (err) break;
-                    k++;
-                }
-                if (err) break;
-                dc_vals[n * blocks_per_mcu + bi] = dcv;
-                bi++;
-            }
-        }
+        err = decode_mcu(&r, comps, ncomp, t, preds, dc_vals + n * bpm);
         if (err) break;
     }
     out[0] = err;
@@ -334,4 +344,86 @@ EXPORT int64_t eval_flips(uint8_t *data, int64_t data_len, int64_t start_byte, i
         res_rough[i] = nb > 0 ? roughness(scratch_dc, nb, up_v, dn_v, left_k, w) : INFINITY;
     }
     return ncand;
+}
+
+/* Tail recovery: the latest data of an interval survives after a damaged stretch,
+ * but where its MCUs start is unknown. Huffman streams resynchronise by
+ * themselves, so decoding from almost any bit after the damage converges on the
+ * true parse and ends exactly at the interval's restart marker.
+ *
+ * Scans start positions from marker_pos-1 back to `lo`, every bit. A start counts
+ * when decoding from it reaches the marker exactly (1-bit padding allowed) after
+ * at most max_mcus MCUs. The first success is decoded to the end; later (earlier
+ * in the file) starts stop as soon as they land on a known MCU boundary of the
+ * reference parse (splice), so each costs a few MCUs. Scanning stops after
+ * `give_up` bytes without a success (inside the damage nothing converges).
+ *
+ * Returns the number of MCUs of the longest tail (0 if none) and its start in
+ * *best_bit (absolute bit position); known[0..return) then holds the MCU start
+ * bits of that tail. known, trial: int64[max_mcus + 1]. */
+EXPORT int64_t tail_scan(const uint8_t *data, int64_t data_len, int64_t lo, int64_t marker_pos,
+                         const comp_t *comps, int ncomp,
+                         const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
+                         const int32_t *mincode, const uint8_t *symbols,
+                         int64_t max_mcus, int64_t give_up, int64_t *best_bit,
+                         int64_t *known, int64_t *trial) {
+    tables_t t = { fast, maxcode, valptr, mincode, symbols };
+    int32_t preds[8];
+    int32_t dc[64];
+    int64_t nknown = 0;      /* known[0..nknown) ascending MCU start bits of the reference parse */
+    int64_t best_n = 0;
+    *best_bit = -1;
+    int64_t last_success = marker_pos;
+    for (int64_t p = marker_pos - 1; p >= lo; p--) {
+        if (last_success - p > give_up && best_n > 0) break;
+        if (last_success - p > give_up * 4) break;
+        for (int bit = 7; bit >= 0; bit--) {
+            int64_t sbit = p * 8 + bit;
+            if (nknown && sbit >= known[0]) continue;  /* inside the known parse already */
+            reader_t r;
+            reader_init(&r, data, p, marker_pos + 2);
+            int err = 0;
+            if (bit) { int32_t d; err = read_bits(&r, bit, &d); }
+            if (err) continue;
+            memset(preds, 0, sizeof preds);
+            int64_t n = 0, total = -1;
+            int64_t q = 0; /* pointer into known */
+            int spliced = 0;
+            while (n < max_mcus) {
+                int64_t eb; int ebit;
+                tell(&r, &eb, &ebit);
+                int64_t pos = eb * 8 + ebit;
+                trial[n] = pos;
+                if (nknown) {
+                    while (q < nknown && known[q] < pos) q++;
+                    if (q < nknown && known[q] == pos) { total = n + (nknown - q); spliced = 1; break; }
+                }
+                err = decode_mcu(&r, comps, ncomp, &t, preds, dc);
+                if (err) break;
+                n++;
+                /* reached the marker? */
+                int64_t eb2; int ebit2; tell(&r, &eb2, &ebit2);
+                int pad_ok;
+                int64_t a = aligned_end(data, data_len, eb2, ebit2, &pad_ok);
+                if (a == marker_pos && pad_ok) { total = n; break; }
+                if (eb2 > marker_pos) break;
+            }
+            if (total <= 0 || total > max_mcus) continue;
+            if (total >= best_n) {
+                /* new reference parse: this start's boundaries + the known suffix */
+                int64_t head = n;  /* MCUs decoded before splicing/ending */
+                int64_t suffix = spliced ? (nknown - q) : 0;
+                int64_t newn = head + suffix;
+                if (newn <= max_mcus) {
+                    if (suffix) memmove(known + head, known + q, sizeof(int64_t) * (size_t)suffix);
+                    memcpy(known, trial, sizeof(int64_t) * (size_t)head);
+                    nknown = newn;
+                }
+                best_n = total;
+                *best_bit = sbit;
+            }
+            last_success = p;
+        }
+    }
+    return best_n;
 }

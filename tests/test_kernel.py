@@ -82,3 +82,31 @@ def test_eval_flips_parity():
     assert c[0] == py[0] and c[1] == py[1] and c[2] == py[2]
     assert np.allclose(c[3], py[3], equal_nan=True)
     assert any(c[1])  # the true repair is among the candidates and is complete
+
+
+@needs_c
+def test_tail_scan_parity_and_recovery():
+    """Destroy the first half of interval 6: the tail must be found, identically in C and Python."""
+    data = make_jpeg(make_image(512, 256), restart_rows=1)
+    res, ft, pk = _setup(data)
+    ref = D.decode_scan(data, res, ft)
+    iv = ref.intervals[6]
+    mid = (iv.byte_start + iv.byte_end) // 2
+    rng = np.random.default_rng(5)
+    buf = bytearray(data)
+    for o in range(iv.byte_start, mid):
+        if rng.random() < 0.08:
+            buf[o] ^= 1 << int(rng.integers(0, 8))
+    broken = bytes(buf)
+
+    def run():
+        return kernel.tail_scan(broken, iv.byte_start, iv.byte_end, pk, iv.mcu_count)
+
+    c, py = _both(run)
+    assert c == py
+    n, start_bit, bits = c
+    true_starts = [m.bit_start for m in ref.mcus if iv.mcu_first <= m.index < iv.mcu_first + iv.mcu_count]
+    # a good share of the interval comes back, and the tail's MCU boundaries (after the
+    # first, possibly junk, MCU) are exactly the true ones
+    assert n >= iv.mcu_count // 3
+    assert bits[1:] == true_starts[-(n - 1):]
