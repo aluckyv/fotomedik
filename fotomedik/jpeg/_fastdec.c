@@ -1,16 +1,23 @@
 /* FotoMedik fast baseline entropy-decoding kernel.
  *
- * Decodes up to `max_mcus` MCUs of one restart interval starting at a bit
- * position, mirroring fotomedik/jpeg/decoder.py exactly (same errors, same
- * positions). Called through ctypes; the Python decoder keeps all the
- * structure (intervals, markers, resync) and only hands the hot loop here.
+ * decode_mcus(): decodes up to `max_mcus` MCUs of one restart interval from a
+ *   bit position. Mirrors fotomedik/jpeg/kernel.py:py_decode_mcus exactly
+ *   (same errors, same positions).
+ * eval_flips(): the bit-flip search loop. For each candidate (offset, mask) it
+ *   flips the byte in place, decodes (cheap stage 1, then to the end of the
+ *   interval for survivors), restores the byte, and reports how far decoding
+ *   got, whether it landed exactly on the restart marker, whether the final
+ *   byte is padded with 1-bits as the standard requires, and a DC-smoothness
+ *   score. Mirrors kernel.py:py_eval_flips.
  *
- * Build:  gcc -O2 -shared -fPIC -o _fastdec.so _fastdec.c      (Linux)
- *         cl /O2 /LD _fastdec.c /Fe_fastdec.dll                (Windows, MSVC)
- *         gcc -O2 -shared -o _fastdec.dll _fastdec.c           (Windows, mingw)
+ * Called through ctypes; Python keeps all structure (intervals, markers,
+ * resync, candidate selection) and hands only the hot loops here.
+ *
+ * Build:  python build_fastdec.py
  */
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 #ifdef _WIN32
 #define EXPORT __declspec(dllexport)
@@ -25,6 +32,14 @@ typedef struct {
 } comp_t;
 
 typedef struct {
+    const int32_t *fast;    /* [8][512]  (cls*4+id) */
+    const int32_t *maxcode; /* [8][17] */
+    const int32_t *valptr;  /* [8][17] */
+    const int32_t *mincode; /* [8][17] */
+    const uint8_t *symbols; /* [8][256] */
+} tables_t;
+
+typedef struct {
     const uint8_t *data;
     int64_t pos, end;
     uint64_t buf;
@@ -33,7 +48,7 @@ typedef struct {
     int hit_marker;   /* marker byte */
     int64_t hit_off;  /* offset of the marker's FF */
     int eof;
-    int64_t bytepos[8]; /* ring of positions of loaded real bytes */
+    int64_t bytepos[8]; /* positions of loaded real bytes, newest last */
     int bp_n;
 } reader_t;
 
@@ -83,7 +98,6 @@ static inline uint32_t peek16(reader_t *r) {
     return (uint32_t)((r->buf >> (r->nbits - 16)) & 0xFFFF);
 }
 
-/* returns 0 ok, else error code */
 static inline int skip(reader_t *r, int n) {
     if (r->nbits < n) fill(r, n);
     if (r->real < n) return r->hit ? ERR_MARKER : ERR_EOF;
@@ -100,11 +114,9 @@ static inline int read_bits(reader_t *r, int n, int32_t *out) {
     return 0;
 }
 
-/* Huffman tables: 8 slots (cls*4+id); fast[slot*512], maxcode[slot*17], valptr, mincode, symbols[slot*256] */
-static inline int decode_symbol(reader_t *r, int slot, const int32_t *fast, const int32_t *maxcode,
-                                const int32_t *valptr, const int32_t *mincode, const uint8_t *symbols, int *sym) {
+static inline int decode_symbol(reader_t *r, int slot, const tables_t *t, int *sym) {
     uint32_t code16 = peek16(r);
-    int32_t e = fast[slot * 512 + (code16 >> 7)];
+    int32_t e = t->fast[slot * 512 + (code16 >> 7)];
     if (e) {
         int err = skip(r, e >> 8);
         if (err) return err;
@@ -113,25 +125,21 @@ static inline int decode_symbol(reader_t *r, int slot, const int32_t *fast, cons
     }
     for (int length = 10; length <= 16; length++) {
         int32_t c = (int32_t)(code16 >> (16 - length));
-        if (c <= maxcode[slot * 17 + length]) {
+        if (c <= t->maxcode[slot * 17 + length]) {
             int err = skip(r, length);
             if (err) return err;
-            *sym = symbols[slot * 256 + valptr[slot * 17 + length] + c - mincode[slot * 17 + length]];
+            *sym = t->symbols[slot * 256 + t->valptr[slot * 17 + length] + c - t->mincode[slot * 17 + length]];
             return 0;
         }
     }
     return ERR_BAD_HUFFMAN;
 }
 
-/* Returns number of MCUs decoded. Fills out[]:
- *  out[0]=err, out[1]=err_byte, out[2]=err_bit, out[3]=marker (if ERR_MARKER), out[4]=end_byte, out[5]=end_bit
- * dc_vals: int32 [max_mcus * blocks_per_mcu] in scan order; mcu_bitstart: int64 [max_mcus] */
-EXPORT int64_t decode_mcus(const uint8_t *data, int64_t start_byte, int start_bit, int64_t end,
-                           const comp_t *comps, int ncomp,
-                           const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
-                           const int32_t *mincode, const uint8_t *symbols,
-                           int64_t max_mcus, int32_t *preds,
-                           int64_t *mcu_bitstart, int32_t *dc_vals, int64_t *out) {
+/* Core loop. Returns MCUs decoded; fills out[0..5] as documented on decode_mcus. */
+static int64_t run_decode(const uint8_t *data, int64_t start_byte, int start_bit, int64_t end,
+                          const comp_t *comps, int ncomp, const tables_t *t,
+                          int64_t max_mcus, int32_t *preds,
+                          int64_t *mcu_bitstart, int32_t *dc_vals, int64_t *out) {
     reader_t r;
     memset(&r, 0, sizeof r);
     r.data = data; r.pos = start_byte; r.end = end;
@@ -142,21 +150,20 @@ EXPORT int64_t decode_mcus(const uint8_t *data, int64_t start_byte, int start_bi
     int64_t n = 0;
     int64_t eb; int ebit;
     for (n = 0; n < max_mcus && !err; n++) {
-        tell(&r, &eb, &ebit);
-        mcu_bitstart[n] = eb * 8 + ebit;
+        if (mcu_bitstart) { tell(&r, &eb, &ebit); mcu_bitstart[n] = eb * 8 + ebit; }
         int bi = 0;
         for (int c = 0; c < ncomp && !err; c++) {
             const comp_t *cp = &comps[c];
             int nb = cp->h * cp->v;
             for (int b = 0; b < nb && !err; b++) {
-                int t;
-                err = decode_symbol(&r, cp->dc_t, fast, maxcode, valptr, mincode, symbols, &t);
+                int s0;
+                err = decode_symbol(&r, cp->dc_t, t, &s0);
                 if (err) break;
-                if (t > 11) { err = ERR_BAD_HUFFMAN; break; }
+                if (s0 > 11) { err = ERR_BAD_HUFFMAN; break; }
                 int32_t v;
-                err = read_bits(&r, t, &v);
+                err = read_bits(&r, s0, &v);
                 if (err) break;
-                if (t && v < (1 << (t - 1))) v -= (1 << t) - 1;
+                if (s0 && v < (1 << (s0 - 1))) v -= (1 << s0) - 1;
                 preds[c] += v;
                 int32_t dcv = preds[c];
                 int64_t mag = (int64_t)dcv * cp->qdc;
@@ -165,7 +172,7 @@ EXPORT int64_t decode_mcus(const uint8_t *data, int64_t start_byte, int start_bi
                 int k = 1;
                 while (k < 64) {
                     int rs;
-                    err = decode_symbol(&r, 4 + cp->ac_t, fast, maxcode, valptr, mincode, symbols, &rs);
+                    err = decode_symbol(&r, 4 + cp->ac_t, t, &rs);
                     if (err) break;
                     int s = rs & 15, run = rs >> 4;
                     if (s == 0) {
@@ -192,4 +199,101 @@ EXPORT int64_t decode_mcus(const uint8_t *data, int64_t start_byte, int start_bi
     else { out[1] = eb; out[2] = ebit; out[3] = 0; }
     out[4] = eb; out[5] = ebit;
     return n;
+}
+
+/* out[0]=err, out[1]=err_byte, out[2]=err_bit, out[3]=marker (if ERR_MARKER),
+ * out[4]=end_byte, out[5]=end_bit (position of the next unread bit)
+ * dc_vals: int32 [max_mcus * blocks_per_mcu] in scan order; mcu_bitstart: int64 [max_mcus] */
+EXPORT int64_t decode_mcus(const uint8_t *data, int64_t start_byte, int start_bit, int64_t end,
+                           const comp_t *comps, int ncomp,
+                           const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
+                           const int32_t *mincode, const uint8_t *symbols,
+                           int64_t max_mcus, int32_t *preds,
+                           int64_t *mcu_bitstart, int32_t *dc_vals, int64_t *out) {
+    tables_t t = { fast, maxcode, valptr, mincode, symbols };
+    return run_decode(data, start_byte, start_bit, end, comps, ncomp, &t, max_mcus, preds, mcu_bitstart, dc_vals, out);
+}
+
+/* Where the interval ends after the last MCU: next byte boundary, FF00-stuffed
+ * padding skipped. *pad_ok = 1 when the unused bits of the last byte are all 1s. */
+static int64_t aligned_end(const uint8_t *data, int64_t len, int64_t eb, int ebit, int *pad_ok) {
+    int64_t p = eb;
+    *pad_ok = 1;
+    if (ebit) {
+        uint8_t mask = (uint8_t)((1u << (8 - ebit)) - 1);
+        *pad_ok = (data[eb] & mask) == mask;
+        p = eb + 1;
+        if (data[eb] == 0xFF && p < len && data[p] == 0x00) p++;
+    }
+    for (int hops = 0; hops < 4 && p + 2 < len && data[p] == 0xFF && data[p + 1] == 0x00; hops++) p += 2;
+    return p;
+}
+
+/* Smoothness score over `nblocks` candidate blocks (lower = smoother); mean of
+ * weighted |DC differences| to the left neighbour (inside the candidate, weight 2)
+ * and to known blocks above and below (weight 1). Returns 0 when there is nothing to compare. */
+static double roughness(const int32_t *dc, int64_t nblocks, const double *up_v, const double *dn_v,
+                        const int32_t *left_k, const double *w) {
+    double total = 0.0;
+    int64_t n = 0;
+    for (int64_t k = 0; k < nblocks; k++) {
+        double a = (double)dc[k];
+        int32_t l = left_k[k];
+        if (l >= 0 && l < k) { double d = a - (double)dc[l]; total += 2.0 * (d < 0 ? -d : d) * w[k]; n++; }
+        if (!isnan(up_v[k])) { double d = a - up_v[k]; total += (d < 0 ? -d : d) * w[k]; n++; }
+        if (!isnan(dn_v[k])) { double d = a - dn_v[k]; total += (d < 0 ? -d : d) * w[k]; n++; }
+    }
+    return n ? total / (double)n : 0.0;
+}
+
+/* For each candidate i: flip data[offs[i]] ^= masks[i], decode from (start_byte,
+ * start_bit) with preds0, restore the byte.
+ *   res_dec[i]      MCUs decoded cleanly (from the resume point)
+ *   res_complete[i] 1 if all `needed` MCUs decoded and the data ends exactly at marker_pos
+ *                   (marker_pos < 0: no marker known, any clean end counts)
+ *   res_pad[i]      1 if the final partial byte is padded with 1-bits
+ *   res_rough[i]    smoothness over all blocks (complete) or over the first
+ *                   max(1, dec - min_gain) MCUs (partial)
+ * scratch_dc: int32[needed * blocks_per_mcu].  Returns number of candidates evaluated. */
+EXPORT int64_t eval_flips(uint8_t *data, int64_t data_len, int64_t start_byte, int start_bit, int64_t end,
+                          const comp_t *comps, int ncomp,
+                          const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
+                          const int32_t *mincode, const uint8_t *symbols,
+                          const int32_t *preds0, int64_t needed, int64_t stage1_n,
+                          int64_t marker_pos, int min_gain,
+                          const int64_t *offs, const uint8_t *masks, int64_t ncand,
+                          const double *up_v, const double *dn_v, const int32_t *left_k, const double *w,
+                          int32_t *res_dec, int8_t *res_complete, int8_t *res_pad, double *res_rough,
+                          int32_t *scratch_dc) {
+    tables_t t = { fast, maxcode, valptr, mincode, symbols };
+    int bpm = 0;
+    for (int c = 0; c < ncomp; c++) bpm += comps[c].h * comps[c].v;
+    int32_t preds[8];
+    int64_t out[6];
+    for (int64_t i = 0; i < ncand; i++) {
+        int64_t off = offs[i];
+        uint8_t m = masks[i];
+        data[off] ^= m;
+        memcpy(preds, preds0, sizeof(int32_t) * ncomp);
+        int64_t lim = stage1_n < needed ? stage1_n : needed;
+        int64_t n = run_decode(data, start_byte, start_bit, end, comps, ncomp, &t, lim, preds, NULL, scratch_dc, out);
+        if (out[0] == 0 && n == lim && lim < needed) {
+            memcpy(preds, preds0, sizeof(int32_t) * ncomp);
+            n = run_decode(data, start_byte, start_bit, end, comps, ncomp, &t, needed, preds, NULL, scratch_dc, out);
+        }
+        int complete = 0, pad_ok = 0;
+        if (out[0] == 0 && n == needed) {
+            int64_t p = aligned_end(data, data_len, out[4], (int)out[5], &pad_ok);
+            complete = marker_pos < 0 || p == marker_pos;
+        }
+        data[off] ^= m;
+        res_dec[i] = (int32_t)n;
+        res_complete[i] = (int8_t)complete;
+        res_pad[i] = (int8_t)pad_ok;
+        int64_t nb;
+        if (complete) nb = n * bpm;
+        else { int64_t k = n - min_gain; if (k < 1) k = 1; if (k > n) k = n; nb = k * bpm; }
+        res_rough[i] = nb > 0 ? roughness(scratch_dc, nb, up_v, dn_v, left_k, w) : INFINITY;
+    }
+    return ncand;
 }

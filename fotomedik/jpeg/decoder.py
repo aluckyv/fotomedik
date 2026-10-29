@@ -14,9 +14,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import markers as M
-from . import fastdec
-from .bitreader import BitReader, MarkerHit
-from .tables import FrameTables, HuffmanTable
+from . import kernel
+from .bitreader import BitReader
+from .kernel import MissingTables  # noqa: F401  (re-exported)
+from .tables import FrameTables
 
 ERROR_REASONS = frozenset(
     ["bad_huffman", "coef_overflow", "dc_range", "unexpected_marker", "eof", "bad_rst", "skipped"]
@@ -25,10 +26,6 @@ ERROR_REASONS = frozenset(
 
 class Unsupported(Exception):
     """Scan type the v0.1 decoder does not handle (progressive, 12-bit, arithmetic)."""
-
-
-class MissingTables(Exception):
-    """Header lacks a table the scan references; repair the header first."""
 
 
 @dataclass
@@ -91,50 +88,6 @@ class ScanResult:
         return [iv.error for iv in self.intervals if iv.error is not None]
 
 
-# --------------------------------------------------------------------------- Huffman fast tables
-
-_FAST_BITS = 9
-_fast_cache: dict[int, tuple[list[int], HuffmanTable]] = {}
-
-
-def _fast_table(t: HuffmanTable) -> list[int]:
-    key = id(t)
-    hit = _fast_cache.get(key)
-    if hit is not None and hit[1] is t:
-        return hit[0]
-    fast = [0] * (1 << _FAST_BITS)
-    for (length, code), sym in t.lookup.items():
-        if length <= _FAST_BITS:
-            shift = _FAST_BITS - length
-            base = code << shift
-            entry = (length << 8) | sym
-            for i in range(1 << shift):
-                fast[base + i] = entry
-    _fast_cache[key] = (fast, t)
-    return fast
-
-
-class _Bad(Exception):
-    def __init__(self, reason: str, detail: str = ""):
-        self.reason = reason
-        self.detail = detail
-
-
-def _decode_symbol(br: BitReader, t: HuffmanTable, fast: list[int]) -> int:
-    code16 = br.peek_bits(16)
-    e = fast[code16 >> (16 - _FAST_BITS)]
-    if e:
-        br.skip_bits(e >> 8)
-        return e & 0xFF
-    maxcode = t.maxcode
-    for length in range(_FAST_BITS + 1, 17):
-        c = code16 >> (16 - length)
-        if c <= maxcode[length]:
-            br.skip_bits(length)
-            return t.symbols[t.valptr[length] + c - t.mincode[length]]
-    raise _Bad("bad_huffman", f"no code matches 0x{code16:04X}")
-
-
 # --------------------------------------------------------------------------- geometry
 
 
@@ -143,11 +96,6 @@ class _Comp:
     cid: int
     h: int
     v: int
-    qdc: int
-    dc_t: HuffmanTable
-    ac_t: HuffmanTable
-    dc_fast: list[int]
-    ac_fast: list[int]
     blocks_w: int
     blocks_h: int
 
@@ -159,11 +107,6 @@ def _scan_components(ft: FrameTables) -> tuple[list[_Comp], int, int]:
     interleaved = len(scan.components) > 1
     for sc in scan.components:
         fc = frame.component(sc.id)
-        if fc.tq not in ft.quant:
-            raise MissingTables(f"quant table {fc.tq} missing")
-        if (0, sc.td) not in ft.huff or (1, sc.ta) not in ft.huff:
-            raise MissingTables(f"huffman tables {sc.td}/{sc.ta} missing")
-        dc_t, ac_t = ft.huff[(0, sc.td)], ft.huff[(1, sc.ta)]
         if interleaved:
             h, v = fc.h, fc.v
             bw, bh = frame.mcus_per_row * h, frame.mcu_rows * v
@@ -172,9 +115,7 @@ def _scan_components(ft: FrameTables) -> tuple[list[_Comp], int, int]:
             cw = -(-frame.width * fc.h // frame.hmax)
             ch = -(-frame.height * fc.v // frame.vmax)
             bw, bh = -(-cw // 8), -(-ch // 8)
-        comps.append(
-            _Comp(sc.id, h, v, ft.quant[fc.tq].dc, dc_t, ac_t, _fast_table(dc_t), _fast_table(ac_t), bw, bh)
-        )
+        comps.append(_Comp(sc.id, h, v, bw, bh))
     if interleaved:
         return comps, frame.mcus_per_row, frame.mcu_rows
     return comps, comps[0].blocks_w, comps[0].blocks_h
@@ -292,11 +233,8 @@ def decode_scan(
     intervals: list[Interval] = []
     first_error: DecodeError | None = None
 
-    use_fast = fastdec.available()
-    if use_fast:
-        arr = np.frombuffer(data, dtype=np.uint8)
-        pk = fastdec.packed_for(ft)
-        geom = [(c.cid, c.h, c.v) for c in comps]
+    pk = kernel.packed_for(ft)  # raises MissingTables when the header lacks a table
+    geom = [(c.cid, c.h, c.v) for c in comps]
 
     br = BitReader(data, start, end)
     if start_bit:
@@ -305,34 +243,6 @@ def decode_scan(
     iv_index = first_mcu // dri if dri else 0
     pred = {c.cid: 0 for c in comps}
     resume_preds = dict(init_preds) if init_preds else None
-
-    def block(c: _Comp, brow: int, bcol: int) -> None:
-        t = _decode_symbol(br, c.dc_t, c.dc_fast)
-        if t > 11:
-            raise _Bad("bad_huffman", f"DC category {t}")
-        diff = br.receive_extend(t)
-        pred[c.cid] += diff
-        dcv = pred[c.cid]
-        if abs(dcv * c.qdc) > 1024 + c.qdc:
-            raise _Bad("dc_range", f"DC {dcv} * q{c.qdc}")
-        k = 1
-        while k < 64:
-            rs = _decode_symbol(br, c.ac_t, c.ac_fast)
-            s = rs & 15
-            r = rs >> 4
-            if s == 0:
-                if r == 15:
-                    k += 16
-                    continue
-                break
-            k += r
-            if k > 63:
-                raise _Bad("coef_overflow", f"k={k}")
-            if s > 10:
-                raise _Bad("bad_huffman", f"AC category {s}")
-            br.skip_bits(s)
-            k += 1
-        dc_arrays[c.cid][brow, bcol] = dcv
 
     while mcu < limit:
         iv_first = mcu
@@ -349,58 +259,37 @@ def decode_scan(
                 pred[cid] = 0
         err: DecodeError | None = None
         stop = False
-        if use_fast:
-            # C kernel decodes the interval's MCUs; Python keeps the structure around it.
-            s_off, s_bit = br.tell()
-            preds_arr = np.array([pred[cid] for cid, _h, _v in geom], dtype=np.int32)
-            n, ename, e_off, e_bit, e_marker, end_off, end_bit, bitstarts, dcv = fastdec.decode_mcus(
-                arr, s_off, s_bit, end, pk, preds_arr, iv_count
-            )
-            for i in range(n):
-                mcus.append(MCUInfo(mcu + i, int(bitstarts[i])))
-            if n:
-                idx = np.arange(mcu, mcu + n)
-                mrow, mcol = np.divmod(idx, mcus_per_row)
-                bi = 0
-                for cid, h, v in geom:
-                    for by in range(v):
-                        for bx in range(h):
-                            dc_arrays[cid][mrow * v + by, mcol * h + bx] = dcv[:, bi]
-                            bi += 1
-                mcu_ok[mcu : mcu + n] = True
-            iv.decoded = n
-            mcu += n
-            for (cid, _h, _v), pv in zip(geom, preds_arr):
-                pred[cid] = int(pv)
-            if ename is None:
-                br.seek(end_off)
-                if end_bit:
-                    br.read_bits(end_bit)
-            elif ename == "marker":
-                err = DecodeError("unexpected_marker", mcu, e_off, 0, f"marker 0xFF{e_marker:02X} inside MCU")
-            else:
-                err = DecodeError(ename, mcu, e_off, e_bit, "")
+        # The kernel (C or Python reference) decodes the interval's MCUs; this
+        # function keeps the structure around it (markers, intervals, resync).
+        s_off, s_bit = br.tell()
+        preds_arr = np.array([pred[cid] for cid, _h, _v in geom], dtype=np.int32)
+        n, ename, e_off, e_bit, e_marker, end_off, end_bit, bitstarts, dcv = kernel.decode_mcus(
+            data, s_off, s_bit, end, pk, preds_arr, iv_count
+        )
+        for i in range(n):
+            mcus.append(MCUInfo(mcu + i, int(bitstarts[i])))
+        if n:
+            idx = np.arange(mcu, mcu + n)
+            mrow, mcol = np.divmod(idx, mcus_per_row)
+            bi = 0
+            for cid, h, v in geom:
+                for by in range(v):
+                    for bx in range(h):
+                        dc_arrays[cid][mrow * v + by, mcol * h + bx] = dcv[:, bi]
+                        bi += 1
+            mcu_ok[mcu : mcu + n] = True
+        iv.decoded = n
+        mcu += n
+        for (cid, _h, _v), pv in zip(geom, preds_arr):
+            pred[cid] = int(pv)
+        if ename is None:
+            br.seek(end_off)
+            if end_bit:
+                br.read_bits(end_bit)
+        elif ename == "marker":
+            err = DecodeError("unexpected_marker", mcu, e_off, 0, f"marker 0xFF{e_marker:02X} inside MCU")
         else:
-            try:
-                for _ in range(iv_count):
-                    off, bit = br.tell()
-                    mcus.append(MCUInfo(mcu, off * 8 + bit))
-                    mrow, mcol = divmod(mcu, mcus_per_row)
-                    for c in comps:
-                        for by in range(c.v):
-                            for bx in range(c.h):
-                                block(c, mrow * c.v + by, mcol * c.h + bx)
-                    mcu_ok[mcu] = True
-                    iv.decoded += 1
-                    mcu += 1
-            except _Bad as e:
-                off, bit = br.tell()
-                err = DecodeError(e.reason, mcu, off, bit, e.detail)
-            except MarkerHit as e:
-                err = DecodeError("unexpected_marker", mcu, e.offset, 0, f"marker 0xFF{e.marker:02X} inside MCU")
-            except EOFError:
-                off, bit = br.tell()
-                err = DecodeError("eof", mcu, off, bit, "data ended inside interval")
+            err = DecodeError(ename, mcu, e_off, e_bit, "")
 
         if err is None:
             # Interval decoded; now the boundary: marker, range end, or EOI.

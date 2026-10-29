@@ -1,0 +1,84 @@
+"""The C kernel and the pure-Python reference must agree exactly."""
+
+import numpy as np
+import pytest
+
+from fotomedik.jpeg import decoder as D
+from fotomedik.jpeg import fastdec, kernel
+from fotomedik.jpeg import markers as M
+from fotomedik.jpeg.tables import FrameTables
+from synth import flip_bits, make_image, make_jpeg
+
+needs_c = pytest.mark.skipif(not fastdec.available(), reason="compiled kernel not built")
+
+
+def _setup(data):
+    res = M.parse_segments(data)
+    ft = FrameTables.from_parse(res)
+    return res, ft, kernel.packed_for(ft)
+
+
+def _both(fn):
+    """Run fn() with the C library, then with the Python reference."""
+    c = fn()
+    saved = fastdec._LIB, fastdec._TRIED
+    fastdec._LIB, fastdec._TRIED = None, True
+    try:
+        py = fn()
+    finally:
+        fastdec._LIB, fastdec._TRIED = saved
+    return c, py
+
+
+@needs_c
+@pytest.mark.parametrize("rst", [None, 1])
+def test_decode_mcus_parity_on_damage(rst):
+    data = make_jpeg(make_image(), restart_rows=rst)
+    res, ft, pk = _setup(data)
+    rng = np.random.default_rng(1)
+    for _ in range(60):
+        off = int(rng.integers(res.scan_start, res.eoi_offset))
+        broken = flip_bits(data, off, 1 << int(rng.integers(0, 8)))
+        start = int(rng.integers(res.scan_start, off))
+        bit = int(rng.integers(0, 8))
+
+        def run():
+            preds = np.zeros(pk.ncomp, dtype=np.int32)
+            out = kernel.decode_mcus(broken, start, bit, len(broken), pk, preds, 40)
+            return out[:7], out[7].tolist(), out[8].tolist(), preds.tolist()
+
+        c, py = _both(run)
+        assert c == py
+
+
+@needs_c
+def test_eval_flips_parity():
+    data = make_jpeg(make_image(), restart_rows=1)
+    res, ft, pk = _setup(data)
+    ref = D.decode_scan(data, res, ft)
+    iv = ref.intervals[4]
+    broken = bytearray(flip_bits(data, (iv.byte_start + iv.byte_end) // 2, 0x10))
+    needed = iv.mcu_count
+    nb = needed * pk.blocks_per_mcu
+    rng = np.random.default_rng(2)
+    geom = (
+        np.where(rng.random(nb) < 0.5, rng.normal(0, 50, nb), np.nan),
+        np.where(rng.random(nb) < 0.5, rng.normal(0, 50, nb), np.nan),
+        np.array([k - 1 if k % 3 else -1 for k in range(nb)], dtype=np.int32),
+        np.full(nb, 0.5),
+    )
+    offs = np.repeat(np.arange(iv.byte_start + 1, iv.byte_end - 1), 8).astype(np.int64)
+    masks = np.tile(np.array([1 << b for b in range(8)], dtype=np.uint8), len(offs) // 8)
+    arr = np.frombuffer(broken, dtype=np.uint8)
+    before = bytes(broken)
+
+    def run():
+        out = kernel.eval_flips(arr, iv.byte_start, 0, iv.byte_end + 2, pk, np.zeros(pk.ncomp, np.int32),
+                                needed, 4, iv.byte_end, 3, offs, masks, geom)
+        return [o.tolist() for o in out]
+
+    c, py = _both(run)
+    assert bytes(broken) == before  # every flip was undone
+    assert c[0] == py[0] and c[1] == py[1] and c[2] == py[2]
+    assert np.allclose(c[3], py[3], equal_nan=True)
+    assert any(c[1])  # the true repair is among the candidates and is complete
