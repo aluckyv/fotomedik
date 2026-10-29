@@ -34,6 +34,53 @@ BACKOFF_MCUS = 3  # MCUs dropped before a detected error (silent desync margin)
 ANOMALY_LEVELS = 96  # luma jump vs. the block above (gray levels) that marks an MCU as untrusted
 ANOMALY_MAX_EXTRA = 16
 MARK_YCC = (105, 212, 235)  # magenta in YCbCr
+TAIL_REF_ROUNDS = (2.0, 6.0, math.inf)  # mean reference distance (block rows) accepted per round
+
+
+def block_mask(mcu_ok: np.ndarray, arr: np.ndarray, h: int, v: int, per_row: int) -> np.ndarray:
+    """Per-block mask of one component: the block's MCU is trusted and its DC known."""
+    rows, cols = arr.shape
+    okm = np.repeat(np.repeat(mcu_ok[: (rows // v) * per_row].reshape(rows // v, per_row), v, 0), h, 1)
+    return okm[:rows, :cols] & ~np.isnan(arr)
+
+
+def vertical_reference(arr: np.ndarray, okm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per block: DC interpolated linearly between the nearest trusted blocks above and
+    below in the same column (the block itself where trusted), and the distance in
+    block rows to the nearer of them (0 where trusted, inf where the column has none)."""
+    rows, cols = arr.shape
+    ridx = np.arange(rows)[:, None].repeat(cols, 1)
+    above = np.maximum.accumulate(np.where(okm, ridx, -1), axis=0)
+    below = np.minimum.accumulate(np.where(okm, ridx, rows)[::-1], axis=0)[::-1]
+    colidx = np.arange(cols)[None, :].repeat(rows, 0)
+    va = np.where(above >= 0, arr[np.clip(above, 0, rows - 1), colidx], np.nan)
+    vb = np.where(below < rows, arr[np.clip(below, 0, rows - 1), colidx], np.nan)
+    da = (ridx - above).astype(float)
+    db = (below - ridx).astype(float)
+    lin = (va * db + vb * da) / np.where(da + db > 0, da + db, 1)
+    val = np.where(np.isnan(va), vb, np.where(np.isnan(vb), va, lin))
+    dist = np.minimum(np.where(above >= 0, da, np.inf), np.where(below < rows, db, np.inf))
+    val = np.where(okm, arr, val)
+    dist = np.where(okm, 0.0, dist)
+    return val, dist
+
+
+def tail_blocks(first: int, n: int, h: int, v: int, per_row: int) -> tuple[np.ndarray, np.ndarray]:
+    """(block rows, block cols) of a component for MCUs first..first+n, shape (n, h*v),
+    in the order the blocks appear in the MCU."""
+    mrow, mcol = np.divmod(np.arange(first, first + n), per_row)
+    br = np.stack([mrow * v + by for by in range(v) for _bx in range(h)], axis=1)
+    bc = np.stack([mcol * h + bx for _by in range(v) for bx in range(h)], axis=1)
+    return br, bc
+
+
+def legal_offset(rel: np.ndarray, q: int, d: float) -> float | None:
+    """Clamp offset d so every rel + d stays a legal DC value; None when impossible."""
+    lim = (1024 + q) // q
+    lo_d, hi_d = -lim - int(rel.min()), lim - int(rel.max())
+    if lo_d > hi_d:
+        return None
+    return float(min(max(d, lo_d), hi_d))
 
 
 def decode_for(ctx: Context) -> tuple[M.ParseResult, FrameTables, D.ScanResult] | None:
@@ -157,21 +204,61 @@ class FillHoles(Recipe):
                 if not full and keep + n_tail > iv.mcu_count - 1:
                     tail = None  # cannot fit
             trusted[iv.mcu_first + keep : iv.mcu_first + iv.mcu_count] = False
-            if tail is not None:
-                f = tail["first_mcu"]
-                n = tail["n"]
+            plan[iv.index] = {"keep": keep, "tail": tail, "reason": reason}
+
+        # Tails: the DC offset of each is re-estimated against the rows around it, as they
+        # will look in the output - tails close to real rows first, the others then also
+        # lean on those (dense damage often leaves no clean row next to a tail).
+        pending = [pl for pl in plan.values() if pl["tail"] is not None]
+        for max_dist in TAIL_REF_ROUNDS:
+            if not pending:
+                break
+            refs = {cid: vertical_reference(work_dc[cid], block_mask(trusted, work_dc[cid], h, v, mcus_per_row))
+                    for cid, h, v in comps}
+            later = []
+            for pl in pending:
+                tail = pl["tail"]
+                f, n, rel = tail["first_mcu"], tail["n"], tail["dc_rel"]
+                deltas = {}
+                col = 0
+                dists = []
+                for cid, h, v in comps:
+                    if tail["full"]:
+                        deltas[cid], col = 0.0, col + h * v  # a whole interval: DC values are absolute
+                        dists.append(0.0)
+                        continue
+                    br, bc = tail_blocks(f, n, h, v, mcus_per_row)
+                    val, dist = refs[cid]
+                    rv, dv = val[br, bc], dist[br, bc]
+                    r = rel[:, col : col + h * v]
+                    good = np.isfinite(dv) & ~np.isnan(rv)
+                    dists.append(float(np.mean(dv[good])) if good.any() else math.inf)
+                    deltas[cid] = float(np.median(rv[good] - r[good])) if good.any() else None
+                    col += h * v
+                if max(dists) > max_dist:
+                    later.append(pl)
+                    continue
+                col = 0
+                ok = True
+                for cid, h, v in comps:
+                    d = deltas[cid] if deltas[cid] is not None else float(tail["delta"][cid])
+                    d = legal_offset(rel[:, col : col + h * v], qdc[cid], d)
+                    if d is None:
+                        ok = False
+                        break
+                    deltas[cid] = d
+                    col += h * v
+                if not ok:
+                    pl["tail"] = None
+                    continue
+                tail["delta"] = {cid: int(round(d)) for cid, d in deltas.items()}
                 trusted[f : f + n] = True
-                rel = tail["dc_rel"]
                 col = 0
                 for cid, h, v in comps:
-                    d = tail["delta"][cid]
-                    idx = np.arange(f, f + n)
-                    mrow, mcol = np.divmod(idx, mcus_per_row)
-                    for by in range(v):
-                        for bx in range(h):
-                            work_dc[cid][mrow * v + by, mcol * h + bx] = rel[:, col] + d
-                            col += 1
-            plan[iv.index] = {"keep": keep, "tail": tail, "reason": reason}
+                    br, bc = tail_blocks(f, n, h, v, mcus_per_row)
+                    work_dc[cid][br, bc] = rel[:, col : col + h * v] + tail["delta"][cid]
+                    col += h * v
+            pending = later
         covered = max((iv.mcu_first + iv.mcu_count for iv in sr.intervals), default=0)
         if covered < total:
             trusted[covered:] = False
@@ -179,23 +266,7 @@ class FillHoles(Recipe):
         # ---------------------------------------------------------------- interpolation sources
         interp: dict[int, np.ndarray] = {}
         for cid, h, v in comps:
-            arr = work_dc[cid]
-            rows, cols = arr.shape
-            okm = np.repeat(np.repeat(trusted[: (rows // v) * mcus_per_row].reshape(rows // v, mcus_per_row), v, 0), h, 1)
-            okm = okm[:rows, :cols] & ~np.isnan(arr)
-            ridx = np.arange(rows)[:, None].repeat(cols, 1)
-            above = np.where(okm, ridx, -1)
-            above = np.maximum.accumulate(above, axis=0)
-            below = np.where(okm, ridx, rows)
-            below = np.minimum.accumulate(below[::-1], axis=0)[::-1]
-            colidx = np.arange(cols)[None, :].repeat(rows, 0)
-            va = np.where(above >= 0, arr[np.clip(above, 0, rows - 1), colidx], np.nan)
-            vb = np.where(below < rows, arr[np.clip(below, 0, rows - 1), colidx], np.nan)
-            da = (ridx - above).astype(float)
-            db = (below - ridx).astype(float)
-            lin = (va * db + vb * da) / np.where(da + db > 0, da + db, 1)
-            val = np.where(np.isnan(va), vb, np.where(np.isnan(vb), va, lin))
-            val = np.where(okm, arr, val)
+            val, _dist = vertical_reference(work_dc[cid], block_mask(trusted, work_dc[cid], h, v, mcus_per_row))
             interp[cid] = np.nan_to_num(val, nan=0.0)
 
         def fill_targets(first, count, last_override=None):

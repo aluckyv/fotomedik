@@ -16,6 +16,7 @@
  * Build:  python build_fastdec.py
  */
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -25,7 +26,7 @@
 #define EXPORT
 #endif
 
-#define FASTDEC_ABI 6  /* bump whenever an exported signature changes; fastdec.py checks it */
+#define FASTDEC_ABI 10  /* bump whenever an exported signature changes; fastdec.py checks it */
 
 EXPORT int fastdec_abi(void) { return FASTDEC_ABI; }
 
@@ -347,86 +348,129 @@ EXPORT int64_t eval_flips(uint8_t *data, int64_t data_len, int64_t start_byte, i
 }
 
 /* Tail recovery: the latest data of an interval survives after a damaged stretch,
- * but where its MCUs start is unknown. Huffman streams resynchronise by
- * themselves, so decoding from almost any bit after the damage converges on the
- * true parse and ends exactly at the interval's restart marker.
+ * but where its MCUs start is unknown. Decoding from any bit position yields a
+ * deterministic sequence of MCU boundaries (the DC predictor does not change where
+ * an MCU ends), so the parses from all start positions form a graph: every
+ * position points to the end of the MCU decoded from it. Huffman streams
+ * resynchronise, so paths merge quickly - junk mostly into the true parse, but junk
+ * paths also merge with each other first and can run a dozen MCUs before joining.
  *
- * Scans start positions from marker_pos-1 back to `lo`, every bit. A start counts
- * when decoding from it reaches the marker exactly (1-bit padding allowed) after
- * at most max_mcus MCUs. The first success is decoded to the end; later (earlier
- * in the file) starts stop as soon as they land on a known MCU boundary of the
- * reference parse (splice), so each costs a few MCUs. A start inside the
- * damage also "decodes" (garbage) and eventually lands on the true parse, but
- * only after many MCUs: once a reference exists, a start must splice within
- * `max_head` MCUs to count. Scanning stops after `give_up` bytes without a success.
+ * Trials start every `step` bytes (two bit phases) in [lo, marker_pos), each stops
+ * when it reaches a position already in the graph. The flow of a position is the
+ * number of trial starts whose path passes through it. In intact data nearly every
+ * start converges on the true parse within a few MCUs, so walking back from the
+ * last MCU (the one ending exactly on the marker) always to the predecessor with
+ * the largest flow follows the true parse; junk branches carry little flow.
  *
- * Returns the number of MCUs of the longest tail (0 if none) and its start in
- * *best_bit (absolute bit position); known[0..return) then holds the MCU start
- * bits of that tail. known, trial: int64[max_mcus + 1]. */
-EXPORT int64_t tail_scan(const uint8_t *data, int64_t data_len, int64_t lo, int64_t marker_pos,
+ * Returns the number of MCU starts written to out_bits (ascending, ending with the
+ * last MCU before the marker; at most cap), 0 if no path reaches the marker, -1 if
+ * memory ran out. out_flow gets the flow of each. */
+#define TF_NONE  (-1)
+#define TF_TERM  (-2)
+
+typedef struct {
+    int64_t *pos; int64_t *next; int32_t *starts; int32_t *flow; int64_t *best; int32_t *bestf;
+    int64_t n, cap;
+    int64_t *hkey; int64_t *hval; int64_t hmask;
+} tgraph_t;
+
+static inline uint64_t tf_hash(int64_t k) {
+    uint64_t x = (uint64_t)k * 0x9E3779B97F4A7C15ULL;
+    return x ^ (x >> 29);
+}
+
+/* index of pos; inserts a fresh node when absent (*fresh = 1). -1 when full. */
+static int64_t tf_get(tgraph_t *g, int64_t pos, int *fresh) {
+    uint64_t h = tf_hash(pos) & (uint64_t)g->hmask;
+    for (;;) {
+        if (g->hkey[h] == -1) break;
+        if (g->hkey[h] == pos) { *fresh = 0; return g->hval[h]; }
+        h = (h + 1) & (uint64_t)g->hmask;
+    }
+    if (g->n >= g->cap) return -1;
+    int64_t i = g->n++;
+    g->hkey[h] = pos; g->hval[h] = i;
+    g->pos[i] = pos; g->next[i] = TF_NONE; g->starts[i] = 0;
+    *fresh = 1;
+    return i;
+}
+
+static const int64_t *tf_sort_pos;
+static int tf_cmp(const void *a, const void *b) {
+    int64_t x = tf_sort_pos[*(const int64_t *)a], y = tf_sort_pos[*(const int64_t *)b];
+    return (x > y) - (x < y);
+}
+
+EXPORT int64_t tail_flow(const uint8_t *data, int64_t data_len, int64_t lo, int64_t marker_pos,
                          const comp_t *comps, int ncomp,
                          const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
                          const int32_t *mincode, const uint8_t *symbols,
-                         int64_t max_mcus, int64_t give_up, int64_t max_head, int64_t *best_bit,
-                         int64_t *known, int64_t *trial) {
+                         int64_t step, int64_t max_nodes, int64_t cap, int64_t *out_bits, int32_t *out_flow) {
     tables_t t = { fast, maxcode, valptr, mincode, symbols };
-    int32_t preds[8];
-    int32_t dc[64];
-    int64_t nknown = 0;      /* known[0..nknown) ascending MCU start bits of the reference parse */
-    int64_t best_n = 0;
-    *best_bit = -1;
-    int64_t last_success = marker_pos;
-    for (int64_t p = marker_pos - 1; p >= lo; p--) {
-        if (last_success - p > give_up && best_n > 0) break;
-        if (last_success - p > give_up * 4) break;
-        for (int bit = 7; bit >= 0; bit--) {
-            int64_t sbit = p * 8 + bit;
-            if (nknown && sbit >= known[0]) continue;  /* inside the known parse already */
+    tgraph_t g; memset(&g, 0, sizeof g);
+    int64_t hsize = 1; while (hsize < 2 * max_nodes) hsize <<= 1;
+    g.cap = max_nodes; g.hmask = hsize - 1;
+    g.pos = malloc(sizeof(int64_t) * (size_t)max_nodes);
+    g.next = malloc(sizeof(int64_t) * (size_t)max_nodes);
+    g.starts = malloc(sizeof(int32_t) * (size_t)max_nodes);
+    g.flow = malloc(sizeof(int32_t) * (size_t)max_nodes);
+    g.best = malloc(sizeof(int64_t) * (size_t)max_nodes);
+    g.bestf = malloc(sizeof(int32_t) * (size_t)max_nodes);
+    g.hkey = malloc(sizeof(int64_t) * (size_t)hsize);
+    g.hval = malloc(sizeof(int64_t) * (size_t)hsize);
+    int64_t *order = malloc(sizeof(int64_t) * (size_t)max_nodes);
+    int64_t result = -1;
+    if (!g.pos || !g.next || !g.starts || !g.flow || !g.best || !g.bestf || !g.hkey || !g.hval || !order) goto done;
+    memset(g.hkey, 0xFF, sizeof(int64_t) * (size_t)hsize);  /* all -1 */
+    int32_t preds[8], dc[64];
+    int full = 0;
+    for (int64_t p = marker_pos - 1; p >= lo && !full; p -= step) {
+        for (int ph = 0; ph < 8 && !full; ph += 4) {
+            int fresh;
+            int64_t cur = tf_get(&g, p * 8 + ph, &fresh);
+            if (cur < 0) { full = 1; break; }
+            g.starts[cur]++;
+            if (!fresh) continue;
             reader_t r;
             reader_init(&r, data, p, marker_pos + 2);
-            int err = 0;
-            if (bit) { int32_t d; err = read_bits(&r, bit, &d); }
-            if (err) continue;
-            memset(preds, 0, sizeof preds);
-            int64_t n = 0, total = -1;
-            int64_t q = 0; /* pointer into known */
-            int spliced = 0;
-            while (n < max_mcus) {
-                if (nknown && n > max_head) break;  /* garbage until it happened to resync */
-                int64_t eb; int ebit;
-                tell(&r, &eb, &ebit);
-                int64_t pos = eb * 8 + ebit;
-                trial[n] = pos;
-                if (nknown) {
-                    while (q < nknown && known[q] < pos) q++;
-                    if (q < nknown && known[q] == pos) { total = n + (nknown - q); spliced = 1; break; }
-                }
-                err = decode_mcu(&r, comps, ncomp, &t, preds, dc, 0);  /* predictor unknown: no DC range test */
-                if (err) break;
-                n++;
-                /* reached the marker? */
-                int64_t eb2; int ebit2; tell(&r, &eb2, &ebit2);
+            if (ph) { int32_t d; if (read_bits(&r, ph, &d)) { g.next[cur] = TF_NONE; continue; } }
+            for (;;) {
+                memset(preds, 0, sizeof preds);
+                if (decode_mcu(&r, comps, ncomp, &t, preds, dc, 0)) break;  /* dead end */
+                int64_t eb; int ebit; tell(&r, &eb, &ebit);
                 int pad_ok;
-                int64_t a = aligned_end(data, data_len, eb2, ebit2, &pad_ok);
-                if (a == marker_pos && pad_ok) { total = n; break; }
-                if (eb2 > marker_pos) break;
+                if (aligned_end(data, data_len, eb, ebit, &pad_ok) == marker_pos && pad_ok) { g.next[cur] = TF_TERM; break; }
+                if (eb > marker_pos) break;
+                int64_t nx = tf_get(&g, eb * 8 + ebit, &fresh);
+                if (nx < 0) { full = 1; break; }
+                g.next[cur] = nx;
+                if (!fresh) break;  /* merged into a known path */
+                cur = nx;
             }
-            if (total <= 0 || total > max_mcus) continue;
-            if (total >= best_n) {
-                /* new reference parse: this start's boundaries + the known suffix */
-                int64_t head = n;  /* MCUs decoded before splicing/ending */
-                int64_t suffix = spliced ? (nknown - q) : 0;
-                int64_t newn = head + suffix;
-                if (newn <= max_mcus) {
-                    if (suffix) memmove(known + head, known + q, sizeof(int64_t) * (size_t)suffix);
-                    memcpy(known, trial, sizeof(int64_t) * (size_t)head);
-                    nknown = newn;
-                }
-                best_n = total;
-                *best_bit = sbit;
-            }
-            last_success = p;
         }
     }
-    return best_n;
+    /* flow: positions in ascending order, every node hands its flow to its successor */
+    for (int64_t i = 0; i < g.n; i++) { order[i] = i; g.flow[i] = g.starts[i]; g.best[i] = -1; g.bestf[i] = 0; }
+    tf_sort_pos = g.pos;
+    qsort(order, (size_t)g.n, sizeof(int64_t), tf_cmp);
+    int64_t term = -1;
+    for (int64_t k = 0; k < g.n; k++) {
+        int64_t v = order[k];
+        int64_t nx = g.next[v];
+        if (nx == TF_TERM) { if (term < 0 || g.flow[v] > g.flow[term]) term = v; continue; }
+        if (nx < 0) continue;
+        g.flow[nx] += g.flow[v];
+        if (g.flow[v] > g.bestf[nx]) { g.bestf[nx] = g.flow[v]; g.best[nx] = v; }
+    }
+    result = 0;
+    if (term < 0) goto done;
+    int64_t m = 0;
+    for (int64_t v = term; v >= 0 && m < cap; v = g.best[v]) m++;
+    int64_t i = m;
+    for (int64_t v = term; v >= 0 && i > 0; v = g.best[v]) { i--; out_bits[i] = g.pos[v]; out_flow[i] = g.flow[v]; }
+    result = m;
+done:
+    free(g.pos); free(g.next); free(g.starts); free(g.flow); free(g.best); free(g.bestf);
+    free(g.hkey); free(g.hval); free(order);
+    return result;
 }

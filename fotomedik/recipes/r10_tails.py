@@ -4,9 +4,11 @@ Dying flash rarely flips isolated bits: it rots whole sectors (several KB with a
 few % of bits wrong). Nothing inside such a stretch can be repaired, but the data
 after it is intact. Its MCU boundaries are unknown, yet Huffman streams
 resynchronise by themselves: decoding from almost any bit after the damage
-converges on the true parse and ends exactly on the interval's restart marker
-(kernel.tail_scan). That fixes how many MCUs the tail holds and so where they
-belong. The DC values come out relative to an unknown predictor; one offset per
+converges on the true parse and ends exactly on the interval's restart marker.
+kernel.tail_flow follows the parse most start positions flow into back from the
+marker. That fixes how many MCUs the tail holds and so where they belong. Leading
+MCUs whose DC clashes with the rows above/below (junk decoded inside the damage)
+are trimmed. The DC values come out relative to an unknown predictor; one offset per
 colour component is estimated from the rows above/below (median) and handed to
 R9, which splices the tail behind the filled hole.
 
@@ -23,47 +25,46 @@ import numpy as np
 
 from ..jpeg import decoder as D
 from ..jpeg import kernel as K
-from ..scan.garbage import last_broken_stuffing
+from ..scan.garbage import last_dense_damage
 from .base import Context, Recipe
-from .r9_holes import decode_for
+from .r9_holes import block_mask, decode_for, tail_blocks, vertical_reference
 from .registry import register
 
-DROP_FIRST = 3  # first MCUs of a tail may be junk that resynchronised onto the true parse
-GIVE_UP = 512  # bytes scanned past the last convergent start before stopping
-MAX_HEAD = 6  # MCUs a start may take to land on the reference parse
+DROP_FIRST = 2  # the first MCUs of a tail start inside the damage
 MIN_TAIL = 2  # MCUs worth splicing
-ANOMALY_LEVELS = 96  # gray levels: leading tail MCUs this far off their neighbours are dropped
-MAX_TRIM = 8
+ANOMALY_MIN = 20  # gray levels: a leading MCU at least this far off its neighbours is junk
+TRIM_SCAN = 48  # leading MCUs examined for junk
+MAX_REF_DIST = 8  # block rows: farther clean rows say little about a tail's DC
 
 
-def _neighbour_offsets(sr: D.ScanResult, ft, first_mcu: int, dc_rel: np.ndarray, pk: K.Packed) -> dict[int, float | None]:
-    """Per component: median(neighbour DC - relative DC) over tail blocks with a clean vertical neighbour."""
-    comps, per_row, _rows = D._scan_components(ft)
-    n = dc_rel.shape[0]
-    out: dict[int, float | None] = {}
-    col = 0
-    for ci, c in enumerate(comps):
-        arr = sr.dc[c.cid]
-        diffs: list[float] = []
-        for j in range(n):
-            mi = first_mcu + j
-            mrow, mcol = divmod(mi, per_row)
-            for by in range(c.v):
-                for bx in range(c.h):
-                    bi = col + by * c.h + bx
-                    brow, bcol = mrow * c.v + by, mcol * c.h + bx
-                    rel = float(dc_rel[j, bi])
-                    if by == 0 and brow > 0:
-                        um = (mrow - 1) * per_row + mcol
-                        if sr.mcu_ok[um] and not math.isnan(arr[brow - 1, bcol]):
-                            diffs.append(arr[brow - 1, bcol] - rel)
-                    if by == c.v - 1 and brow + 1 < arr.shape[0]:
-                        dm = (mrow + 1) * per_row + mcol
-                        if dm < len(sr.mcu_ok) and sr.mcu_ok[dm] and not math.isnan(arr[brow + 1, bcol]):
-                            diffs.append(arr[brow + 1, bcol] - rel)
-        out[c.cid] = float(np.median(diffs)) if diffs else None
-        col += c.h * c.v
-    return out
+class References:
+    """Per component: DC interpolated from the nearest clean rows above/below and the
+    distance to them (block rows), from the decode before any repair."""
+
+    def __init__(self, sr: D.ScanResult, ft):
+        self.comps, self.per_row, _rows = D._scan_components(ft)
+        self.ref = {}
+        for c in self.comps:
+            arr = sr.dc[c.cid]
+            self.ref[c.cid] = vertical_reference(arr, block_mask(sr.mcu_ok, arr, c.h, c.v, self.per_row))
+
+    def blocks(self, first_mcu: int, n: int):
+        """Per component (cid, column slice in dc_rel, reference values, distances), shape (n, h*v)."""
+        col = 0
+        for c in self.comps:
+            br, bc = tail_blocks(first_mcu, n, c.h, c.v, self.per_row)
+            val, dist = self.ref[c.cid]
+            yield c.cid, slice(col, col + c.h * c.v), val[br, bc], dist[br, bc]
+            col += c.h * c.v
+
+    def offsets(self, first_mcu: int, dc_rel: np.ndarray, max_dist: float = MAX_REF_DIST) -> dict[int, float | None]:
+        """Per component: median(reference - relative DC) over blocks with a reference
+        within max_dist block rows."""
+        out: dict[int, float | None] = {}
+        for cid, sl, rv, dv in self.blocks(first_mcu, dc_rel.shape[0]):
+            good = (dv <= max_dist) & ~np.isnan(rv)
+            out[cid] = float(np.median(rv[good] - dc_rel[:, sl][good])) if good.any() else None
+        return out
 
 
 def _left_offsets(sr: D.ScanResult, ft, first_mcu: int, dc_rel: np.ndarray) -> dict[int, float | None]:
@@ -84,6 +85,40 @@ def _left_offsets(sr: D.ScanResult, ft, first_mcu: int, dc_rel: np.ndarray) -> d
         out[c.cid] = None if val is None else val - float(dc_rel[0, col])
         col += c.h * c.v
     return out
+
+
+def head_anomaly(refs: References, first_mcu: int, dc_rel: np.ndarray, delta: dict, pk: K.Packed,
+                 max_dist: float = MAX_REF_DIST) -> np.ndarray:
+    """Gray levels by which each tail MCU misses the DC its surroundings suggest (first
+    block of every component, worst component); NaN where no reference is near."""
+    n = dc_rel.shape[0]
+    out = np.full(n, np.nan)
+    for ci, (cid, sl, rv, dv) in enumerate(refs.blocks(first_mcu, n)):
+        a = np.abs(dc_rel[:, sl][:, 0] + delta[cid] - rv[:, 0]) * (pk.qdc[ci] / 8.0)
+        a = np.where((dv[:, 0] <= max_dist) & ~np.isnan(rv[:, 0]), a, np.nan)
+        out = np.where(np.isnan(out), a, np.where(np.isnan(a), out, np.maximum(out, a)))
+    return out
+
+
+def leading_junk(anom: np.ndarray, floor: float = ANOMALY_MIN, gap: int = 4) -> int:
+    """How many leading MCUs to drop: through the last anomalous one that is followed by
+    fewer than `gap` normal ones before the next anomaly. The threshold adapts to the image:
+    max(floor, 4 x the median anomaly of the whole tail)."""
+    vals = anom[~np.isnan(anom)]
+    if not len(vals):
+        return 0
+    thr = max(floor, 4.0 * float(np.median(vals)))
+    trim = 0
+    normal = 0
+    for i, a in enumerate(anom):
+        if not math.isnan(a) and a > thr:
+            trim = i + 1
+            normal = 0
+        else:
+            normal += 1
+            if normal >= gap:
+                break
+    return trim
 
 
 def find_interval_start(data: bytes, pk: K.Packed, lo: int, hi: int, mpos: int, count: int,
@@ -169,6 +204,7 @@ class TailRecovery(Recipe):
         total = sr.total_mcus
         tails: dict[int, dict] = {}
         recovered = 0
+        refs = References(sr, ft)
         for iv, last, marker_pos in self._spans(sr, parse):
             j = last
             mpos = marker_pos
@@ -179,18 +215,20 @@ class TailRecovery(Recipe):
                     j -= 1
                     continue
                 lo = iv.byte_start
-                bad = last_broken_stuffing(data, lo, mpos)
+                bad = last_dense_damage(data, lo, mpos)
                 if bad is not None:
-                    lo = bad + 2  # certain damage: intact data resumes after it
-                n, start_bit, bits = K.tail_scan(data, lo, mpos, pk, count_j, GIVE_UP, MAX_HEAD)
+                    lo = bad + 2  # end of a rotted stretch: intact data resumes after it
+                bits, _flows = K.tail_flow(data, lo, mpos, pk, count_j)
+                n = len(bits)
                 if n < MIN_TAIL + DROP_FIRST:
                     break
+                start_bit = bits[0]
                 full = False
                 if dri and j > iv.index:
                     # a later interval of the span may be intact from its very start
                     avg = max(64, (iv.byte_end or mpos) - iv.byte_start) / max(1, last - iv.index + 1)
                     # the true start may lie a few MCUs inside the found tail (junk head)
-                    hi_s = bits[min(len(bits) - 1, DROP_FIRST + MAX_HEAD)] // 8 + 1
+                    hi_s = bits[min(len(bits) - 1, DROP_FIRST + 12)] // 8 + 1
                     s0 = find_interval_start(data, pk, max(lo, int(mpos - 2.5 * avg)), min(mpos, hi_s),
                                              mpos, count_j, bits, 0xD0 + ((j - 1) % 8))
                     if s0 is not None:
@@ -210,31 +248,16 @@ class TailRecovery(Recipe):
                 if full:
                     delta = {cid: 0.0 for cid in pk.cids}
                 else:
-                    delta = _neighbour_offsets(sr, ft, first_tail, dc_rel, pk)
+                    delta = refs.offsets(first_tail, dc_rel)
                     left = _left_offsets(sr, ft, first_tail, dc_rel)
                     delta = {cid: (delta[cid] if delta[cid] is not None else (left[cid] if left[cid] is not None else 0.0))
                              for cid in pk.cids}
                 # trim leading MCUs that clash with their neighbours (junk before convergence)
                 trim = 0
                 if not full:
-                    luma = pk.cids[0]
-                    q = pk.qdc[0] / 8.0
-                    abs0 = dc_rel[:, 0] + delta[luma]
-                    comps, per_row, _r = D._scan_components(ft)
-                    c0 = comps[0]
-                    arr = sr.dc[luma]
-                    while trim < min(MAX_TRIM, n_tail - MIN_TAIL):
-                        mi = first_tail + trim
-                        mrow, mcol = divmod(mi, per_row)
-                        ref = []
-                        for drow in (-1, c0.v):
-                            r = mrow * c0.v + drow
-                            if 0 <= r < arr.shape[0] and not math.isnan(arr[r, mcol * c0.h]):
-                                ref.append(arr[r, mcol * c0.h])
-                        if ref and abs(abs0[trim] - float(np.mean(ref))) * q > ANOMALY_LEVELS:
-                            trim += 1
-                        else:
-                            break
+                    k = min(TRIM_SCAN, n_tail - MIN_TAIL)
+                    anom = head_anomaly(refs, first_tail, dc_rel, delta, pk)
+                    trim = min(k, leading_junk(anom))
                 if trim:
                     s_bit = bits[drop + trim]
                     n_tail -= trim

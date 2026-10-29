@@ -85,8 +85,8 @@ def test_eval_flips_parity():
 
 
 @needs_c
-def test_tail_scan_parity_and_recovery():
-    """Destroy the first half of interval 6: the tail must be found, identically in C and Python."""
+def test_tail_flow_parity_and_recovery():
+    """Rot the first half of interval 6: the tail must be found, identically in C and Python."""
     data = make_jpeg(make_image(512, 256), restart_rows=1)
     res, ft, pk = _setup(data)
     ref = D.decode_scan(data, res, ft)
@@ -99,19 +99,17 @@ def test_tail_scan_parity_and_recovery():
             buf[o] ^= 1 << int(rng.integers(0, 8))
     broken = bytes(buf)
 
-    from fotomedik.scan.garbage import last_broken_stuffing
-
-    bad = last_broken_stuffing(broken, iv.byte_start, iv.byte_end)
-    lo = iv.byte_start if bad is None else bad + 2
-
     def run():
-        return kernel.tail_scan(broken, lo, iv.byte_end, pk, iv.mcu_count)
+        return kernel.tail_flow(broken, iv.byte_start, iv.byte_end, pk, iv.mcu_count)
 
     c, py = _both(run)
     assert c == py
-    n, start_bit, bits = c
+    bits, flows = c
+    n = len(bits)
     true_starts = [m.bit_start for m in ref.mcus if iv.mcu_first <= m.index < iv.mcu_first + iv.mcu_count]
-    # a good share of the interval comes back, and after the first few (possibly junk)
-    # MCUs the tail's boundaries are exactly the true ones
-    assert n >= iv.mcu_count // 3
-    assert bits[3:] == true_starts[-(n - 3):]
+    # after a few junk MCUs (a parse that met the true one late) the tail's boundaries are
+    # exactly the true ones, and that true part is a good share of the interval
+    k = next(i for i in range(n) if bits[i:] == true_starts[-(n - i):])
+    assert k <= 6
+    assert n - k >= iv.mcu_count // 3
+    assert flows[-1] == max(flows)  # every start flows into the last MCU

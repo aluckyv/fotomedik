@@ -369,79 +369,102 @@ def eval_flips(buf: np.ndarray, start_byte: int, start_bit: int, end: int, pk: P
     return res_dec, res_complete.astype(bool), res_pad.astype(bool), res_rough
 
 
-def py_tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give_up: int, max_head: int = 3):
-    """Reference for the C tail_scan (see _fastdec.c). Returns (n, start_bit, mcu_start_bits)."""
+def py_tail_flow(data, lo: int, marker_pos: int, pk: Packed, step: int, max_nodes: int, cap: int):
+    """Reference for the C tail_flow (see _fastdec.c): (mcu_start_bits, flows)."""
     length = len(data)
-    known: list[int] = []
-    best_n, best_bit = 0, -1
-    last_success = marker_pos
-    for p in range(marker_pos - 1, lo - 1, -1):
-        if last_success - p > give_up and best_n > 0:
-            break
-        if last_success - p > give_up * 4:
-            break
-        for bit in range(7, -1, -1):
-            sbit = p * 8 + bit
-            if known and sbit >= known[0]:
+    nxt: dict[int, int | None] = {}  # position -> next position (None: dead end, -2: ends on the marker)
+    starts: dict[int, int] = {}
+    full = False
+    p = marker_pos - 1
+    while p >= lo and not full:
+        for ph in (0, 4):
+            sbit = p * 8 + ph
+            if sbit in nxt:
+                starts[sbit] = starts.get(sbit, 0) + 1
                 continue
+            if len(nxt) >= max_nodes:
+                full = True
+                break
+            nxt[sbit] = None
+            starts[sbit] = starts.get(sbit, 0) + 1
+            cur = sbit
             br = BitReader(data, p, marker_pos + 2)
             try:
-                if bit:
-                    br.read_bits(bit)
-            except (MarkerHit, EOFError):
-                continue
-            preds = [0] * pk.ncomp
-            dc: list[int] = []
-            n, total, q, spliced = 0, -1, 0, False
-            trial: list[int] = []
-            while n < max_mcus:
-                if known and n > max_head:
-                    break  # garbage until it happened to resync
-                eb, ebit = br.tell()
-                pos = eb * 8 + ebit
-                trial.append(pos)
-                if known:
-                    while q < len(known) and known[q] < pos:
-                        q += 1
-                    if q < len(known) and known[q] == pos:
-                        total, spliced = n + (len(known) - q), True
+                if ph:
+                    br.read_bits(ph)
+                while True:
+                    _py_mcu(br, pk, [0] * pk.ncomp, [], check_dc=False)
+                    eb, ebit = br.tell()
+                    a, pad = py_aligned_end(data, length, eb, ebit)
+                    if a == marker_pos and pad:
+                        nxt[cur] = -2
                         break
-                try:
-                    _py_mcu(br, pk, preds, dc, check_dc=False)  # predictor unknown: no DC range test
-                except (_Bad, MarkerHit, EOFError):
-                    break
-                n += 1
-                eb2, ebit2 = br.tell()
-                a, pad = py_aligned_end(data, length, eb2, ebit2)
-                if a == marker_pos and pad:
-                    total = n
-                    break
-                if eb2 > marker_pos:
-                    break
-            if total <= 0 or total > max_mcus:
-                continue
-            if total >= best_n:
-                suffix = known[q:] if spliced else []
-                if n + len(suffix) <= max_mcus:
-                    known = trial[:n] + suffix
-                best_n, best_bit = total, sbit
-            last_success = p
-    return best_n, best_bit, known
+                    if eb > marker_pos:
+                        break
+                    e = eb * 8 + ebit
+                    if e in nxt:
+                        nxt[cur] = e
+                        break
+                    if len(nxt) >= max_nodes:
+                        full = True
+                        break
+                    nxt[cur] = e
+                    nxt[e] = None
+                    cur = e
+            except (_Bad, MarkerHit, EOFError):
+                pass
+        p -= step
+    flow = {v: starts.get(v, 0) for v in nxt}
+    best: dict[int, int] = {}
+    bestf: dict[int, int] = {}
+    term = None
+    for v in sorted(nxt):
+        n = nxt[v]
+        if n == -2:
+            if term is None or flow[v] > flow[term]:
+                term = v
+            continue
+        if n is None:
+            continue
+        flow[n] += flow[v]
+        if flow[v] > bestf.get(n, 0):
+            bestf[n], best[n] = flow[v], v
+    if term is None:
+        return [], []
+    chain = []
+    v = term
+    while v is not None and len(chain) < cap:
+        chain.append(v)
+        v = best.get(v)
+    chain.reverse()
+    return chain, [flow[v] for v in chain]
 
 
-def tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give_up: int = 512, max_head: int = 3):
-    """Longest decodable tail ending exactly at marker_pos: (n_mcus, start_bit, mcu_start_bits)."""
+def _pydata(data):
+    return memoryview(as_array(data)).cast("B") if isinstance(data, np.ndarray) else data
+
+
+TAIL_MAX_NODES = 1 << 20
+TAIL_MAX_TRIALS = 1 << 17
+
+
+def tail_flow(data, lo: int, marker_pos: int, pk: Packed, cap: int, step: int | None = None):
+    """MCU start bits of the tail that ends exactly at marker_pos, found by parse-graph
+    flow (see _fastdec.c): (mcu_start_bits ascending, flow per start). At most `cap`
+    starts, the last being the MCU right before the marker; empty when none ends there."""
+    if step is None:
+        step = max(8, (marker_pos - lo) * 2 // TAIL_MAX_TRIALS + 1)
     lib = fastdec.load()
     if lib is None:
-        return py_tail_scan(memoryview(as_array(data)).cast("B") if isinstance(data, np.ndarray) else data,
-                            lo, marker_pos, pk, max_mcus, give_up, max_head)
+        return py_tail_flow(_pydata(data), lo, marker_pos, pk, step, TAIL_MAX_NODES, cap)
     arr = as_array(data)
-    known = np.zeros(max_mcus + 1, dtype=np.int64)
-    trial = np.zeros(max_mcus + 1, dtype=np.int64)
-    best = np.zeros(1, dtype=np.int64)
-    n = int(lib.tail_scan(
+    bits = np.zeros(max(1, cap), dtype=np.int64)
+    flows = np.zeros(max(1, cap), dtype=np.int32)
+    n = int(lib.tail_flow(
         _ptr(arr), len(arr), lo, marker_pos, pk.c_comps, pk.ncomp,
         _ptr(pk.fast), _ptr(pk.maxcode), _ptr(pk.valptr), _ptr(pk.mincode), _ptr(pk.symbols),
-        max_mcus, give_up, max_head, _ptr(best), _ptr(known), _ptr(trial),
+        step, TAIL_MAX_NODES, cap, _ptr(bits), _ptr(flows),
     ))
-    return n, int(best[0]), [int(x) for x in known[:n]]
+    if n < 0:
+        raise MemoryError("tail_flow: out of memory")
+    return [int(x) for x in bits[:n]], [int(x) for x in flows[:n]]

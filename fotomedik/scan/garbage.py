@@ -167,3 +167,18 @@ def last_broken_stuffing(data: bytes, lo: int, hi: int) -> int | None:
         n = data[p + 1]
         if not (n == 0x00 or 0xD0 <= n <= 0xD9 or n == 0xFF):
             return p
+
+
+def last_dense_damage(data: bytes, lo: int, hi: int, window: int = 2048) -> int | None:
+    """Offset of the last broken FF pair in [lo, hi) that has another one within `window`
+    bytes before it (the end of a rotted stretch). Isolated broken pairs - single flipped
+    bits that decoding resynchronises past - are ignored."""
+    later = None
+    p = hi
+    while True:
+        p = last_broken_stuffing(data, lo, p)
+        if p is None:
+            return None
+        if later is not None and later - p <= window:
+            return later
+        later = p
