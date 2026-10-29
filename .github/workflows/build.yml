@@ -37,6 +37,8 @@ jobs:
 
   app-windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -70,6 +72,19 @@ jobs:
         with:
           name: FotoMedik-windows
           path: dist/FotoMedik.exe
+      - name: publish as the "app" release (stable download link)
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view app *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create app dist/FotoMedik.exe --title "FotoMedik app (latest build)" --notes "Windows app built from main. Download FotoMedik.exe and run it."
+          } else {
+            gh release upload app dist/FotoMedik.exe --clobber
+            gh release edit app --notes "Windows app built from main, commit ${{ github.sha }}. Download FotoMedik.exe and run it."
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
