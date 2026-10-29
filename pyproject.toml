@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
-ai = ["onnxruntime>=1.17"]  # on Windows: onnxruntime-directml (graphics card)
+ai = ["onnxruntime>=1.17", "onnx>=1.14", "packaging"]  # on Windows: onnxruntime-directml (graphics card)
 
 [project.scripts]
 fotomedik = "fotomedik.cli:main"

@@ -1,10 +1,15 @@
 """Maximum-quality hole filling with Stable Diffusion 1.5 inpainting (ONNX).
 
-The holes are repainted window by window (512x512 pixels at the photo's own scale).
-The diffusion does not start from noise but from the current picture with noise
-added part of the way (SDEdit, `STRENGTH`), so the shapes and colours the thumbnail
-gave the holes stay; the network adds texture and detail. Real pixels are passed to
-the inpainting network as known and are never changed. No text prompt is used.
+The holes are repainted window by window (512x512 pixels). The diffusion does not
+start from noise but from the current picture with noise added part of the way
+(SDEdit, `STRENGTH`), so the shapes and colours the thumbnail gave the holes stay;
+the network adds texture and detail. Real pixels are passed to the inpainting
+network as known and are never changed. No text prompt is used.
+
+The work is done on a reduced copy of the photo (`PRESETS`): a 12 MP photo is
+repainted at half size, in about 20 windows instead of 80, and each window then
+shows the network a bigger part of the scene. The repainted holes are brought back
+to full size by Real-ESRGAN (see enhance.enlarge_holes).
 
 Made for a graphics card: on the processor every window takes minutes.
 """
@@ -19,6 +24,20 @@ STEPS = 20
 STRENGTH = 0.6  # how far into the noise the start goes: higher invents more
 LATENT_SCALE = 0.18215
 BOS, EOS = 49406, 49407  # CLIP tokens: an empty prompt is BOS, then EOS padding
+
+# quality presets: (the photo is reduced this many times, length of the DDIM schedule);
+# with STRENGTH 0.6 the schedule lengths mean 6, 8 and 12 passes of the network per window
+PRESETS = {"fast": (4, 10), "balanced": (2, 14), "full": (1, 20)}
+PRESET_NAMES = {"fast": "fast", "balanced": "balanced", "full": "full size"}
+DEFAULT_PRESET = "balanced"
+MIN_SIDE = 768  # the reduced copy keeps at least this many pixels on its long side
+
+
+def working_divisor(long_side: int, divisor: int) -> int:
+    """The preset's reduction, lowered for small photos (a 2 MP photo is not quartered)."""
+    while divisor > 1 and long_side // divisor < MIN_SIDE:
+        divisor //= 2
+    return divisor
 
 
 def _dtype(inp):
@@ -104,9 +123,9 @@ def windows(holes: np.ndarray, size: int = WINDOW, stride: int = STRIDE) -> list
 
 
 def diffusion_fill(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, sd: Diffusion, progress=None,
-                   size: int = WINDOW, steps: int = STEPS) -> np.ndarray:
+                   size: int = WINDOW, steps: int = STEPS, stop=None, stats: dict | None = None) -> np.ndarray:
     """Holes of `arr` repainted window by window; real pixels stay."""
-    from .enhance import _soft
+    from .enhance import _check, _soft
 
     h, w = holes.shape
     pad_h, pad_w = max(0, size - h), max(0, size - w)
@@ -114,7 +133,10 @@ def diffusion_fill(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, sd: 
     hm = np.pad(holes, ((0, pad_h), (0, pad_w))) if pad_h or pad_w else holes
     done = np.zeros_like(hm)
     wins = windows(hm, size, min(STRIDE, size * 3 // 4))
+    if stats is not None:
+        stats["windows"] = len(wins)
     for i, (y, x) in enumerate(wins):
+        _check(stop)
         tile = work[y : y + size, x : x + size]
         m = hm[y : y + size, x : x + size] & ~done[y : y + size, x : x + size]
         if not m.any():
@@ -130,3 +152,34 @@ def diffusion_fill(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, sd: 
         if progress:
             progress(i + 1, len(wins))
     return work[:h, :w]
+
+
+def repaint_holes(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine, quality: str | None = None,
+                  progress=None, stop=None) -> tuple[np.ndarray, str]:
+    """Holes of `arr` repainted at the preset's working size and brought back to full
+    size (Real-ESRGAN where the engine has it, bicubic otherwise). Real pixels stay.
+    Returns (rgb, a few words on how it was done)."""
+    from PIL import Image
+
+    from .enhance import enlarge_holes, reduce, reduce_mask
+
+    divisor, steps = PRESETS[quality or DEFAULT_PRESET]
+    h, w = holes.shape
+    divisor = working_divisor(max(h, w), divisor)
+    st: dict = {}
+    if divisor == 1:
+        out = diffusion_fill(arr, holes, unknown, engine.sd, progress, steps=steps, stop=stop, stats=st)
+        return out, f"full size, {st.get('windows', 0)} windows"
+    lo, lo_holes = reduce(arr, holes, divisor)
+    lo_unknown = reduce_mask(unknown & holes, divisor) if unknown.any() else np.zeros_like(lo_holes)
+    lo_out = diffusion_fill(lo, lo_holes, lo_unknown, engine.sd, progress, steps=steps, stop=stop, stats=st)
+    if engine.sr is not None:
+        hi = enlarge_holes(lo_out, lo_holes, engine, divisor, None, stop) * 255.0
+        how = "Real-ESRGAN"
+    else:
+        hi = np.asarray(Image.fromarray(lo_out).resize((lo_out.shape[1] * divisor, lo_out.shape[0] * divisor),
+                                                       Image.BICUBIC), dtype=np.float32)
+        how = "bicubic"
+    hi = np.clip(np.rint(hi[:h, :w]), 0, 255).astype(np.uint8)
+    out = np.where(holes[..., None], hi, arr)
+    return out, f"1/{divisor} size, {st.get('windows', 0)} windows, enlarged by {how}"

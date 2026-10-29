@@ -79,7 +79,7 @@ STEP_MODELS = {
     "ai": (SR, INPAINT),
     "deblock": (DEBLOCK,),
     "faces": (FACE_DET, FACE),
-    "diffusion": (INPAINT, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT),
+    "diffusion": (INPAINT, SR, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT),  # SR enlarges the repainted holes
 }
 ALL = tuple(m for ms in STEP_MODELS.values() for m in ms)
 

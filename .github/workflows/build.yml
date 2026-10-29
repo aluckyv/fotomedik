@@ -73,7 +73,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e . pyside6 pyinstaller onnxruntime-directml opencv-python-headless
+      - run: pip install -e . pyside6 pyinstaller onnxruntime-directml onnx packaging opencv-python-headless
       - name: build _fastdec.dll
         run: python build_fastdec.py
       - name: demo photos
@@ -97,6 +97,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name FotoMedik
           --add-binary "fotomedik/jpeg/_fastdec.dll;fotomedik/jpeg"
           --hidden-import onnxruntime --collect-binaries onnxruntime
+          --hidden-import onnxruntime.transformers.float16 --hidden-import onnx
           --exclude-module tkinter --exclude-module pytest
           fotomedik_app.py
       - name: smoke test of the packaged app
@@ -120,7 +121,7 @@ jobs:
           FOTOMEDIK_MODELS: ${{ github.workspace }}\models
         run: |
           $p = Start-Process -FilePath dist\FotoMedik.exe -ArgumentList "--smoke-ai","demo","demo_out_ai","shot_ai.png" -PassThru -Wait
-          if (Test-Path shot_ai.txt) { Get-Content shot_ai.txt | Where-Object { $_ -notmatch '^Downloading .*%$' } | Select-Object -Last 9 | ForEach-Object { Write-Host "::notice title=smoke (AI)::$_" } }
+          if (Test-Path shot_ai.txt) { Get-Content shot_ai.txt | Where-Object { $_ -notmatch 'Downloading .*%$' } | Select-Object -Last 9 | ForEach-Object { Write-Host "::notice title=smoke (AI)::$_" } }
           Write-Host "exit code $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { exit 1 }
           if (!(Get-ChildItem demo_out_ai -Filter *_enhanced.jpg)) { exit 1 }

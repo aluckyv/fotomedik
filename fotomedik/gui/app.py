@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -110,6 +111,7 @@ class RepairWorker(QObject):
     result = Signal(object)
     ai_done = Signal(object)
     status = Signal(str)
+    ai_status = Signal(str)
     finished = Signal(float, str)
 
     def __init__(self, paths: list[Path], out: Path, options: dict):
@@ -122,7 +124,8 @@ class RepairWorker(QObject):
         err = ""
         try:
             runner.run(self.paths, self.out, self.options, on_result=self.result.emit,
-                       on_status=self.status.emit, stop=self.stop, on_ai=self.ai_done.emit)
+                       on_status=self.status.emit, stop=self.stop, on_ai=self.ai_done.emit,
+                       on_ai_status=self.ai_status.emit)
         except Exception as e:  # shown to the user, the app keeps running
             err = f"{type(e).__name__}: {e}"
         self.finished.emit(time.perf_counter() - t, err)
@@ -276,6 +279,19 @@ class MainWindow(QMainWindow):
             self.steps[key] = cb
         self.steps["burst"].setChecked(True)
         self.ai = self.steps["ai"]  # older name (smoke test)
+        self.quality = QComboBox()
+        for key, label in (("fast", "Fast"), ("balanced", "Balanced"), ("full", "Full size")):
+            self.quality.addItem(label, key)
+        self.quality.setCurrentIndex(1)
+        self.quality.setToolTip("Maximum quality repaints a reduced copy of the photo, then enlarges the holes "
+                                "back with Real-ESRGAN.\n"
+                                "Fast: quarter size, 6 passes per window (~6 windows on a 12 MP photo).\n"
+                                "Balanced: half size, 8 passes (~20 windows) — the network sees more of the "
+                                "scene in each window.\n"
+                                "Full size: 12 passes, ~80 windows; slowest.")
+        self.quality.setEnabled(False)
+        self.steps["diffusion"].toggled.connect(self.quality.setEnabled)
+        ext.addWidget(self.quality)
         ext.addStretch(1)
         outer.addLayout(ext)
 
@@ -289,6 +305,10 @@ class MainWindow(QMainWindow):
         self.stat.setMinimumWidth(320)
         prog.addWidget(self.stat)
         outer.addLayout(prog)
+        self.aistat = QLabel("")  # the enhanced copies run beside the repairs: their own line
+        self.aistat.setObjectName("hint")
+        self.aistat.hide()
+        outer.addWidget(self.aistat)
 
         # ---- results: list | before/after + report
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -413,9 +433,11 @@ class MainWindow(QMainWindow):
 
         steps = [k for k, cb in self.steps.items() if cb.isChecked()]
         options = {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked(),
-                   "enhance": steps}
+                   "enhance": steps, "quality": self.quality.currentData()}
         self.aibox.setVisible(bool(steps))
         self.aibox.show_image(None)
+        self.aistat.setVisible(bool(steps))
+        self.aistat.setText("Enhanced copies: waiting for the first repaired photo…" if steps else "")
         self.thread = QThread(self)
         self.worker = RepairWorker(paths, out, options)
         self.worker.moveToThread(self.thread)
@@ -423,6 +445,7 @@ class MainWindow(QMainWindow):
         self.worker.result.connect(self._on_result)
         self.worker.ai_done.connect(self._on_ai)
         self.worker.status.connect(self.stat.setText)
+        self.worker.ai_status.connect(self.aistat.setText)
         self.worker.finished.connect(self._on_finished)
         self.worker.finished.connect(self.thread.quit)
         self.thread.start()
@@ -615,6 +638,7 @@ def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, a
     w.show()
     w._start()
     w.worker.status.connect(lambda s: (log.write(s + "\n"), log.flush()))
+    w.worker.ai_status.connect(lambda s: (log.write("[enhance] " + s + "\n"), log.flush()))
     started = time.perf_counter()
     code = {"v": 2}
 

@@ -106,3 +106,36 @@ def test_real_models_all_steps():
     _save("diffusion", hole_img, filled)
     assert np.array_equal(filled[~holes], hole_img[~holes])
     assert filled[holes].std() > 2
+
+
+def test_fp16_copies_of_the_real_networks(tmp_path):
+    """The fp16 conversion of the fp32 networks (used on a graphics card): the copy is
+    written and, where the processor can run fp16 at all, agrees with the original."""
+    import onnxruntime as ort
+
+    from fotomedik.ai import half, models
+    from fotomedik.ai.enhance import Engine
+
+    eng = Engine.load(progress=lambda d, n, m: None, steps=("ai",), half=False)
+    print(f"::notice title=Real-ESRGAN input::{[(i.name, i.shape) for i in eng.sr.get_inputs()]} "
+          f"batch in one call: {eng.sr_batch}")
+    for model in (models.SR,):
+        path = models.model_dir() / model.file
+        out = tmp_path / half.half_path(path).name
+        t = time.perf_counter()
+        half.convert(path, out)
+        print(f"converted {model.name} to fp16 in {time.perf_counter() - t:.1f} s: "
+              f"{path.stat().st_size >> 20} MB -> {out.stat().st_size >> 20} MB")
+        assert out.stat().st_size < 0.7 * path.stat().st_size
+        full = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        x = half.test_picture(model, full)
+        try:
+            s16 = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
+            got = half._picture_output(s16, x)
+        except Exception as e:  # the processor has no fp16 kernels for it: nothing to compare
+            print(f"::notice title=fp16 {model.name}::not run on the processor: {type(e).__name__}: {str(e)[:120]}")
+            continue
+        ref = half._picture_output(full, x)
+        mean, worst = half.compare(ref, got)
+        print(f"::notice title=fp16 {model.name}::mean difference {mean:.5f}, largest {worst:.4f} of the range")
+        assert mean <= half.TOL_MEAN and worst <= half.TOL_MAX

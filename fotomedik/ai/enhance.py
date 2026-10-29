@@ -9,7 +9,9 @@ from the repaired file only by that re-compression).
    is scaled back up.
 2. Holes are sharpened by Real-ESRGAN: the photo is reduced to a quarter (the
    holes carry no more detail than that) and enlarged 4x again by the network,
-   tile by tile, only where holes are.
+   tile by tile, only where holes are; on a graphics card several tiles go in one
+   call. The same enlarging brings the holes Stable Diffusion repainted at a
+   reduced size back to full size (diffusion.repaint_holes).
 3. Data consistency (the range/null-space idea of DDNM, Wang et al. 2022): what
    is known about a hole is its 8x8 block averages, so after the networks every
    block gets its known average back (as a smooth correction surface); the
@@ -20,6 +22,7 @@ from the repaired file only by that re-compression).
 from __future__ import annotations
 
 import io
+import time
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -84,12 +87,38 @@ def _grow(mask: np.ndarray, px: int) -> np.ndarray:
 
 ORT_DTYPES = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(int64)": np.int64,
               "tensor(int32)": np.int32, "tensor(double)": np.float64}
+GPU_PROVIDERS = ("CUDAExecutionProvider", "DmlExecutionProvider")
+DEVICE_NAMES = {"DmlExecutionProvider": "GPU (DirectML)", "CUDAExecutionProvider": "GPU (CUDA)",
+                "CPUExecutionProvider": "CPU"}
+SR_BATCH = 4  # tiles enlarged in one go on a graphics card (when the model allows a batch)
+
+
+def _batch_dynamic(session) -> bool:
+    """Whether the network takes more than one picture at a time (a symbolic batch size)."""
+    try:
+        shape = session.get_inputs()[0].shape
+    except Exception:
+        return False
+    return bool(shape) and not isinstance(shape[0], int)
+
+
+class Stopped(InterruptedError):
+    """The user stopped the run in the middle of a photo."""
+
+
+def _check(stop) -> None:
+    if stop is not None and stop.is_set():
+        raise Stopped("stopped")
 
 
 class Engine:
     """The networks the chosen steps need. Sessions are ONNX Runtime sessions or anything
     with the same `run(None, {name: array})` / `get_inputs()` interface (the tests use
-    stand-ins). face_det is the path of the YuNet model (OpenCV runs it)."""
+    stand-ins). face_det is the path of the YuNet model (OpenCV runs it).
+
+    An engine is kept between runs (see run.engine_for) and `ensure` loads the networks
+    a later run needs on top. `devices` says where every network runs and `notes`
+    collects what went differently than hoped (a network the graphics card refused)."""
 
     def __init__(self, sr=None, inpaint=None, device: str = "CPU", deblock=None, face_det=None, face=None, sd=None):
         self.sr = sr
@@ -99,58 +128,97 @@ class Engine:
         self.face_det = face_det
         self.face_s = face
         self.sd = sd
+        self.devices: dict[str, str] = {}
+        self.notes: list[str] = []
+        self.loaded: set[str] = set()
+        self.sr_batch = 1
 
     @classmethod
-    def load(cls, progress=None, stop=None, steps=("ai",)) -> "Engine":
+    def load(cls, progress=None, stop=None, steps=("ai",), half: bool = True, say=None) -> "Engine":
+        return cls().ensure(steps, progress, stop, half, say)
+
+    def has(self, step: str) -> bool:
+        return step in self.loaded
+
+    def ensure(self, steps, progress=None, stop=None, half: bool = True, say=None) -> "Engine":
+        """Load the networks of `steps` that are not loaded yet (downloading them first).
+        progress(done, total, model) follows the downloads, say(text) tells about slow
+        one-off work. half: fp16 copies of the fp32 networks on a graphics card (see .half)."""
         import onnxruntime as ort
 
         from . import models
 
         avail = ort.get_available_providers()
-        providers = [p for p in ("DmlExecutionProvider", "CUDAExecutionProvider") if p in avail]
-        providers.append("CPUExecutionProvider")
-        used = {"v": "CPUExecutionProvider"}
+        gpu = [p for p in GPU_PROVIDERS if p in avail]
+        providers = gpu + ["CPUExecutionProvider"]
 
-        def session(model):
-            path = models.ensure(model, progress, stop)
+        def make(path):
             so = ort.SessionOptions()
             if "DmlExecutionProvider" in providers:  # DirectML wants these off
                 so.enable_mem_pattern = False
                 so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             try:
-                s = ort.InferenceSession(str(path), sess_options=so, providers=providers)
+                return ort.InferenceSession(str(path), sess_options=so, providers=providers)
             except Exception:  # the graphics card refused the model: use the processor
-                s = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-            if hasattr(s, "get_providers") and s.get_providers()[0] != "CPUExecutionProvider":
-                used["v"] = s.get_providers()[0]
+                if not gpu:
+                    raise
+                return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+
+        def session(model):
+            path = models.ensure(model, progress, stop)
+            if half and gpu:
+                from . import half as H
+
+                s = H.session(model, path, make, say, self.notes)
+            else:
+                s = make(path)
+            prov = s.get_providers()[0] if hasattr(s, "get_providers") else "CPUExecutionProvider"
+            self.devices[model.name] = DEVICE_NAMES.get(prov, prov)
+            if gpu and prov not in GPU_PROVIDERS:
+                self.notes.append(f"{model.name} runs on the processor: the graphics card refused it")
             return s
 
-        eng = cls()
-        steps = set(steps)
+        steps = set(steps) - self.loaded
         if "ai" in steps:
-            eng.sr = session(models.SR)
-            eng.inpaint_s = session(models.INPAINT)
+            if self.sr is None:
+                self.sr = session(models.SR)
+            if self.inpaint_s is None:
+                self.inpaint_s = session(models.INPAINT)
         if "deblock" in steps:
-            eng.deblock_s = session(models.DEBLOCK)
+            self.deblock_s = session(models.DEBLOCK)
         if "faces" in steps:
-            eng.face_det = str(models.ensure(models.FACE_DET, progress, stop))
-            eng.face_s = session(models.FACE)
+            self.face_det = str(models.ensure(models.FACE_DET, progress, stop))
+            self.face_s = session(models.FACE)
         if "diffusion" in steps:
             from .diffusion import Diffusion
 
-            if eng.inpaint_s is None:
-                eng.inpaint_s = session(models.INPAINT)
-            eng.sd = Diffusion(session(models.SD_UNET), session(models.SD_VAE_ENC), session(models.SD_VAE_DEC),
-                               session(models.SD_TEXT))
-        eng.device = {"DmlExecutionProvider": "GPU (DirectML)", "CUDAExecutionProvider": "GPU (CUDA)"}.get(used["v"], "CPU")
-        return eng
+            if self.inpaint_s is None:
+                self.inpaint_s = session(models.INPAINT)
+            if self.sr is None:  # brings the repainted holes back to full size
+                self.sr = session(models.SR)
+            self.sd = Diffusion(session(models.SD_UNET), session(models.SD_VAE_ENC), session(models.SD_VAE_DEC),
+                                session(models.SD_TEXT))
+        self.loaded |= steps
+        on_gpu = [d for d in self.devices.values() if d != "CPU"]
+        self.device = on_gpu[0] if on_gpu else "CPU"
+        self.sr_batch = SR_BATCH if (self.sr is not None and on_gpu and _batch_dynamic(self.sr)) else 1
+        return self
 
     def enlarge4(self, tile: np.ndarray) -> np.ndarray:
         """float32 (h, w, 3) in 0..1 -> (4h, 4w, 3) in 0..1."""
+        return self.enlarge4_many([tile])[0]
+
+    def enlarge4_many(self, tiles: list[np.ndarray]) -> list[np.ndarray]:
+        """enlarge4 of several same-sized tiles, `sr_batch` at a time in one network call."""
         name = self.sr.get_inputs()[0].name
-        x = np.ascontiguousarray(tile.transpose(2, 0, 1)[None], dtype=np.float32)
-        y = self.sr.run(None, {name: x})[0][0]
-        return np.clip(y.transpose(1, 2, 0), 0, 1)
+        out: list[np.ndarray] = []
+        step = max(1, self.sr_batch)
+        for k in range(0, len(tiles), step):
+            group = tiles[k : k + step]
+            x = np.ascontiguousarray(np.stack([t.transpose(2, 0, 1) for t in group]), dtype=np.float32)
+            y = self.sr.run(None, {name: x})[0]
+            out.extend(np.clip(yi.transpose(1, 2, 0), 0, 1) for yi in y)
+        return out
 
     def fill(self, rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """uint8 (512, 512, 3) and bool (512, 512) -> uint8 (512, 512, 3), masked part filled."""
@@ -182,24 +250,61 @@ def inpaint_unknown(arr: np.ndarray, unknown: np.ndarray, engine: Engine) -> np.
     return np.where(unknown[..., None], np.clip(np.rint(up), 0, 255), arr).astype(np.uint8)
 
 
-def sharpen_holes(arr: np.ndarray, holes: np.ndarray, engine: Engine, progress=None) -> np.ndarray:
+def reduce_mask(mask: np.ndarray, factor: int) -> np.ndarray:
+    """`mask` reduced `factor` times: a reduced pixel is set when any of its pixels is."""
+    h, w = mask.shape
+    lw, lh = -(-w // factor), -(-h // factor)
+    return np.asarray(Image.fromarray((mask * 255).astype(np.uint8)).resize((lw, lh), Image.BOX)) > 0
+
+
+def reduce(arr: np.ndarray, holes: np.ndarray, factor: int) -> tuple[np.ndarray, np.ndarray]:
+    """`arr` (uint8) and `holes` reduced `factor` times: (uint8 picture, mask of the
+    reduced pixels that touch a hole)."""
     h, w = holes.shape
-    lw, lh = -(-w // 4), -(-h // 4)
-    lo = np.asarray(Image.fromarray(arr).resize((lw, lh), Image.LANCZOS), dtype=np.float32) / 255.0
-    need = np.asarray(Image.fromarray((holes * 255).astype(np.uint8)).resize((lw, lh), Image.BOX)) > 0
-    hi = np.asarray(Image.fromarray(arr).resize((4 * lw, 4 * lh), Image.BICUBIC), dtype=np.float32) / 255.0
+    lw, lh = -(-w // factor), -(-h // factor)
+    lo = np.asarray(Image.fromarray(arr).resize((lw, lh), Image.LANCZOS))
+    return lo, reduce_mask(holes, factor)
+
+
+def enlarge_holes(lo: np.ndarray, need: np.ndarray, engine: Engine, factor: int = 4, progress=None,
+                  stop=None, stats: dict | None = None) -> np.ndarray:
+    """`lo` (uint8, reduced `factor` times) enlarged `factor` times: by Real-ESRGAN in the
+    tiles that touch `need`, bicubic elsewhere. factor 2 or 4 (the network enlarges 4x;
+    for 2 its output is halved). Returns float32 0..1, (factor*lh, factor*lw, 3)."""
+    lh, lw = need.shape
+    lof = lo.astype(np.float32) / 255.0
+    hi = np.asarray(Image.fromarray(lo).resize((factor * lw, factor * lh), Image.BICUBIC), dtype=np.float32) / 255.0
     hi = hi.copy()
     tiles = [(y, x) for y in range(0, lh, TILE) for x in range(0, lw, TILE)
              if need[y : y + TILE, x : x + TILE].any()]
-    padded = np.pad(lo, ((PAD, PAD + TILE), (PAD, PAD + TILE), (0, 0)), mode="reflect")
-    for i, (y, x) in enumerate(tiles):
-        th, tw = min(TILE, lh - y), min(TILE, lw - x)
-        src = padded[y : y + th + 2 * PAD, x : x + tw + 2 * PAD]
-        big = engine.enlarge4(src)
-        hi[4 * y : 4 * (y + th), 4 * x : 4 * (x + tw)] = big[4 * PAD : 4 * (PAD + th), 4 * PAD : 4 * (PAD + tw)]
+    if stats is not None:
+        stats["tiles"] = len(tiles)
+    padded = np.pad(lof, ((PAD, PAD + TILE), (PAD, PAD + TILE), (0, 0)), mode="reflect")
+    side = TILE + 2 * PAD
+    step = max(1, engine.sr_batch)
+    for k in range(0, len(tiles), step):
+        _check(stop)
+        group = tiles[k : k + step]
+        bigs = engine.enlarge4_many([padded[y : y + side, x : x + side] for y, x in group])
+        for (y, x), big in zip(group, bigs):
+            th, tw = min(TILE, lh - y), min(TILE, lw - x)
+            big = big[4 * PAD : 4 * (PAD + th), 4 * PAD : 4 * (PAD + tw)]
+            if factor != 4:
+                q = 4 // factor  # 4x output -> factor x: average q x q pixels
+                big = big.reshape(th * factor, q, tw * factor, q, 3).mean(axis=(1, 3))
+            hi[factor * y : factor * (y + th), factor * x : factor * (x + tw)] = big
         if progress:
-            progress(i + 1, len(tiles))
-    hi = hi[:h, :w] * 255.0
+            progress(min(k + step, len(tiles)), len(tiles))
+    return hi
+
+
+def sharpen_holes(arr: np.ndarray, holes: np.ndarray, engine: Engine, progress=None, factor: int = 4,
+                  stop=None, stats: dict | None = None) -> np.ndarray:
+    """Holes of `arr` sharpened: the photo is reduced `factor` times (the holes carry no
+    more detail than that) and enlarged again by Real-ESRGAN where holes are."""
+    h, w = holes.shape
+    lo, need = reduce(arr, holes, factor)
+    hi = enlarge_holes(lo, need, engine, factor, progress, stop, stats)[:h, :w] * 255.0
     a = _soft(holes, FEATHER)[..., None]
     return np.clip(np.rint(arr * (1 - a) + hi * a), 0, 255).astype(np.uint8)
 
@@ -226,7 +331,7 @@ DEBLOCK_TILE = 512
 DEBLOCK_PAD = 16
 
 
-def deblock(arr: np.ndarray, engine: Engine) -> np.ndarray:
+def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: dict | None = None) -> np.ndarray:
     """Remove JPEG blocking and ringing from the whole picture (FBCNN), tile by tile."""
     s = engine.deblock_s
     name = s.get_inputs()[0].name
@@ -235,63 +340,87 @@ def deblock(arr: np.ndarray, engine: Engine) -> np.ndarray:
     out = np.empty_like(x)
     p = DEBLOCK_PAD
     padded = np.pad(x, ((p, p + DEBLOCK_TILE), (p, p + DEBLOCK_TILE), (0, 0)), mode="reflect")
-    for y in range(0, h, DEBLOCK_TILE):
-        for x0 in range(0, w, DEBLOCK_TILE):
-            th, tw = min(DEBLOCK_TILE, h - y), min(DEBLOCK_TILE, w - x0)
-            ph, pw = -(-(th + 2 * p) // 8) * 8, -(-(tw + 2 * p) // 8) * 8  # the network halves 3 times
-            tile = padded[y : y + ph, x0 : x0 + pw]
-            inp = np.ascontiguousarray(tile.transpose(2, 0, 1)[None], dtype=np.float32)
-            res = [r for r in s.run(None, {name: inp}) if getattr(r, "ndim", 0) == 4][0][0].transpose(1, 2, 0)
-            out[y : y + th, x0 : x0 + tw] = res[p : p + th, p : p + tw]
+    tiles = [(y, x0) for y in range(0, h, DEBLOCK_TILE) for x0 in range(0, w, DEBLOCK_TILE)]
+    if stats is not None:
+        stats["tiles"] = len(tiles)
+    for i, (y, x0) in enumerate(tiles):
+        _check(stop)
+        th, tw = min(DEBLOCK_TILE, h - y), min(DEBLOCK_TILE, w - x0)
+        ph, pw = -(-(th + 2 * p) // 8) * 8, -(-(tw + 2 * p) // 8) * 8  # the network halves 3 times
+        tile = padded[y : y + ph, x0 : x0 + pw]
+        inp = np.ascontiguousarray(tile.transpose(2, 0, 1)[None], dtype=np.float32)
+        res = [r for r in s.run(None, {name: inp}) if getattr(r, "ndim", 0) == 4][0][0].transpose(1, 2, 0)
+        out[y : y + th, x0 : x0 + tw] = res[p : p + th, p : p + tw]
+        if progress:
+            progress(i + 1, len(tiles))
     return np.clip(np.rint(out * 255.0), 0, 255).astype(np.uint8)
 
 
-def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
-                  burst=None, progress=None) -> tuple[np.ndarray, list[str]]:
-    """The enhanced copy, step by step. Returns (rgb, what was done).
+def _took(t0: float) -> str:
+    s = time.perf_counter() - t0
+    return f"{s:.1f} s" if s < 10 else f"{s:.0f} s"
 
-    burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots."""
+
+def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
+                  burst=None, progress=None, quality: str | None = None, stop=None) -> tuple[np.ndarray, list[str]]:
+    """The enhanced copy, step by step. Returns (rgb, what was done, with the time it took).
+
+    burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots.
+    progress(done, total, what) reports the tiles or windows of the slow steps.
+    quality: diffusion preset (see diffusion.PRESETS). Raises Stopped when `stop` is set."""
     steps = set(steps)
     done: list[str] = []
     real = arr.copy()
     unknown = unknown & holes
+
+    def report(what):
+        return (lambda i, n: progress(i, n, what)) if progress else None
+
     if "burst" in steps and burst is not None and holes.any():
+        t0 = time.perf_counter()
         arr, filled = burst(arr, holes)
         if filled.any():
-            done.append(f"similar shots: {100 * filled.sum() / max(1, holes.sum()):.0f} % of the holes")
+            done.append(f"similar shots: {100 * filled.sum() / max(1, holes.sum()):.0f} % of the holes ({_took(t0)})")
             real = np.where(filled[..., None], arr, real)
             holes = holes & ~filled
             unknown = unknown & ~filled
+    _check(stop)
     if "deblock" in steps and engine.deblock_s is not None:
-        arr = deblock(arr, engine)
+        t0, st = time.perf_counter(), {}
+        arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st)
         real = arr.copy()  # the cleaned picture is the base from here on
-        done.append("JPEG blocks and noise removed")
+        done.append(f"JPEG blocks and noise removed ({st.get('tiles', 0)} tiles, {_took(t0)})")
     if holes.any():
         before = arr
         if "diffusion" in steps and engine.sd is not None:
-            from .diffusion import diffusion_fill
+            from .diffusion import repaint_holes
 
+            t0 = time.perf_counter()
             if unknown.any() and engine.inpaint_s is not None:  # a start for holes the thumbnail left blank
                 arr = inpaint_unknown(arr, unknown, engine)
-            arr = diffusion_fill(arr, holes, unknown, engine.sd, progress)
+            arr, what = repaint_holes(arr, holes, unknown, engine, quality, report("Stable Diffusion window"), stop)
             arr = keep_block_means(arr, before, holes, holes & ~unknown)
-            done.append("holes repainted (Stable Diffusion, follows the thumbnail)")
+            done.append(f"holes repainted (Stable Diffusion, follows the thumbnail; {what}, {_took(t0)})")
         elif "ai" in steps and (engine.sr is not None or engine.inpaint_s is not None):
             if unknown.any() and engine.inpaint_s is not None:
+                t0 = time.perf_counter()
                 arr = inpaint_unknown(arr, unknown, engine)
-                done.append("unknown holes filled (LaMa)")
+                done.append(f"unknown holes filled (LaMa, {_took(t0)})")
             if engine.sr is not None:
+                t0, st = time.perf_counter(), {}
                 filled_arr = arr
-                arr = sharpen_holes(arr, holes, engine, progress)
+                arr = sharpen_holes(arr, holes, engine, report("Real-ESRGAN tile"), stop=stop, stats=st)
                 arr = keep_block_means(arr, filled_arr, holes, holes & ~unknown)
-                done.append("holes sharpened (Real-ESRGAN)")
+                done.append(f"holes sharpened (Real-ESRGAN, {st.get('tiles', 0)} tiles, {_took(t0)})")
         arr = np.where(holes[..., None], arr, real)
+    _check(stop)
     if "faces" in steps and engine.face_s is not None:
         from .faces import restore_faces
 
+        t0 = time.perf_counter()
         arr, n = restore_faces(arr, engine)
         if n:
-            done.append(f"{n} face(s) restored (GFPGAN)")
+            done.append(f"{n} face(s) restored (GFPGAN, {_took(t0)})")
     return arr, done
 
 

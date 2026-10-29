@@ -139,11 +139,13 @@ def collect(paths: list[Path], out: Path) -> list[tuple[Path, Path]]:
 
 
 def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0,
-        on_result=None, on_status=None, stop: threading.Event | None = None, on_ai=None) -> list[Result]:
+        on_result=None, on_status=None, stop: threading.Event | None = None, on_ai=None,
+        on_ai_status=None) -> list[Result]:
     """Repair everything under `paths` into `out`. Originals are never written.
     on_result(Result) is called as each photo finishes; on_status(str) for phases.
-    options["enhance"] (steps, see ai.run) adds an enhanced copy of every repaired photo
-    after the repairs (on_ai(Result) as each is made); options["ai"] means ["ai"]."""
+    options["enhance"] (steps, see ai.run) adds an enhanced copy of every repaired photo,
+    made while the repairs go on (on_ai(Result) as each is made, on_ai_status(str) for
+    their progress; options["quality"] is the diffusion preset); options["ai"] means ["ai"]."""
     out.mkdir(parents=True, exist_ok=True)
     for p in paths:
         if p.is_dir() and p.resolve() == out.resolve():
@@ -156,12 +158,30 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
     if not files:
         return results
     say = on_status or (lambda s: None)
+    steps = list(options.get("enhance") or (["ai"] if options.get("ai") else []))
+    enhancer = None
+    by_rep: dict[int, Result] = {}
+    if steps:
+        from .ai.run import Enhancer
+
+        def copy_made(rep: FileReport) -> None:
+            if options.get("write_reports"):  # the report was written before the copy existed
+                name = Path(rep.output_name)
+                rp = out / name.parent / (name.stem + ".report.json")
+                if rp.exists():
+                    rp.write_text(rep.to_json(), encoding="utf-8")
+            if on_ai:
+                on_ai(by_rep[id(rep)])
+
+        enhancer = Enhancer([p for p, _rel in files], out, steps, on_ai_status or say, stop,
+                            on_done=copy_made, quality=options.get("quality"))
+        enhancer.start()
     with Workers(jobs, len(files)) as workers:
         if len(files) > 1:
             say("Learning from the healthy photos in the set…")
             options["ref_candidates"], options["thumb_refs"] = _learn_candidates(files, say, jobs, workers)
         work = [(str(p), str(rel), str(out), options, None) for p, rel in files]
-        order = sorted(range(len(work)), key=lambda i: -os.path.getsize(work[i][0]))
+        order = list(range(len(work)))  # in list order: shots of one scene finish close together
         say(f"Repairing {len(work)} photo(s)…")
 
         def failed(i, err: Exception) -> tuple[FileReport, float]:
@@ -175,8 +195,11 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
             output = (out / rep.output_name) if rep.output_name else None
             r = Result(files[i][0], output, rep, secs, options)
             results.append(r)
+            by_rep[id(rep)] = r
             if on_result:
                 on_result(r)
+            if enhancer is not None:
+                enhancer.add(i, rep)
 
         if workers.ex is None:
             for i in order:
@@ -211,14 +234,11 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
                     except Exception as e:  # one bad file must not stop the batch
                         rep, secs = failed(i, e)
                     done(i, rep, secs)
-    steps = list(options.get("enhance") or (["ai"] if options.get("ai") else []))
-    if steps and results and not (stop is not None and stop.is_set()):
-        lost = [r for r in results if is_lost(r.report)]
-        if lost:
-            say(f"{len(lost)} lost or mostly lost photo(s) get no enhanced copy")
-        by_rep = {id(r.report): r for r in results}
-        from .ai.run import run_extras
-
-        run_extras([(r.report, r.source) for r in results], out, steps, say, stop,
-                   on_done=(lambda rep: on_ai(by_rep[id(rep)])) if on_ai else None)
+    if enhancer is not None:
+        if results and not (stop is not None and stop.is_set()):
+            lost = [r for r in results if is_lost(r.report)]
+            if lost:
+                say(f"{len(lost)} lost or mostly lost photo(s) get no enhanced copy")
+            say("Repairs done; finishing the enhanced copies…")
+        enhancer.finish()
     return results
