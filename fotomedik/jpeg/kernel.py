@@ -569,3 +569,41 @@ def find_interval_start(data, lo: int, hi: int, mpos: int, pk: Packed, count: in
         s = int(lib.find_interval_start(dptr, len(arr), lo, hi, mpos, pk.c_comps, pk.ncomp, *pk.tp,
                                         count, _ptr(kn), len(kn), pm, probe))
     return None if s < 0 else s
+
+
+def py_converged_start(data, pos: int, end: int, pk: Packed, probe: int, step: int, mcus: int,
+                       frac: tuple[int, int]) -> int:
+    """Reference for the C converged_start (see _fastdec.c)."""
+    limit = min(end - 64, pos + probe)
+    votes: dict[int, int] = {}
+    ntr = 0
+    for s in range(pos, limit, step):
+        for ph in (0, 4):
+            p = [0] * pk.ncomp
+            n, _err, _eb, _ebit, _mk, end_b, end_bit, bits, _dc = py_run_decode(data, s, ph, end, pk, mcus, p,
+                                                                               check_dc=False)
+            ends = [int(b) for b in bits[1:n]]
+            for b in ends[: mcus - 1]:
+                votes[b] = votes.get(b, 0) + 1
+            if n >= 2:
+                ntr += 1
+    if ntr < 4:
+        return -1
+    for b in sorted(votes):
+        if votes[b] * frac[1] >= frac[0] * ntr:
+            return b
+    return -1
+
+
+def converged_start(data, pos: int, end: int, pk: Packed, probe: int = 256, step: int = 16, mcus: int = 48,
+                    frac: tuple[int, int] = (3, 5)) -> int | None:
+    """Earliest MCU start bit in an intact stretch that most decoding trials from
+    [pos, pos + probe) agree on (the parse they converge to), or None."""
+    lib = fastdec.load()
+    if lib is None:
+        b = py_converged_start(_pydata(data), pos, end, pk, probe, step, mcus, frac)
+    else:
+        arr, dptr = _data_ptr(data)
+        b = int(lib.converged_start(dptr, len(arr), pos, end, pk.c_comps, pk.ncomp, *pk.tp,
+                                    probe, step, mcus, frac[0], frac[1]))
+    return None if b < 0 else b

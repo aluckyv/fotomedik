@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).parent
-ABI = 11  # must match FASTDEC_ABI in _fastdec.c
+ABI = 12  # must match FASTDEC_ABI in _fastdec.c
 _LIB = None
 _TRIED = False
 
@@ -70,6 +70,10 @@ def load() -> ctypes.CDLL | None:
             fs.restype = _I64
             fs.argtypes = [_P, _I64, _I64, _I64, _I64, ctypes.POINTER(Comp), _INT,
                            _P, _P, _P, _P, _P, _I64, _P, _I64, _INT, _INT]
+            cs = lib.converged_start
+            cs.restype = _I64
+            cs.argtypes = [_P, _I64, _I64, _I64, ctypes.POINTER(Comp), _INT,
+                           _P, _P, _P, _P, _P, _I64, _I64, _INT, _INT, _INT]
             lib.bw_put.restype = _INT
             lib.bw_put.argtypes = [_P, _I64, _P, ctypes.c_uint32, _INT]
             lib.bw_finish.restype = _INT

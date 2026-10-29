@@ -96,6 +96,66 @@ def legal_offset(rel: np.ndarray, q: int, d: float) -> float | None:
     return float(min(max(d, lo_d), hi_d))
 
 
+def _retarget(part: dict, head: int, n_new: int, data: bytes, pk: K.Packed) -> dict | None:
+    """The part without its first `head` MCUs, cut to n_new MCUs (relative DC values
+    restart after the dropped head, the offset absorbs the difference)."""
+    if n_new < 2:
+        return None
+    rel = part["dc_rel"]
+    start = part["start_bit"]
+    pr = np.zeros(pk.ncomp, dtype=np.int32)
+    n, err, *_r, end_b, end_bit, bits, _dc = K.decode_mcus(data, start // 8, start % 8, len(data), pk, pr,
+                                                           head + n_new, check_dc=False)
+    if n != head + n_new:
+        return None
+    new = dict(part)
+    new["start_bit"] = int(bits[head])
+    new["end_bit"] = int(end_b * 8 + end_bit)
+    new["first_mcu"] = part["first_mcu"] + head
+    new["n"] = n_new
+    if head:
+        last_cols = np.cumsum([h * v for h, v in pk.hv]) - 1
+        base = rel[head - 1][last_cols]
+        new["dc_rel"] = rel[head : head + n_new] - base[np.repeat(np.arange(pk.ncomp), [h * v for h, v in pk.hv])]
+        new["delta"] = {cid: int(part["delta"][cid] + base[i]) for i, cid in enumerate(pk.cids)}
+    else:
+        new["dc_rel"] = rel[:n_new]
+    return new
+
+
+def arrange_parts(iv, keep: int, pieces: list, tail: dict | None, data: bytes, pk: K.Packed) -> list[dict]:
+    """Spliced parts of one interval in MCU order, each preceded by at least one filled
+    MCU (it sets the predictor the part was decoded against), none overlapping."""
+    if tail is not None and tail["full"] and tail["n"] == iv.mcu_count:
+        return [tail]
+    parts = sorted(pieces + ([tail] if tail is not None else []), key=lambda t: t["first_mcu"])
+    out: list[dict] = []
+    cursor = iv.mcu_first + keep  # first MCU not taken yet
+    end = iv.mcu_first + iv.mcu_count
+    for part in parts:
+        first, n = part["first_mcu"], part["n"]
+        if first + n > end:
+            if part is tail:
+                continue
+            n = end - first
+        if out and first < out[-1]["first_mcu"] + out[-1]["n"] + 1 and part is tail:
+            # the tail is anchored exactly: shorten the part before it instead
+            prev = out.pop()
+            cut = _retarget(prev, 0, first - 1 - prev["first_mcu"], data, pk)
+            cursor = iv.mcu_first + keep if not out else out[-1]["first_mcu"] + out[-1]["n"]
+            if cut is not None and cut["first_mcu"] >= cursor + 1:
+                out.append(cut)
+                cursor = cut["first_mcu"] + cut["n"]
+        head = max(0, cursor + 1 - first)
+        if head or n != part["n"]:
+            part = _retarget(part, head, n - head, data, pk)
+            if part is None:
+                continue
+        out.append(part)
+        cursor = part["first_mcu"] + part["n"]
+    return out
+
+
 def decode_for(ctx: Context) -> tuple[M.ParseResult, FrameTables, D.ScanResult] | None:
     """Parse + decode the current data, cached on the context until the data changes."""
     hit = ctx.cache.get("decode")
@@ -148,6 +208,8 @@ class FillHoles(Recipe):
         qdc = {sc.id: ft.quant[frame.component(sc.id).tq].dc for sc in ft.scan.components}
         luma, lh, lv = comps[0]
         tails: dict[int, dict] = ctx.memo.pop("tails", {}) if ctx.memo.get("tails") else {}
+        pieces_in: dict[int, list] = ctx.memo.pop("pieces", {}) if ctx.memo.get("pieces") else {}
+        pk = K.packed_for(ft)
 
         # ---------------------------------------------------------------- pass 1: what is real
         work_dc = {cid: sr.dc[cid].copy() for cid, _h, _v in comps}
@@ -214,20 +276,20 @@ class FillHoles(Recipe):
                     keep = 0
                 if not full and keep + n_tail > iv.mcu_count - 1:
                     tail = None  # cannot fit
+            parts = arrange_parts(iv, keep, pieces_in.get(iv.index, []), tail, data, pk)
             trusted[iv.mcu_first + keep : iv.mcu_first + iv.mcu_count] = False
-            plan[iv.index] = {"keep": keep, "tail": tail, "reason": reason}
+            plan[iv.index] = {"keep": keep, "parts": parts, "reason": reason}
 
         # Tails: the DC offset of each is re-estimated against the rows around it, as they
         # will look in the output - tails close to real rows first, the others then also
         # lean on those (dense damage often leaves no clean row next to a tail).
-        pending = [pl for pl in plan.values() if pl["tail"] is not None]
+        pending = [(pl, part) for pl in plan.values() for part in pl["parts"]]
         for max_dist in TAIL_REF_ROUNDS:
             if not pending:
                 break
             refs = fields_for(work_dc, trusted)
             later = []
-            for pl in pending:
-                tail = pl["tail"]
+            for pl, tail in pending:
                 f, n, rel = tail["first_mcu"], tail["n"], tail["dc_rel"]
                 deltas = {}
                 col = 0
@@ -245,7 +307,7 @@ class FillHoles(Recipe):
                     deltas[cid] = float(np.median(rv[good] - r[good])) if good.any() else None
                     col += h * v
                 if max(dists) > max_dist:
-                    later.append(pl)
+                    later.append((pl, tail))
                     continue
                 col = 0
                 ok = True
@@ -258,7 +320,7 @@ class FillHoles(Recipe):
                     deltas[cid] = d
                     col += h * v
                 if not ok:
-                    pl["tail"] = None
+                    pl["parts"].remove(tail)
                     continue
                 tail["delta"] = {cid: int(round(d)) for cid, d in deltas.items()}
                 trusted[f : f + n] = True
@@ -308,8 +370,9 @@ class FillHoles(Recipe):
 
         pk = K.packed_for(ft)
 
-        def build_interval(iv, keep, tail, reason, preds_in):
-            """Entropy bytes of one rebuilt interval: kept prefix + fill + spliced tail."""
+        def build_interval(iv, keep, parts, reason, preds_in):
+            """Entropy bytes of one rebuilt interval: kept prefix, then fill and spliced
+            parts (intact stretches placed by R11, the tail from R10) in MCU order."""
             w = BitWriter()
             prefix = b""
             p_ = preds_in
@@ -322,20 +385,34 @@ class FillHoles(Recipe):
                 if bit:
                     w.put_bits(data[off] >> (8 - bit), bit)
                 p_ = last_block_preds(iv.mcu_first + keep - 1)
-            n_tail = tail["n"] if tail is not None else 0
-            gap = iv.mcu_count - keep - n_tail
-            hole = None
-            if gap > 0:
-                override = tail["delta"] if tail is not None else None
-                encode_flat_mcus(ft, gap, {}, p_, fill_targets(iv.mcu_first + keep, gap, override), writer=w)
-                hole = Hole(iv.mcu_first + keep, gap, reason)
-            if tail is not None:
-                _stream_bits(w, data, tail["start_bit"], tail["end_bit"])
-            return prefix + w.finish(), n_tail, hole
+            cursor = iv.mcu_first + keep
+            end = iv.mcu_first + iv.mcu_count
+            holes_: list[Hole] = []
+            n_spliced = 0
+            for part in parts:
+                gap = part["first_mcu"] - cursor
+                if gap > 0:
+                    # the fill's last block carries the predictor the part was decoded against
+                    encode_flat_mcus(ft, gap, {}, p_, fill_targets(cursor, gap, part["delta"]), writer=w)
+                    holes_.append(Hole(cursor, gap, reason))
+                _stream_bits(w, data, part["start_bit"], part["end_bit"])
+                p_ = part_end_preds(part)
+                cursor = part["first_mcu"] + part["n"]
+                n_spliced += part["n"]
+            if cursor < end:
+                encode_flat_mcus(ft, end - cursor, {}, p_, fill_targets(cursor, end - cursor), writer=w)
+                holes_.append(Hole(cursor, end - cursor, reason))
+            return prefix + w.finish(), n_spliced, holes_
+
+        def part_end_preds(part):
+            out = {}
+            col = 0
+            for cid, h, v in comps:
+                out[cid] = int(part["dc_rel"][-1, col + h * v - 1]) + int(part["delta"][cid])
+                col += h * v
+            return out
 
         def interval_ok(piece, iv) -> bool:
-            if not dri:
-                return True  # checked with the whole file below
             buf = piece + b"\xff\xd9"
             pr = np.zeros(pk.ncomp, dtype=np.int32)
             n, err, *_ = K.decode_mcus(buf, 0, 0, len(buf), pk, pr, iv.mcu_count)
@@ -356,16 +433,21 @@ class FillHoles(Recipe):
                     preds = last_block_preds(iv.mcu_first + iv.mcu_count - 1)
             else:
                 pl = plan[iv.index]
-                piece, n_spliced, hole = build_interval(iv, pl["keep"], pl["tail"], pl["reason"], dict(preds))
-                if pl["tail"] is not None and not interval_ok(piece, iv):
-                    # the spliced tail does not decode in place: rebuild without it
-                    f = pl["tail"]["first_mcu"]
-                    trusted[f : f + pl["tail"]["n"]] = False
-                    piece, n_spliced, hole = build_interval(iv, pl["keep"], None, pl["reason"], dict(preds))
+                parts = pl["parts"]
+                piece, n_spliced, holes_ = build_interval(iv, pl["keep"], parts, pl["reason"], dict(preds))
+                if parts and not interval_ok(piece, iv):
+                    # some spliced part does not decode in place: add them one by one, keep what works
+                    good: list = []
+                    for part in parts:
+                        trial = build_interval(iv, pl["keep"], good + [part], pl["reason"], dict(preds))
+                        if interval_ok(trial[0], iv):
+                            good.append(part)
+                        else:
+                            trusted[part["first_mcu"] : part["first_mcu"] + part["n"]] = False
+                    piece, n_spliced, holes_ = build_interval(iv, pl["keep"], good, pl["reason"], dict(preds))
                 pieces.append(piece)
                 spliced += n_spliced
-                if hole is not None:
-                    holes.append(hole)
+                holes.extend(holes_)
             last_index = iv.index
             if dri and iv.mcu_first + iv.mcu_count < total:
                 pieces.append(rst_marker(iv.index))

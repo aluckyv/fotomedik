@@ -10,9 +10,11 @@ big files spread over the cores the others have freed.
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 CPU = os.cpu_count() or 1
+_PREFIX = "fotomedik-worker"
 
 _pool: ThreadPoolExecutor | None = None
 _fixed: int | None = None  # set_threads() override
@@ -43,7 +45,7 @@ def threads() -> int:
 def _get_pool() -> ThreadPoolExecutor:
     global _pool
     if _pool is None:
-        _pool = ThreadPoolExecutor(max_workers=CPU, thread_name_prefix="fotomedik")
+        _pool = ThreadPoolExecutor(max_workers=CPU, thread_name_prefix=_PREFIX)
     return _pool
 
 
@@ -62,6 +64,8 @@ def pmap(fn, items: list, chunks: int | None = None) -> list:
     into contiguous chunks (one per thread) so per-task overhead stays small."""
     n = len(items)
     t = min(threads(), n) if chunks is None else min(chunks, n)
+    if threading.current_thread().name.startswith(_PREFIX):
+        t = 1  # already inside a pool thread: waiting on the same pool could deadlock
     if t <= 1:
         return [fn(x) for x in items]
     size = -(-n // t)

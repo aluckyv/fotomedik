@@ -26,7 +26,7 @@
 #define EXPORT
 #endif
 
-#define FASTDEC_ABI 11  /* bump whenever an exported signature changes; fastdec.py checks it */
+#define FASTDEC_ABI 12  /* bump whenever an exported signature changes; fastdec.py checks it */
 
 EXPORT int fastdec_abi(void) { return FASTDEC_ABI; }
 
@@ -617,4 +617,58 @@ EXPORT int encode_dc_fill(uint8_t *out, int64_t cap, int64_t *st, const comp_t *
         }
     }
     return 0;
+}
+
+/* Converged parse at the start of an intact stretch: trials start every `step` bytes in
+ * [pos, pos + probe) (two bit phases), decode up to `mcus` MCUs (no DC checks) and the
+ * earliest MCU boundary that at least frac_num/frac_den of the trials pass through is
+ * returned (bit position), or -1. A trial's own start does not count. */
+static int i64_cmp(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+EXPORT int64_t converged_start(const uint8_t *data, int64_t data_len, int64_t pos, int64_t end,
+                               const comp_t *comps, int ncomp,
+                               const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
+                               const int32_t *mincode, const uint8_t *symbols,
+                               int64_t probe, int64_t step, int mcus, int frac_num, int frac_den) {
+    tables_t t = { fast, maxcode, valptr, mincode, symbols };
+    (void)data_len;
+    int64_t limit = end - 64 < pos + probe ? end - 64 : pos + probe;
+    int64_t ntr_max = 2 * ((limit - pos) / step + 1);
+    if (ntr_max <= 0) return -1;
+    int64_t *all = malloc(sizeof(int64_t) * (size_t)(ntr_max * mcus + 1));
+    if (!all) return -1;
+    int64_t na = 0, ntr = 0;
+    int32_t preds[8], dc[64];
+    for (int64_t s = pos; s < limit; s += step) {
+        for (int ph = 0; ph < 8; ph += 4) {
+            reader_t r;
+            reader_init(&r, data, s, end);
+            if (ph) { int32_t d; if (read_bits(&r, ph, &d)) continue; }
+            memset(preds, 0, sizeof preds);
+            int k = 0;
+            int64_t prev_end = -1;
+            for (; k < mcus; k++) {
+                if (decode_mcu(&r, comps, ncomp, &t, preds, dc, 0)) break;
+                int64_t eb; int ebit; tell(&r, &eb, &ebit);
+                if (k > 0) all[na++] = prev_end;  /* a boundary another MCU was decoded from */
+                prev_end = eb * 8 + ebit;
+            }
+            if (k >= 2) ntr++;
+        }
+    }
+    int64_t best = -1;
+    if (ntr >= 4) {
+        qsort(all, (size_t)na, sizeof(int64_t), i64_cmp);
+        for (int64_t i = 0; i < na;) {
+            int64_t j = i;
+            while (j < na && all[j] == all[i]) j++;
+            if ((j - i) * frac_den >= (int64_t)frac_num * ntr) { best = all[i]; break; }
+            i = j;
+        }
+    }
+    free(all);
+    return best;
 }
