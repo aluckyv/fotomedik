@@ -175,6 +175,11 @@ class BitReader:
         """(marker, offset) if a marker (after optional FF fill) is at the read position."""
         p = self.pos
         data = self.data
+        # 1-bit padding can form a 0xFF that encoders stuff as FF 00 right before the marker
+        hops = 0
+        while p + 2 < self.end and data[p] == 0xFF and data[p + 1] == 0x00 and hops < 4:
+            p += 2
+            hops += 1
         if p >= self.end or data[p] != 0xFF:
             return None
         q = p + 1
@@ -188,7 +193,7 @@ class BitReader:
         m = self.marker_at()
         if m is None:
             raise ValueError("no marker at read position")
-        p = self.pos + 1
+        p = m[1] + 1
         while self.data[p] == 0xFF:
             p += 1
         self.pos = p + 1

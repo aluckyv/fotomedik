@@ -52,6 +52,7 @@ class Context:
     options: dict[str, Any] = field(default_factory=dict)
     suggested_name: str | None = None
     fallback: str | None = None  # e.g. "thumbnail" when only the Exif preview survived
+    recovered_fraction: float | None = None  # share of MCUs kept from the original (set by R9)
     notes: list[str] = field(default_factory=list)
     cache: dict[str, Any] = field(default_factory=dict)  # per-stage scratch (parse results etc.)
 

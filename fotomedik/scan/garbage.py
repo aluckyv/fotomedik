@@ -56,6 +56,8 @@ def _jpeg_window(goods: list[int], bads: list[int], zeros: list[bool], i: int, w
     z = sum(zeros[i:hi])
     if z > (hi - i) // 2:
         return False
+    if g == 0 and b == 0:
+        return True  # no FF bytes at all: flat/synthetic data, not random garbage
     return g > b
 
 
