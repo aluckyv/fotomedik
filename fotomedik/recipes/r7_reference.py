@@ -182,17 +182,20 @@ class ReferenceHeader(Recipe):
                         continue
                     p2 = M.parse_segments(cand)
                     misfit = row_misfit(sr, FrameTables.from_parse(p2))
-                    trials.append((frac, misfit, prof.votes, cand, start, prof, (w, h)))
+                    clean_ivs = sum(1 for iv in sr.intervals if iv.ok) if len(sr.intervals) > 1 else 0
+                    trials.append((frac, misfit, prof.votes, cand, start, prof, (w, h), clean_ivs))
         if not trials:
             ctx.note(self, "reference header did not produce a decodable file")
             return
 
         def rank(t):
-            frac, misfit, votes = t[0], t[1], t[2]
-            # decoded share first (coarsely), then rows that line up, then the commoner header
-            return (round(frac, 2), -(misfit if misfit is not None else 1e9), votes)
+            frac, misfit, votes, clean_ivs = t[0], t[1], t[2], t[7]
+            # restart intervals that decode cleanly from marker to marker prove the row
+            # length (a wrong one fails every interval, however much of each prefix decodes);
+            # then the decoded share (coarsely), rows that line up, the commoner header
+            return (clean_ivs, round(frac, 2), -(misfit if misfit is not None else 1e9), votes)
 
-        frac, _misfit, _votes, cand, start, prof, (w, h) = max(trials, key=rank)
+        frac, _misfit, _votes, cand, start, prof, (w, h), _clean = max(trials, key=rank)
         if frac + MIN_GAIN < current:
             ctx.note(self, f"reference header kept aside: {frac:.1%} vs current {current:.1%}")
             return

@@ -161,12 +161,7 @@ def thumbnail_image(data: bytes, thumb_refs: list | None = None, landscape: bool
 
 
 def _rescue_thumbnail(data: bytes, thumb_refs: list):
-    from ..jpeg import markers as M
-    from .base import Context
     from .r7_reference import CLOSE_SOS, _POPCOUNT
-    from .r9_holes import FillHoles
-    from .r10_tails import TailRecovery
-    from .registry import run_pipeline
 
     head = data[: min(len(data), 1 << 16)]
     arr = np.frombuffer(head, dtype=np.uint8)
@@ -180,9 +175,34 @@ def _rescue_thumbnail(data: bytes, thumb_refs: list):
         for j in range(L):
             dist += _POPCOUNT[np.bitwise_xor(arr[j : len(arr) - L + 1 + j], sos[j])]
         close = np.flatnonzero(dist <= CLOSE_SOS * 8 * L)
-        if not len(close):
-            continue
-        start = int(close[0]) + L  # the thumbnail's SOS comes first
+        starts = [int(close[0]) + L] if len(close) else []  # the thumbnail's SOS comes first
+        # its SOS may be rotted too: thumbnails of one camera share their layout, so the
+        # scan starts a fixed distance after the thumbnail's SOI (FF D8 FF, a bit may be off)
+        if ref.scan_offset:
+            sig = np.frombuffer(b"\xff\xd8\xff", dtype=np.uint8)
+            dsig = sum(_POPCOUNT[np.bitwise_xor(arr[j : len(arr) - 2 + j], sig[j])] for j in range(3))
+            for p0 in np.flatnonzero(dsig <= 2)[:8]:
+                if 64 <= p0 and p0 + ref.scan_offset < len(head) and int(p0) + ref.scan_offset not in starts:
+                    starts.append(int(p0) + ref.scan_offset)
+        for start in starts:
+            cand = _rescue_from(head, start, ref)
+            if cand is not None and (best is None or cand[0] > best[0]):
+                best = cand
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _rescue_from(head: bytes, start: int, ref):
+    """(real share, YCbCr pixels, mask of real pixels) of the thumbnail whose scan starts
+    at `start`, decoded with the reference thumbnail header; None when too little is real."""
+    from ..jpeg import markers as M
+    from .base import Context
+    from .r9_holes import FillHoles
+    from .r10_tails import TailRecovery
+    from .registry import run_pipeline
+
+    if True:
         end = head.find(b"\xff\xd9", start)
         end = end + 2 if end > 0 else len(head)
         blob = ref.header_bytes(ref.width, ref.height, []) + head[start:end]
@@ -194,15 +214,15 @@ def _rescue_thumbnail(data: bytes, thumb_refs: list):
             im = Image.open(io.BytesIO(ctx.data))
             im.load()
         except Exception:
-            continue
+            return None
         if ctx.recovered_fraction is not None:
             frac = ctx.recovered_fraction
         else:  # nothing needed repair: the scan decodes as it is
             from ..scan.scanner import scan_bytes
 
             frac = scan_bytes(ctx.data).recovered_fraction
-        if frac < RESCUE_MIN or (best is not None and frac <= best[0]):
-            continue
+        if frac < RESCUE_MIN:
+            return None
         res = M.parse_segments(ctx.data)
         from ..jpeg.tables import FrameTables
 
@@ -214,10 +234,7 @@ def _rescue_thumbnail(data: bytes, thumb_refs: list):
             for mi in range(hole.mcu_first, hole.mcu_first + hole.mcu_count):
                 r, c = divmod(mi, per_row)
                 mask[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw] = False
-        best = (frac, np.asarray(im.convert("YCbCr")), mask)
-    if best is None:
-        return None
-    return best[1], best[2]
+        return frac, np.asarray(im.convert("YCbCr")), mask
 
 
 def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,

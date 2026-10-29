@@ -61,6 +61,7 @@ class CameraProfile:
     source: str = ""
     votes: int = 1  # photos of the set that carry exactly this header
     alt_dims: list = field(default_factory=list)  # other image sizes seen with these tables (w, h)
+    scan_offset: int = field(default=0, compare=False)  # where the scan starts in the original file (thumbnails sit at a fixed layout)
 
     @classmethod
     def from_jpeg(cls, data: bytes, source: str = "") -> "CameraProfile":
@@ -85,6 +86,7 @@ class CameraProfile:
             sos=res.first(M.SOS).payload,
             jfif=app0.payload if app0 and app0.payload.startswith(b"JFIF") else None,
             source=source,
+            scan_offset=res.scan_start or 0,
         )
 
     # ---------------------------------------------------------------- serialisation

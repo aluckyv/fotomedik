@@ -38,6 +38,7 @@ FIRST_WINDOW = 0.25  # search +-25 % of the MCU distance to the nearest anchor (
 MIN_WINDOW = 48
 MAX_WINDOW = 3000
 SHIFT = 6  # MCUs a block may move against its predecessor (a lost or extra MCU after a flipped bit)
+SHORT = 10  # with restart markers the search stays inside one interval: chains this short are placed too
 
 
 def damage_points(data: bytes, lo: int, hi: int) -> np.ndarray:
@@ -57,7 +58,7 @@ def intact_segments(data: bytes, lo: int, hi: int, min_len: int = MIN_SEG) -> li
     return [(a, c) for a, c in zip(edges, ends) if c - a >= min_len]
 
 
-def chains(data: bytes, pk: K.Packed, a: int, c: int) -> list[np.ndarray]:
+def chains(data: bytes, pk: K.Packed, a: int, c: int, min_len: int = BLOCK) -> list[np.ndarray]:
     """MCU start bits of the parses found in the intact stretch [a, c); a decoding error
     (a damaged spot the FF rule did not reveal) ends one chain and starts the next."""
     out = []
@@ -69,7 +70,7 @@ def chains(data: bytes, pk: K.Packed, a: int, c: int) -> list[np.ndarray]:
             continue
         preds = np.zeros(pk.ncomp, dtype=np.int32)
         n, err, eb, _ebit, *_r, bits, _dc = K.decode_mcus(data, s // 8, s % 8, c, pk, preds, 1 << 20, check_dc=False)
-        if n >= BLOCK:
+        if n >= min_len:
             out.append(np.asarray(bits[:n], dtype=np.int64))
         nxt = max(eb, s // 8) + 16
         if nxt <= pos:
@@ -165,27 +166,43 @@ class Anchors:
         return int(e), int(min(MAX_WINDOW, max(MIN_WINDOW, FIRST_WINDOW * near)))
 
 
+def _blocks(n: int, min_len: int) -> list[tuple[int, int]]:
+    """(start, length) of the blocks a chain of n MCUs is placed in: BLOCK-sized, the
+    remainder joined to the last one; a chain shorter than BLOCK is one block."""
+    if n < min_len:
+        return []
+    if n < BLOCK:
+        return [(0, n)]
+    starts = list(range(0, n - BLOCK + 1, BLOCK))
+    out = [(k, BLOCK) for k in starts]
+    rest = n - (starts[-1] + BLOCK)
+    if rest and min_len < BLOCK:  # short pieces allowed: the remainder is not wasted
+        k, ln = out[-1]
+        out[-1] = (k, ln + rest)
+    return out
+
+
 def place_chain(placer: Placer, rel: np.ndarray, byte_of: np.ndarray, anchors: Anchors,
-                m_lo: int, m_hi: int) -> list[tuple[int, int, int]]:
+                m_lo: int, m_hi: int, min_len: int = BLOCK) -> list[tuple[int, int, int]]:
     """Blocks of the chain that fit: (chain index, MCU index, count), in chain order."""
     out: list[tuple[int, int, int]] = []
     n = len(rel)
     prev_end = None  # MCU index right after the last placed block
     floor = m_lo
-    for k in range(0, n - BLOCK + 1, BLOCK):
-        blk = rel[k : k + BLOCK]
+    for k, bl in _blocks(n, min_len):
+        blk = rel[k : k + bl]
         if prev_end is not None:
-            cs, base = placer.costs(blk, prev_end - SHIFT, prev_end + SHIFT + BLOCK)
+            cs, base = placer.costs(blk, prev_end - SHIFT, prev_end + SHIFT + bl)
             if len(cs):
                 i = int(np.argmin(cs))
                 m = base + i
                 if cs[i] <= ACCEPT and m >= floor:
-                    out.append((k, m, BLOCK))
-                    prev_end, floor = m + BLOCK, m + BLOCK
+                    out.append((k, m, bl))
+                    prev_end, floor = m + bl, m + bl
                     continue
             prev_end = None  # lost the thread: search afresh
         e, w = anchors.expect(float(byte_of[k]))
-        cs, base = placer.costs(blk, max(floor, e - w), min(m_hi, e + w + BLOCK))
+        cs, base = placer.costs(blk, max(floor, e - w), min(m_hi, e + w + bl))
         if not len(cs) or not np.isfinite(cs).any():
             continue
         i = int(np.argmin(cs))
@@ -193,9 +210,9 @@ def place_chain(placer: Placer, rel: np.ndarray, byte_of: np.ndarray, anchors: A
         second = float(cs[far].min()) if far.any() else np.inf
         if cs[i] <= ACCEPT and cs[i] <= DISTINCT * second:
             m = base + i
-            out.append((k, m, BLOCK))
+            out.append((k, m, bl))
             anchors.add(float(byte_of[k]), m)
-            prev_end, floor = m + BLOCK, m + BLOCK
+            prev_end, floor = m + bl, m + bl
     return out
 
 
@@ -255,7 +272,7 @@ class SegmentPlacement(Recipe):
                     b_hi = min(b_hi, t["start_bit"] // 8)
                     anchors.append((t["start_bit"] // 8, t["first_mcu"]))
             anchors.append((b_hi, m_hi))
-            if b_hi - b_lo >= MIN_SEG and m_hi - m_lo >= BLOCK:
+            if b_hi - b_lo >= (MIN_SEG // 2 if dri else MIN_SEG) and m_hi - m_lo >= (SHORT if dri else BLOCK):
                 jobs.append({"iv": iv, "b_lo": b_lo, "b_hi": b_hi, "m_lo": m_lo, "m_hi": m_hi,
                              "anchors": sorted(anchors), "dri": dri})
         return jobs
@@ -264,19 +281,21 @@ class SegmentPlacement(Recipe):
         anchors = Anchors(job["anchors"])
         pieces = []
         floor = job["m_lo"]
-        segs = intact_segments(data, job["b_lo"], job["b_hi"])
+        # inside one restart interval the search is narrow, so short chains are safe to place
+        min_len = SHORT if job["dri"] else BLOCK
+        segs = intact_segments(data, job["b_lo"], job["b_hi"], MIN_SEG if not job["dri"] else MIN_SEG // 2)
         # finding the parses is independent per stretch (compiled code, parallel threads);
         # placing them is sequential, every piece must come after the previous one
-        found = parallel.pmap(lambda sc: chains(data, pk, sc[0], sc[1]), segs)
+        found = parallel.pmap(lambda sc: chains(data, pk, sc[0], sc[1], min_len), segs)
         for (a, c), seg_chains in zip(segs, found):
             for bits in seg_chains:
-                if len(bits) < BLOCK:
+                if len(bits) < min_len:
                     continue
                 preds = np.zeros(pk.ncomp, dtype=np.int32)
                 s = int(bits[0])
                 dn, _err, *_r, dc = K.decode_mcus(data, s // 8, s % 8, c, pk, preds, len(bits), check_dc=False)
                 rel = dc[:dn].astype(float) * placer.q[None, :]
-                blocks = place_chain(placer, rel, bits[:dn] / 8.0, anchors, floor, job["m_hi"])
+                blocks = place_chain(placer, rel, bits[:dn] / 8.0, anchors, floor, job["m_hi"], min_len)
                 for k, m, n in merge_blocks(blocks):
                     pieces.append({"chain_bits": bits, "k": k, "m": m, "n": n, "end": c})
                     floor = max(floor, m + n)
