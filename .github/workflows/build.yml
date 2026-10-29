@@ -53,6 +53,11 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python fotomedik_app.py --smoke demo demo_out_src shot_src.png
+      - name: stamp the build number
+        shell: pwsh
+        run: |
+          "BUILD = ${{ github.run_number }}`nCOMMIT = `"${{ github.sha }}`"`n" | Set-Content -Encoding utf8 fotomedik/_build.py
+          "{`"build`": ${{ github.run_number }}, `"commit`": `"${{ github.sha }}`"}" | Set-Content -Encoding utf8 version.json
       - name: package FotoMedik.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name FotoMedik
@@ -80,10 +85,10 @@ jobs:
         run: |
           gh release view app *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create app dist/FotoMedik.exe --title "FotoMedik app (latest build)" --notes "Windows app built from main. Download FotoMedik.exe and run it."
+            gh release create app dist/FotoMedik.exe version.json --title "FotoMedik app (latest build)" --notes "Build ${{ github.run_number }}"
           } else {
-            gh release upload app dist/FotoMedik.exe --clobber
-            gh release edit app --notes "Windows app built from main, commit ${{ github.sha }}. Download FotoMedik.exe and run it."
+            gh release upload app dist/FotoMedik.exe version.json --clobber
+            gh release edit app --notes "Build ${{ github.run_number }} from commit ${{ github.sha }}. Download FotoMedik.exe and run it; it updates itself afterwards."
           }
       - uses: actions/upload-artifact@v4
         if: always()

@@ -65,16 +65,17 @@ def _nothing_to_save(ctx: Context, rep: FileReport) -> bool:
     return bool(fatal) and not ctx.applied and ctx.data == ctx.original
 
 
-def _write_outputs(ctx: Context, rep: FileReport, out_dir: Path, rel: Path) -> Path:
+def _write_outputs(ctx: Context, rep: FileReport, out_dir: Path, rel: Path, reports: bool = False) -> Path:
+    """The repaired file (unless there is nothing to save) and, on request, its report."""
     out_name = ctx.suggested_name or rel.name
     target = out_dir / rel.parent / out_name
     target.parent.mkdir(parents=True, exist_ok=True)
     if _nothing_to_save(ctx, rep):
         rep.output_name = None
+    else:
+        target.write_bytes(ctx.data)
+    if reports:
         (target.parent / (Path(out_name).stem + ".report.json")).write_text(rep.to_json(), encoding="utf-8")
-        return target
-    target.write_bytes(ctx.data)
-    (target.parent / (Path(out_name).stem + ".report.json")).write_text(rep.to_json(), encoding="utf-8")
     return target
 
 
@@ -109,7 +110,7 @@ def _repair_file(args: tuple[str, str, str, dict, CameraProfile | None]) -> tupl
     data = Path(path).read_bytes()
     relp = Path(rel)
     ctx, rep = repair_bytes(data, relp.name, options, profile)
-    target = _write_outputs(ctx, rep, Path(out), relp)
+    target = _write_outputs(ctx, rep, Path(out), relp, bool(options.get("write_reports")))
     if rep.output_name is not None:
         rep.output_name = str(target.relative_to(Path(out)))
     return rep, time.perf_counter() - t
@@ -225,13 +226,14 @@ def scan(path: Path, lang: str):
 
 
 def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
-                jobs: int = 0):
+                jobs: int = 0, reports: bool = False):
     if path.is_dir() and out.resolve() == path.resolve():
         raise click.ClickException("output folder must differ from the input folder (originals are never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
     jobs = jobs or (os.cpu_count() or 1)
     t0 = time.perf_counter()
-    options = {"mark_holes": mark_holes, "keep_damaged": keep_damaged, "time_budget": time_budget}
+    options = {"mark_holes": mark_holes, "keep_damaged": keep_damaged, "time_budget": time_budget,
+               "write_reports": reports}
     profile = CameraProfile.from_json(Path(ref).read_text(encoding="utf-8")) if ref else None
     files = [(p, rel) for p, rel in _iter_files(path) if not p.resolve().is_relative_to(out.resolve())]
     with Workers(jobs, len(files)) as workers:
@@ -258,11 +260,12 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 @click.option("--time-budget", default=5.0, show_default=True, help="seconds per file for bit-flip search")
 @click.option("--thorough", is_flag=True, help="search much longer for flipped bits (60 s per file)")
 @click.option("--jobs", default=0, show_default="all CPU cores", help="files repaired in parallel")
+@click.option("--reports", is_flag=True, help="also write a .report.json next to every repaired photo")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, lang):
-    """Repair a file or folder into OUT (+ a .report.json per file)."""
+def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, lang):
+    """Repair a file or folder into OUT (--reports: a .report.json per file too)."""
     _fix_common(path, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
-                auto_ref=False, jobs=jobs)
+                auto_ref=False, jobs=jobs, reports=reports)
 
 
 @main.command()
@@ -287,17 +290,18 @@ def learn(good: Path, out: Path):
 @click.option("--time-budget", default=5.0, show_default=True)
 @click.option("--thorough", is_flag=True, help="search much longer for flipped bits (60 s per file)")
 @click.option("--jobs", default=0, show_default="all CPU cores", help="files repaired in parallel")
+@click.option("--reports", is_flag=True, help="also write a .report.json next to every repaired photo")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, lang):
+def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
-    reports = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
-                          auto_ref=True, jobs=jobs)
+    reps = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
+                       auto_ref=True, jobs=jobs, reports=reports)
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])
-        for r in reports:
+        for r in reps:
             w.writerow([r.name, r.output_name, r.recovered_pct, len(r.holes), ";".join(f["kind"] for f in r.findings), ";".join(r.applied), r.fallback or ""])
-    click.echo(f"{len(reports)} file(s) -> {out} (summary.csv)")
+    click.echo(f"{len(reps)} file(s) -> {out} (summary.csv)")
 
 
 if __name__ == "__main__":  # pragma: no cover

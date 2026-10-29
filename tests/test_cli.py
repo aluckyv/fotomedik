@@ -50,7 +50,7 @@ def test_cli_fix_writes_output_and_report(tmp_path, healthy_jpeg_rst):
     broken = flip_bits(healthy_jpeg_rst, off, mask)
     p.write_bytes(broken)
     out = tmp_path / "out"
-    r = CliRunner().invoke(main, ["fix", str(p), "-o", str(out), "--lang", "en"])
+    r = CliRunner().invoke(main, ["fix", str(p), "-o", str(out), "--lang", "en", "--reports"])
     assert r.exit_code == 0, r.output
     assert p.read_bytes() == broken  # input untouched
     assert (out / "x.jpg").exists()
@@ -84,7 +84,7 @@ def test_cli_learn_and_ref(tmp_path, healthy_jpeg_rst):
     bad = tmp_path / "bad.jpg"
     bad.write_bytes(bytes(buf))
     out = tmp_path / "out"
-    r = CliRunner().invoke(main, ["fix", str(bad), "-o", str(out), "--ref", str(prof)])
+    r = CliRunner().invoke(main, ["fix", str(bad), "-o", str(out), "--ref", str(prof), "--reports"])
     assert r.exit_code == 0, r.output
     rep = json.loads((out / "bad.report.json").read_text())
     assert "reference_header" in rep["applied"]
@@ -117,7 +117,7 @@ def test_cli_overwritten_file_gets_report_only(tmp_path):
     p = tmp_path / "P0001.JPG"
     p.write_bytes(record * 2000)
     out = tmp_path / "out"
-    r = CliRunner().invoke(main, ["fix", str(p), "-o", str(out), "--lang", "en"])
+    r = CliRunner().invoke(main, ["fix", str(p), "-o", str(out), "--lang", "en", "--reports"])
     assert r.exit_code == 0, r.output
     assert "overwritten" in r.output or "no photo" in r.output
     assert not (out / "P0001.JPG").exists()

@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QProgressDialog,
     QApplication,
     QCheckBox,
     QFileDialog,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import runner
+from . import updater
 from .preview import load_preview
 
 APP_NAME = "FotoMedik"
@@ -125,10 +127,28 @@ class RepairWorker(QObject):
         self.finished.emit(time.perf_counter() - t, err)
 
 
+class UpdateChecker(QObject):
+    """Asks GitHub for a newer build without blocking the window."""
+
+    found = Signal(object)
+
+    def start(self) -> None:
+        def work():
+            try:
+                upd = updater.check()
+            except Exception:
+                upd = None  # offline or not reachable: no update offered
+            if upd is not None:
+                self.found.emit(upd)
+
+        threading.Thread(target=work, daemon=True).start()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} — repair damaged photos")
+        build = updater.current_build()
+        self.setWindowTitle(f"{APP_NAME} — repair damaged photos" + (f"  (build {build})" if build else ""))
         self.resize(1280, 820)
         self.setAcceptDrops(True)
         self.results: list[runner.Result] = []
@@ -154,6 +174,29 @@ class MainWindow(QMainWindow):
         head.addWidget(title)
         head.addWidget(sub)
         outer.addLayout(head)
+
+        # ---- update banner (shown when GitHub has a newer build)
+        self.banner = QFrame()
+        self.banner.setStyleSheet("QFrame { background: #e7f0ff; border: 1px solid #b7cdf5; border-radius: 8px; }")
+        bl = QHBoxLayout(self.banner)
+        bl.setContentsMargins(12, 8, 12, 8)
+        self.banner_text = QLabel("")
+        bl.addWidget(self.banner_text, 1)
+        self.update_btn = QPushButton("Update and restart")
+        self.update_btn.setObjectName("primary")
+        self.update_btn.clicked.connect(self._do_update)
+        bl.addWidget(self.update_btn)
+        later = QPushButton("Later")
+        later.clicked.connect(self.banner.hide)
+        bl.addWidget(later)
+        self.banner.hide()
+        outer.addWidget(self.banner)
+        self.pending_update = None
+        self.checker = UpdateChecker()
+        self.checker.found.connect(self._offer_update)
+        if updater.is_packaged():
+            updater.cleanup_old()
+            self.checker.start()
 
         # ---- input / output
         drop = QFrame()
@@ -196,6 +239,9 @@ class MainWindow(QMainWindow):
         act.addWidget(self.stopb)
         self.mark = QCheckBox("Mark unrecoverable areas in magenta")
         act.addWidget(self.mark)
+        self.reports = QCheckBox("Save a report file for each photo")
+        self.reports.setToolTip("Writes <photo>.report.json next to every repaired copy")
+        act.addWidget(self.reports)
         act.addStretch(1)
         self.openb = QPushButton("Open results folder")
         self.openb.setEnabled(False)
@@ -318,7 +364,7 @@ class MainWindow(QMainWindow):
         self.openb.setEnabled(True)
         self.out_dir = out
 
-        options = {"mark_holes": self.mark.isChecked()}
+        options = {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked()}
         self.thread = QThread(self)
         self.worker = RepairWorker(paths, out, options)
         self.worker.moveToThread(self.thread)
@@ -399,6 +445,43 @@ class MainWindow(QMainWindow):
             subprocess.Popen(["open", str(d)])
         else:
             subprocess.Popen(["xdg-open", str(d)])
+
+    # ------------------------------------------------------------------ updates
+    def _offer_update(self, upd) -> None:
+        self.pending_update = upd
+        self.banner_text.setText(f"A new version of {APP_NAME} is available (build {upd.build}, "
+                                 f"you have build {updater.current_build()}).")
+        self.banner.show()
+
+    def _do_update(self) -> None:
+        upd = self.pending_update
+        if upd is None:
+            return
+        if self.worker is not None and self.thread is not None and self.thread.isRunning():
+            QMessageBox.information(self, APP_NAME, "Wait until the repair finishes, then update.")
+            return
+        new_exe = Path(sys.executable).with_name("FotoMedik.new.exe")
+        dlg = QProgressDialog("Downloading the new version…", "Cancel", 0, 100, self)
+        dlg.setWindowTitle(APP_NAME)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        def progress(done, total):
+            dlg.setValue(int(100 * done / total) if total else 0)
+            QApplication.processEvents()
+
+        try:
+            updater.download(upd, new_exe, progress, cancelled=dlg.wasCanceled)
+            dlg.close()
+            updater.install_and_restart(new_exe)
+        except InterruptedError:
+            dlg.close()
+            return
+        except Exception as e:
+            dlg.close()
+            QMessageBox.warning(self, APP_NAME, f"The update did not work: {e}")
+            return
+        QApplication.quit()
 
     def closeEvent(self, e):  # noqa: N802
         if self.worker is not None:
