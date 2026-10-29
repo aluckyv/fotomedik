@@ -15,7 +15,7 @@ ili sivu sliku. Program:
 Vrednost nije u čudima nego u dijagnozi i maksimalnom izvlačenju. Postojeći alati ili ćute
 ili obećavaju svašta.
 
-Polazni materijal: folder `the test folder` — fotografije 2005–2017 sa kartice koja umire
+Polazni materijal: test folder — fotografije 2005–2017 sa kartice koja umire
 (bit-rot po 32 KB klasterima, uništeni headeri, zalepljen tuđ sadržaj, CardRecovery `.~CR`
 temp fajlovi sa XOR `0x76` na prvih 512 bajtova).
 
@@ -73,7 +73,7 @@ fotomedik/
   report/      JSON + tekst izveštaj, procenat vraćenih MCU-ova
   cli.py       fotomedik scan | fix | batch | learn
 tests/         pytest; sintetička oštećenja iz jedne zdrave slike (ground truth)
-samples/       (gitignore) realni primeri iz the test folder
+samples/       (gitignore) realni primeri (privatni)
 docs/superpowers/specs|plans/
 ```
 

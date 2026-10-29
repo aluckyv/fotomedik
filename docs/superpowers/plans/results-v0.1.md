@@ -1,6 +1,6 @@
 # FotoMedik v0.1 — rezultati (29. 10. 2026)
 
-Test skup: 12 fotografija iz `the test folder` (kartica koja je umirala), plus 25 iz
+Test skup: 12 fotografija iz test foldera (kartica koja je umirala), plus 25 iz
 `2008. BERLIN` za proveru dijagnoze. Mere su iz Linux kontejnera sa 2 jezgra.
 
 ## Brzina
@@ -67,6 +67,6 @@ interpolacijom nije uračunat i izveštaj ga posebno navodi.
 
 - Glatke rupe: niske AC frekvencije iz sličice (DCT po bloku + enkoder za AC
   koeficijente u C-u), umesto ravnih blokova.
-- Pun batch nad `the test folder` u `a separate output folder`. Zdrave slike istog aparata
+- Pun batch nad celim test folderom u poseban izlazni folder. Zdrave slike istog aparata
   iz drugih foldera mogu da posluže kao referentni header.
 - GUI (PySide6).
