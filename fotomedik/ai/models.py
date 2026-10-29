@@ -68,9 +68,11 @@ _CLIP = "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/"
 _CLIP_LICENSE = "MIT (OpenAI CLIP tokenizer files)"
 # the text encoder's vocabulary: a prompt steers what Stable Diffusion paints into the holes
 CLIP_VOCAB = Model("CLIP tokenizer (vocabulary)", "clip_vocab.json",
-                   (_CLIP + "vocab.json", _SD + "tokenizer/vocab.json"), None, 1, _CLIP_LICENSE)
+                   (_CLIP + "vocab.json", _SD + "tokenizer/vocab.json"),
+                   "3f0c4f7d2086b61b38487075278ea9ed04edb53a03cbb045b86c27190fa8fb69", 1, _CLIP_LICENSE)
 CLIP_MERGES = Model("CLIP tokenizer (merges)", "clip_merges.txt",
-                    (_CLIP + "merges.txt", _SD + "tokenizer/merges.txt"), None, 1, _CLIP_LICENSE)
+                    (_CLIP + "merges.txt", _SD + "tokenizer/merges.txt"),
+                    "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a", 1, _CLIP_LICENSE)
 _SD_LICENSE = "CreativeML OpenRAIL-M (Stable Diffusion 1.5 inpainting, Runway/Stability AI)"
 SD_UNET = Model("Stable Diffusion inpainting (UNet)", "sd15inp_unet.onnx",
                 (_SD + "unet/model.onnx", "https://huggingface.co/sona-forge/sd15-inpainting-fp16/resolve/main/unet/model.onnx"),
