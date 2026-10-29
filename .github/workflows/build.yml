@@ -123,7 +123,7 @@ jobs:
           if (Test-Path shot_ai.txt) { Get-Content shot_ai.txt | Where-Object { $_ -notmatch '^Downloading .*%$' } | Select-Object -Last 9 | ForEach-Object { Write-Host "::notice title=smoke (AI)::$_" } }
           Write-Host "exit code $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { exit 1 }
-          if (!(Get-ChildItem demo_out_ai -Filter *_ai.jpg)) { exit 1 }
+          if (!(Get-ChildItem demo_out_ai -Filter *_enhanced.jpg)) { exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: FotoMedik-windows
@@ -149,7 +149,7 @@ jobs:
         run: |
           gh release view ci-preview *> $null
           if ($LASTEXITCODE -ne 0) { gh release create ci-preview --prerelease --title "CI preview pictures" --notes "Pictures from the CI tests (not an app release)." }
-          $files = Get-ChildItem shot_*.png | ForEach-Object { $_.FullName }
+          $files = @(Get-ChildItem shot_*.png) + @(Get-ChildItem demo_out_ai -Filter *_enhanced.jpg -ErrorAction SilentlyContinue) | ForEach-Object { $_.FullName }
           if ($files) { gh release upload ci-preview @files --clobber }
           exit 0
       - uses: actions/upload-artifact@v4
@@ -159,4 +159,4 @@ jobs:
           path: |
             shot_*.png
             shot_*.txt
-            demo_out_ai/*_ai.jpg
+            demo_out_ai/*_enhanced.jpg
