@@ -18,6 +18,7 @@ STRINGS = {
         "holes": "Rupe (nepopravljeni delovi)",
         "hole_line": "MCU {first}–{last} ({count} blokova): {reason}",
         "fallback_thumb": "Glavna slika nije spasiva — sačuvan je ugrađeni thumbnail.",
+        "thumb_guided": "Rupe su popunjene prema ugrađenoj sličici (thumbnail): tačne boje i grubi oblici, bez sitnih detalja.",
         "output": "Izlazni fajl",
         "kind": {
             "not_jpeg": "fajl nije JPEG (ili je početak uništen)",
@@ -51,6 +52,7 @@ STRINGS = {
         "holes": "Holes (unrecovered parts)",
         "hole_line": "MCU {first}–{last} ({count} blocks): {reason}",
         "fallback_thumb": "Main image unrecoverable — the embedded thumbnail was saved instead.",
+        "thumb_guided": "Holes were filled following the embedded thumbnail: right colours and rough shapes, no fine detail.",
         "output": "Output file",
         "kind": {
             "not_jpeg": "not a JPEG (or the start is destroyed)",
@@ -154,6 +156,8 @@ class FileReport:
                 )
             if len(self.holes) > 20:
                 lines.append(f"  … +{len(self.holes) - 20}")
+        if any(e.get("recipe") == "fill_holes" and (e.get("extra") or {}).get("thumbnail_guided") for e in self.log):
+            lines.append(s["thumb_guided"])
         if self.fallback == "thumbnail":
             lines.append(s["fallback_thumb"])
         lines.append(f"{s['output']}: {self.output_name}")

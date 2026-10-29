@@ -416,8 +416,11 @@ class FillHoles(Recipe):
         msg = f"filled {len(holes)} hole(s) covering {filled} of {total} MCUs; {kept} MCUs kept"
         if spliced:
             msg += f" (incl. {spliced} recovered after damaged stretches)"
+        if thumb is not None and holes:
+            msg += "; holes follow the embedded thumbnail"
         ctx.replace_data(new, self, msg, holes=[h.to_dict() for h in holes], kept_mcus=kept,
-                         total_mcus=total, spliced_mcus=spliced)
+                         total_mcus=total, spliced_mcus=spliced, thumbnail_guided=bool(thumb is not None and holes),
+                         thumbnail_fit=({int(k): list(v) for k, v in thumb.fit.items()} if thumb is not None else None))
 
 
 def _unstuff(blob: bytes) -> bytes:

@@ -25,6 +25,8 @@ from ..jpeg import decoder as D
 
 THUMB_MIN_R = 0.8  # luma correlation with the clean blocks needed to trust the thumbnail
 THUMB_MIN_BLOCKS = 200
+UNCAL_MIN_R = 0.5  # agreement needed with whatever decoded when there is too little clean data
+UNCAL_SIGMA = (6.0, 3.0)  # expected error (gray levels, luma/chroma) of an uncalibrated thumbnail
 RESID_DECAY = 4.0  # block rows over which a clean row's correction to the thumbnail fades
 THUMB_DIST = 3.0  # block rows a thumbnail-only reference counts as (for ordering by reliability)
 
@@ -78,6 +80,7 @@ class ThumbBase:
     dc: dict  # cid -> thumbnail DC on the component's block grid (calibrated)
     sigma: dict  # cid -> typical |error| of it vs clean blocks, gray levels
     r: float  # luma correlation with the clean blocks
+    fit: dict  # cid -> (gain, offset in gray levels) of the calibration
 
 
 def build_field(arr: np.ndarray, okm: np.ndarray, q: int, base: np.ndarray | None = None,
@@ -132,6 +135,7 @@ def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray) ->
     hmax, vmax = frame.hmax, frame.vmax
     out: dict = {}
     sig: dict = {}
+    fit: dict = {}
     r_luma = 0.0
     for ci, c in enumerate(comps):
         arr = sr.dc[c.cid]
@@ -154,7 +158,18 @@ def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray) ->
         okm = block_mask(clean_mcus, arr, c.h, c.v, per_row)
         x, y = tdc[okm], arr[okm]
         if len(x) < THUMB_MIN_BLOCKS:
-            return None
+            # too little clean data to calibrate: cameras render the thumbnail from the
+            # same picture (measured gain 0.98-1.1, offset < 4 gray levels), so use it as
+            # is - unless whatever did decode contradicts it
+            anyok = block_mask(sr.mcu_ok, arr, c.h, c.v, per_row)
+            if ci == 0 and int(anyok.sum()) >= 50:
+                xa, ya = tdc[anyok], arr[anyok]
+                if np.std(xa) > 1e-6 and np.std(ya) > 1e-6 and np.corrcoef(xa, ya)[0, 1] < UNCAL_MIN_R:
+                    return None
+            out[c.cid] = tdc
+            sig[c.cid] = UNCAL_SIGMA[min(ci, 1)]
+            fit[c.cid] = (1.0, 0.0)
+            continue
         sx = float(np.std(x))
         if sx > 1e-6 and float(np.std(y)) > 1e-6:
             r = float(np.corrcoef(x, y)[0, 1])
@@ -167,5 +182,6 @@ def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray) ->
             r_luma = r
         b = float(np.median(y - a * x))
         out[c.cid] = a * tdc + b
+        fit[c.cid] = (round(a, 3), round(b * q / 8.0, 1))
         sig[c.cid] = max(1.0, float(np.median(np.abs(y - out[c.cid][okm]))) * q / 8.0)
-    return ThumbBase(out, sig, r_luma)
+    return ThumbBase(out, sig, r_luma, fit)
