@@ -60,6 +60,7 @@ class CameraProfile:
     jfif: bytes | None = None  # APP0 payload, if the camera writes one
     source: str = ""
     votes: int = 1  # photos of the set that carry exactly this header
+    alt_dims: list = field(default_factory=list)  # other image sizes seen with these tables (w, h)
 
     @classmethod
     def from_jpeg(cls, data: bytes, source: str = "") -> "CameraProfile":

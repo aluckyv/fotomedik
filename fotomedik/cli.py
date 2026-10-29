@@ -55,7 +55,11 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
     w, h = _dims(ctx.data)
     rep = FileReport.from_context(ctx, findings_before=[f.to_dict() for f in diag.findings], width=w, height=h)
     if rep.recovered_pct is None:
-        rep.recovered_pct = round(100 * diag.recovered_fraction, 1) if not diag.findings or diag.openable else None
+        if ctx.data != data:  # repaired (e.g. a new header) and nothing left to fill: measure the result
+            after = scan_bytes(ctx.data, name)
+            rep.recovered_pct = round(100 * after.recovered_fraction, 1) if after.openable else None
+        else:
+            rep.recovered_pct = round(100 * diag.recovered_fraction, 1) if not diag.findings or diag.openable else None
     return ctx, rep
 
 
@@ -79,28 +83,33 @@ def _write_outputs(ctx: Context, rep: FileReport, out_dir: Path, rel: Path, repo
     return target
 
 
-def _profile_of(args: tuple[str, str]) -> tuple[CameraProfile, float, CameraProfile | None] | None:
-    """Worker: the header of a file as a reference profile, with the share of its scan
-    that decodes (a damaged scan does not make the header less useful), and the header
-    of its embedded thumbnail (a reference for rescuing damaged thumbnails)."""
+def _profile_of(args: tuple[str, str]) -> dict | None:
+    """Worker: what a file can teach about its camera - its header as a reference profile
+    (with the share of its scan that decodes; a damaged scan does not make the header less
+    useful), the header of its embedded thumbnail, its table block as the file has it,
+    and its header region (damaged headers still vote, see learn.consensus)."""
     path, rel = args
     try:
         data = Path(path).read_bytes()
+    except OSError:
+        return None
+    from .learn.consensus import HEAD, table_block
+
+    out: dict = {"head": data[:HEAD], "profile": None, "health": 0.0, "thumb": None, "block": None}
+    try:
         d = scan_bytes(data, Path(rel).name)
-        if not d.openable:
-            return None
-        thumb = None
-        try:
+        if d.openable:
+            out["profile"] = CameraProfile.from_jpeg(data, source=rel)
+            out["health"] = d.recovered_fraction
+            out["block"] = table_block(data)
             from .recipes.r8_thumbnail import extract_thumbnail
 
             blob = extract_thumbnail(data)
             if blob is not None:
-                thumb = CameraProfile.from_jpeg(blob, source=f"{rel} (thumbnail)")
-        except Exception:
-            thumb = None
-        return CameraProfile.from_jpeg(data, source=rel), d.recovered_fraction, thumb
+                out["thumb"] = CameraProfile.from_jpeg(blob, source=f"{rel} (thumbnail)")
     except Exception:
-        return None
+        pass
+    return out
 
 
 def _repair_file(args: tuple[str, str, str, dict, CameraProfile | None]) -> tuple[FileReport, float]:
@@ -200,8 +209,30 @@ def _learn_candidates(files: list[tuple[Path, Path]], echo, jobs: int = 1, worke
         return out
 
     good = [g for g in found if g is not None]
-    profiles = ranked([(g[0], g[1]) for g in good])
-    thumbs = ranked([(g[2], 1.0) for g in good if g[2] is not None])
+    profiles = ranked([(g["profile"], g["health"]) for g in good if g["profile"] is not None])
+    thumbs = ranked([(g["thumb"], 1.0) for g in good if g["thumb"] is not None])
+    # every header votes, damaged ones included: the tables come out clean even when no
+    # photo of the set has an intact header (bit-by-bit majority, see learn.consensus)
+    from .learn.consensus import consensus
+
+    blocks = {}
+    for g in good:
+        if g["profile"] is not None and g["block"]:
+            key = (g["profile"].width, g["profile"].height, tuple(g["profile"].dqt), tuple(g["profile"].dht))
+            blocks.setdefault(key, g["block"])
+    seeds = []
+    for p in profiles:
+        b = blocks.get((p.width, p.height, tuple(p.dqt), tuple(p.dht)))
+        if b is not None:
+            seeds.append((p, b))
+    if len(good) >= 3:
+        voted = consensus(seeds, [g["head"] for g in good])
+        if seeds:
+            by_key = {id(p): v for (p, _b), v in zip(seeds, voted)}
+            profiles = [by_key.get(id(p), p) for p in profiles]
+        else:
+            profiles = voted  # no header of the set parses: the vote is all there is
+        profiles.sort(key=lambda p: p.votes, reverse=True)
     if profiles:
         echo(f"[ref] {len(profiles)} reference header(s) learned from the set")
     return profiles, thumbs

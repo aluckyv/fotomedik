@@ -167,7 +167,8 @@ class ReferenceHeader(Recipe):
             found = find_scan_start(d, prof.sos_bytes)
             if found is not None and found not in starts:
                 starts.append(found)
-            dims = [(prof.width, prof.height)]
+            dims = [(prof.width, prof.height), (prof.height, prof.width)]  # portrait shots too
+            dims += [tuple(d) for d in prof.alt_dims if tuple(d) not in dims]
             if sof_dims is not None and sof_dims not in dims:
                 near = ham_bytes(sof_dims[0].to_bytes(2, "big") + sof_dims[1].to_bytes(2, "big"),
                                  prof.width.to_bytes(2, "big") + prof.height.to_bytes(2, "big")) <= 2
