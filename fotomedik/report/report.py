@@ -43,6 +43,7 @@ STRINGS = {
             "bitflip_repair": "vraćeni izvrnuti bitovi",
             "fill_holes": "popunjene rupe",
             "thumbnail_fallback": "iskorišćen ugrađeni thumbnail",
+            "smooth_holes": "rupe izglađene (bez kockica)",
         },
     },
     "en": {
@@ -80,6 +81,7 @@ STRINGS = {
             "bitflip_repair": "flipped bits restored",
             "fill_holes": "holes filled",
             "thumbnail_fallback": "embedded thumbnail used",
+            "smooth_holes": "holes smoothed (no squares)",
         },
     },
 }

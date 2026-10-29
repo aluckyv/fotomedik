@@ -1,8 +1,9 @@
 """Minimal baseline JPEG entropy *encoder* — only what hole filling needs.
 
-We never re-encode real image data. We only synthesise DC-only blocks (flat
-colour, EOB right after DC) with the file's own Huffman tables so that a
-damaged restart interval can be replaced by bytes every decoder accepts.
+We never re-encode real image data (it is copied bit for bit). We only synthesise
+blocks for holes with the file's own Huffman tables: DC-only blocks (flat colour,
+EOB right after DC), or full blocks carrying a smooth surface (encode_blocks), so
+that a damaged restart interval can be replaced by bytes every decoder accepts.
 """
 
 from __future__ import annotations
@@ -218,6 +219,90 @@ def _encode_flat_c(ft: FrameTables, mcu_count: int, targets: dict, preds: dict, 
         raise RuntimeError("bit writer overflow")
     for i, cid in enumerate(pk.cids):
         preds[cid] = int(pr[i])
+
+
+def encode_blocks(ft: FrameTables, coefs: np.ndarray, preds: dict[int, int], writer: BitWriter) -> None:
+    """Append full blocks (DC + AC) for len(coefs) MCUs to `writer`, unpadded.
+
+    coefs: int[n_mcu, blocks_per_mcu, 64] in zigzag order, DC absolute (quantised).
+    preds: DC predictor state at the start, updated to the state at the end. A
+    coefficient whose run/size symbol the AC table lacks is shrunk or dropped."""
+    from .kernel import packed_for
+
+    pk = packed_for(ft)
+    dc_len, dc_code, _eob_len, _eob_code = pk.enc_tables(ft)
+    ac_len, ac_code = pk.ac_tables(ft)
+    n = len(coefs)
+    flat = np.ascontiguousarray(np.asarray(coefs).reshape(-1), dtype=np.int32)
+    if flat.size != n * pk.blocks_per_mcu * 64:
+        raise ValueError("coefficient array does not match the scan layout")
+    if isinstance(writer, CBitWriter):
+        pr = np.array([int(preds[cid]) for cid in pk.cids], dtype=np.int32)
+        writer._reserve(flat.size * 4 + 64)
+        rc = writer._call(writer._lib.encode_blocks, pk.c_comps, pk.ncomp, dc_len.ctypes.data, dc_code.ctypes.data,
+                          ac_len.ctypes.data, ac_code.ctypes.data, n, flat.ctypes.data, pr.ctypes.data)
+        if rc == -1:
+            raise RuntimeError("bit writer overflow")
+        if rc == -2:
+            raise ValueError("DC table has no category-0 code")
+        if rc == -3:
+            raise ValueError("AC table has no EOB or ZRL code")
+        for i, cid in enumerate(pk.cids):
+            preds[cid] = int(pr[i])
+        return
+    _py_encode_blocks(pk, dc_len, dc_code, ac_len, ac_code, flat.tolist(), n, preds, writer)
+
+
+def _py_encode_blocks(pk, dc_len, dc_code, ac_len, ac_code, flat: list, n: int, preds: dict, w: BitWriter) -> None:
+    """Python mirror of encode_blocks in _fastdec.c (statement by statement)."""
+    k = 0
+    for _m in range(n):
+        for c, (cid, (h, v)) in enumerate(zip(pk.cids, pk.hv)):
+            ln, cd = dc_len[c], dc_code[c]
+            al, ac = ac_len[c], ac_code[c]
+            if al[0x00] == 0 or al[0xF0] == 0:
+                raise ValueError("AC table has no EOB or ZRL code")
+            for _b in range(h * v):
+                blk = flat[k * 64 : k * 64 + 64]
+                k += 1
+                diff = blk[0] - preds[cid]
+                want = abs(diff).bit_length()
+                s = want
+                while s > 0 and ln[s] == 0:
+                    s -= 1
+                if s == 0 and ln[0] == 0:
+                    raise ValueError("DC table has no category-0 code")
+                if s < want:
+                    lim = (1 << s) - 1
+                    diff = max(-lim, min(lim, diff))
+                w.put_bits(int(cd[s]), int(ln[s]))
+                if s:
+                    w.put_bits(_magnitude_bits(diff, s), s)
+                preds[cid] += diff
+                run = 0
+                for z in range(1, 64):
+                    val = blk[z]
+                    if val == 0:
+                        run += 1
+                        continue
+                    sz = min(abs(val).bit_length(), 10)
+                    while run > 15:
+                        w.put_bits(int(ac[0xF0]), int(al[0xF0]))
+                        run -= 16
+                    sym = (run << 4) | sz
+                    while sz > 0 and al[sym] == 0:
+                        sz -= 1
+                        sym = (run << 4) | sz
+                    if sz == 0:
+                        run += 1
+                        continue
+                    lim = (1 << sz) - 1
+                    val = max(-lim, min(lim, val))
+                    w.put_bits(int(ac[sym]), int(al[sym]))
+                    w.put_bits(_magnitude_bits(val, sz), sz)
+                    run = 0
+                if run > 0:
+                    w.put_bits(int(ac[0x00]), int(al[0x00]))
 
 
 def gray_dc(ft: FrameTables, cid: int, sample: int) -> int:

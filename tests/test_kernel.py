@@ -174,3 +174,32 @@ def test_parallel_decode_matches_serial():
     assert (a.mcu_ok == b.mcu_ok).all()
     for cid in a.dc:
         assert np.array_equal(a.dc[cid], b.dc[cid], equal_nan=True)
+
+
+@needs_c
+def test_full_block_encoder_parity():
+    """Full blocks (DC + AC) give the same bytes in C and Python, and decode back."""
+    from fotomedik.jpeg.encoder import BitWriter, encode_blocks
+
+    data = make_jpeg(make_image())
+    res, ft, pk = _setup(data)
+    rng = np.random.default_rng(5)
+    n = 23
+    coefs = np.zeros((n, pk.blocks_per_mcu, 64), dtype=np.int32)
+    coefs[..., 0] = rng.integers(-60, 60, (n, pk.blocks_per_mcu))
+    for z in (1, 2, 5, 9, 20, 40, 63):
+        coefs[..., z] = rng.integers(-40, 40, (n, pk.blocks_per_mcu)) * (rng.random((n, pk.blocks_per_mcu)) < 0.6)
+
+    def run():
+        w = BitWriter()
+        preds = {cid: 3 for cid in pk.cids}
+        encode_blocks(ft, coefs, preds, w)
+        return w.finish(), preds
+
+    (c_bytes, c_preds), (py_bytes, py_preds) = _both(run)
+    assert c_bytes == py_bytes and c_preds == py_preds
+    # the bytes decode as n MCUs whose DC values are the ones given
+    blob = c_bytes + b"\xff\xd9"
+    got = kernel.decode_mcus(blob, 0, 0, len(blob), pk, np.full(pk.ncomp, 3, dtype=np.int32), n, check_dc=False)
+    assert got[0] == n
+    assert np.array_equal(got[8], coefs[..., 0])

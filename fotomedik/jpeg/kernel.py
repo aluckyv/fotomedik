@@ -92,6 +92,18 @@ class Packed:
         # raw table pointers, computed once (getting a pointer per call is slow)
         self.tp = tuple(a.ctypes.data for a in (self.fast, self.maxcode, self.valptr, self.mincode, self.symbols))
         self._enc = None
+        self._ac = None
+
+    def ac_tables(self, ft: FrameTables):
+        """AC Huffman codes for the full-block encoder: ac_len/ac_code int32[ncomp, 256]."""
+        if self._ac is None:
+            ac_len = np.zeros((self.ncomp, 256), dtype=np.int32)
+            ac_code = np.zeros((self.ncomp, 256), dtype=np.int32)
+            for i, sc in enumerate(ft.scan.components):
+                for (ln, code), sym in ft.huff[(1, sc.ta)].lookup.items():
+                    ac_len[i, sym], ac_code[i, sym] = ln, code
+            self._ac = (ac_len, ac_code)
+        return self._ac
 
     def enc_tables(self, ft: FrameTables):
         """Huffman codes for the DC-only encoder: dc_len/dc_code int32[ncomp, 16],

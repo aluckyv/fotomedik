@@ -26,7 +26,7 @@
 #define EXPORT
 #endif
 
-#define FASTDEC_ABI 12  /* bump whenever an exported signature changes; fastdec.py checks it */
+#define FASTDEC_ABI 13  /* bump whenever an exported signature changes; fastdec.py checks it */
 
 EXPORT int fastdec_abi(void) { return FASTDEC_ABI; }
 
@@ -613,6 +613,73 @@ EXPORT int encode_dc_fill(uint8_t *out, int64_t cap, int64_t *st, const comp_t *
                 }
                 preds[c] += diff;
                 if (bw_emit(out, cap, st, (uint32_t)eob_code[c], eob_len[c])) return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Full blocks (DC difference + AC run/size symbols) with the file's own tables, for
+ * holes that get a smooth surface instead of a flat colour.
+ * coefs: int32[mcu_count * bpm * 64], zigzag order, DC absolute (quantised units);
+ * ac_len/ac_code: int32[ncomp][256] Huffman code per run/size symbol (len 0 = absent).
+ * A coefficient whose symbol the table lacks is shrunk to the largest size it has
+ * for that run, or dropped. Returns 0, -1 (buffer too small), -2 (no DC category 0),
+ * -3 (AC table without EOB or ZRL). */
+EXPORT int encode_blocks(uint8_t *out, int64_t cap, int64_t *st, const comp_t *comps, int ncomp,
+                         const int32_t *dc_len, const int32_t *dc_code, const int32_t *ac_len, const int32_t *ac_code,
+                         int64_t mcu_count, const int32_t *coefs, int32_t *preds) {
+    int64_t k = 0;
+    for (int64_t m = 0; m < mcu_count; m++) {
+        for (int c = 0; c < ncomp; c++) {
+            int nb = comps[c].h * comps[c].v;
+            const int32_t *ln = dc_len + c * 16, *cd = dc_code + c * 16;
+            const int32_t *al = ac_len + c * 256, *ac = ac_code + c * 256;
+            if (al[0x00] == 0 || al[0xF0] == 0) return -3;
+            for (int b = 0; b < nb; b++, k++) {
+                const int32_t *blk = coefs + k * 64;
+                int32_t diff = blk[0] - preds[c];
+                int32_t a = diff < 0 ? -diff : diff;
+                int want = 0;
+                while (a >> want) want++;
+                int s = want;
+                while (s > 0 && ln[s] == 0) s--;
+                if (s == 0 && ln[0] == 0) return -2;
+                if (s < want) {
+                    int32_t lim = (1 << s) - 1;
+                    if (diff > lim) diff = lim;
+                    if (diff < -lim) diff = -lim;
+                }
+                if (bw_emit(out, cap, st, (uint32_t)cd[s], ln[s])) return -1;
+                if (s) {
+                    uint32_t mag = (uint32_t)(diff >= 0 ? diff : diff + (1 << s) - 1);
+                    if (bw_emit(out, cap, st, mag, s)) return -1;
+                }
+                preds[c] += diff;
+                int run = 0;
+                for (int z = 1; z < 64; z++) {
+                    int32_t v = blk[z];
+                    if (v == 0) { run++; continue; }
+                    int32_t av = v < 0 ? -v : v;
+                    int sz = 0;
+                    while (av >> sz) sz++;
+                    if (sz > 10) sz = 10;
+                    while (run > 15) {
+                        if (bw_emit(out, cap, st, (uint32_t)ac[0xF0], al[0xF0])) return -1;
+                        run -= 16;
+                    }
+                    int sym = (run << 4) | sz;
+                    while (sz > 0 && al[sym] == 0) { sz--; sym = (run << 4) | sz; }
+                    if (sz == 0) { run++; continue; }  /* no code for this run: drop it */
+                    int32_t lim = (1 << sz) - 1;
+                    if (v > lim) v = lim;
+                    if (v < -lim) v = -lim;
+                    if (bw_emit(out, cap, st, (uint32_t)ac[sym], al[sym])) return -1;
+                    uint32_t mag = (uint32_t)(v >= 0 ? v : v + (1 << sz) - 1);
+                    if (bw_emit(out, cap, st, mag, sz)) return -1;
+                    run = 0;
+                }
+                if (run > 0 && bw_emit(out, cap, st, (uint32_t)ac[0x00], al[0x00])) return -1;
             }
         }
     }
