@@ -27,7 +27,7 @@ from ..jpeg import decoder as D
 from ..jpeg import kernel as K
 from ..scan.garbage import last_dense_damage
 from .base import Context, Recipe
-from .r9_holes import block_mask, decode_for, tail_blocks, vertical_reference
+from .r9_holes import block_mask, decode_for, junk_onset, tail_blocks, vertical_reference
 from .registry import register
 
 DROP_FIRST = 2  # the first MCUs of a tail start inside the damage
@@ -257,7 +257,14 @@ class TailRecovery(Recipe):
                 if not full:
                     k = min(TRIM_SCAN, n_tail - MIN_TAIL)
                     anom = head_anomaly(refs, first_tail, dc_rel, delta, pk)
-                    trim = min(k, leading_junk(anom))
+                    trim = leading_junk(anom)
+                    # junk decoded inside the damage drifts: a step down in the anomaly
+                    clean_part = anom[n_tail // 2 :]
+                    sig = float(np.nanmedian(clean_part)) if not np.all(np.isnan(clean_part)) else 1.0
+                    onset = junk_onset((anom / max(1.0, sig))[::-1])
+                    if onset is not None:
+                        trim = max(trim, n_tail - onset)
+                    trim = min(k, trim)
                 if trim:
                     s_bit = bits[drop + trim]
                     n_tail -= trim

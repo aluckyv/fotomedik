@@ -31,8 +31,7 @@ from .base import Context, Hole, Recipe
 from .registry import register
 
 BACKOFF_MCUS = 3  # MCUs dropped before a detected error (silent desync margin)
-ANOMALY_LEVELS = 96  # luma jump vs. the block above (gray levels) that marks an MCU as untrusted
-ANOMALY_MAX_EXTRA = 16
+JUNK_LEVEL = 6.0  # median anomaly (in units of the vertical prediction error) of a junk prefix
 MARK_YCC = (105, 212, 235)  # magenta in YCbCr
 TAIL_REF_ROUNDS = (2.0, 6.0, math.inf)  # mean reference distance (block rows) accepted per round
 
@@ -72,6 +71,57 @@ def tail_blocks(first: int, n: int, h: int, v: int, per_row: int) -> tuple[np.nd
     br = np.stack([mrow * v + by for by in range(v) for _bx in range(h)], axis=1)
     bc = np.stack([mcol * h + bx for _by in range(v) for bx in range(h)], axis=1)
     return br, bc
+
+
+def junk_onset(s: np.ndarray, min_t: float = 6.0, ratio: float = 2.5, floor: float = 4.0) -> int | None:
+    """Where junk begins at the end of a per-MCU anomaly series (in noise units), or None.
+
+    After a silent desync the DC predictor is corrupted and stays so: the anomaly steps
+    up and does not come back. The split maximising the step statistic
+    (mean after - mean before) * sqrt(k (n-k) / n) is accepted when it is significant
+    and the level after it is clearly junk; the part before is searched again, since
+    junk often comes in two stages (a small drift, then a big jump).
+    """
+    s = np.nan_to_num(np.asarray(s, dtype=float), nan=0.0)
+    onset = None
+    n = len(s)
+    while n >= 4:
+        cs = np.cumsum(s[:n])
+        k = np.arange(1, n)
+        pre = cs[:-1] / k
+        post = (cs[-1] - cs[:-1]) / (n - k)
+        t = (post - pre) * np.sqrt(k * (n - k) / n)
+        i = int(np.argmax(t))
+        if t[i] < min_t or post[i] < max(floor, ratio * pre[i]):
+            break
+        onset = int(k[i])
+        n = onset
+    return onset
+
+
+def vertical_noise(arr: np.ndarray, okm: np.ndarray, q: int) -> float:
+    """Typical gray-level error of predicting a clean block from the blocks above and below."""
+    m = okm[1:-1] & okm[:-2] & okm[2:]
+    if not m.any():
+        return 1.0
+    err = np.abs(arr[1:-1] - (arr[:-2] + arr[2:]) / 2.0)[m]
+    return max(1.0, float(np.median(err)) * q / 8.0)
+
+
+def anomaly_series(refs: dict, comps, per_row: int, qdc: dict, noise: dict, dc: dict, first: int, n: int,
+                   max_dist: float = 8) -> np.ndarray:
+    """Per MCU: worst component of |DC - reference| in units of that component's typical
+    vertical prediction error (`noise`). `refs`: cid -> (values, distances) from
+    vertical_reference; dc: cid -> the MCUs' first-block DC values. NaN without reference."""
+    out = np.full(n, np.nan)
+    for cid, h, v in comps:
+        val, dist = refs[cid]
+        br, bc = tail_blocks(first, n, h, v, per_row)
+        rv, dv = val[br[:, 0], bc[:, 0]], dist[br[:, 0], bc[:, 0]]
+        a = np.abs(dc[cid] - rv) * qdc[cid] / 8.0 / noise[cid]
+        a = np.where((dv <= max_dist) & ~np.isnan(rv), a, np.nan)
+        out = np.where(np.isnan(out), a, np.where(np.isnan(a), out, np.maximum(out, a)))
+    return out
 
 
 def legal_offset(rel: np.ndarray, q: int, d: float) -> float | None:
@@ -153,31 +203,35 @@ class FillHoles(Recipe):
         work_dc = {cid: sr.dc[cid].copy() for cid, _h, _v in comps}
         trusted = sr.mcu_ok.copy()
 
+        # references for judging kept prefixes: clean intervals only (a prefix may be junk)
+        clean = sr.mcu_ok.copy()
+        for iv in sr.intervals:
+            if not iv.ok:
+                clean[iv.mcu_first : iv.mcu_first + iv.mcu_count] = False
+        clean_masks = {cid: block_mask(clean, sr.dc[cid], h, v, mcus_per_row) for cid, h, v in comps}
+        prefix_refs = {cid: vertical_reference(sr.dc[cid], clean_masks[cid]) for cid, h, v in comps}
+        noise = {cid: vertical_noise(sr.dc[cid], clean_masks[cid], qdc[cid]) for cid, h, v in comps}
+
         def untrust_tail(iv, keep):
-            """Shrink `keep` by the safety margin and by DC anomalies near the end."""
+            """Shrink `keep` by the safety margin, and to just before a silent desync:
+            from there on the DC drifts away from what the rows around suggest."""
+            n = keep
             keep = max(0, keep - BACKOFF_MCUS)
-            extra = 0
-            arr = sr.dc[luma]
-            while keep > 0 and extra < ANOMALY_MAX_EXTRA:
-                mi = iv.mcu_first + keep - 1
-                mrow, mcol = divmod(mi, mcus_per_row)
-                brow, bcol = mrow * lv, mcol * lh
-                cur = arr[brow, bcol]
-                above = None
-                r = brow - 1
-                while r >= 0:
-                    um = (r // lv) * mcus_per_row + bcol // lh
-                    if trusted[um] and not math.isnan(arr[r, bcol]):
-                        above = arr[r, bcol]
-                        break
-                    r -= 1
-                if above is None or math.isnan(cur):
-                    break
-                if abs(cur - above) * qdc[luma] / 8 > ANOMALY_LEVELS:
-                    keep -= 1
-                    extra += 1
-                else:
-                    break
+            if n >= 4:
+                idx = np.arange(iv.mcu_first, iv.mcu_first + n)
+                mrow, mcol = np.divmod(idx, mcus_per_row)
+                first_dc = {cid: sr.dc[cid][mrow * v, mcol * h] for cid, h, v in comps}
+                s_ = anomaly_series(prefix_refs, comps, mcus_per_row, qdc, noise, first_dc, iv.mcu_first, n)
+                onset = junk_onset(s_)
+                if onset is not None:
+                    keep = min(keep, max(0, onset - 1))  # the MCU before the jump is already suspect
+                # junk from the very start (the interval's beginning rotted): no step to find,
+                # but the MCUs sit far from the rows right next to them all along
+                near = anomaly_series(prefix_refs, comps, mcus_per_row, qdc, noise, first_dc, iv.mcu_first, n,
+                                      max_dist=1)[:keep]
+                near = near[~np.isnan(near)]
+                if len(near) >= 4 and float(np.median(near)) >= JUNK_LEVEL:
+                    keep = 0
             return keep
 
         plan: dict[int, dict] = {}  # interval index -> {keep, tail}
