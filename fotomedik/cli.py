@@ -310,7 +310,8 @@ def scan(path: Path, lang: str):
 
 
 def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
-                jobs: int = 0, reports: bool = False, enhance: str = "", quality: str | None = None):
+                jobs: int = 0, reports: bool = False, enhance: str = "", quality: str | None = None,
+                prompt: str | None = None):
     if path.is_dir() and out.resolve() == path.resolve():
         raise click.ClickException("output folder must differ from the input folder (originals are never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
@@ -337,7 +338,7 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 
         reports_wanted = reports
         device = run_extras([(rep, files[i][0]) for i, (rep, _s) in enumerate(results)], out, steps, click.echo,
-                            on_done=ai_done, quality=quality)
+                            on_done=ai_done, quality=quality, prompt=prompt)
         if device:
             click.echo(f"[enhance] networks ran on {device}")
     reports: list[FileReport] = []
@@ -366,12 +367,14 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
               "faces. Network steps invent detail.")
 @click.option("--quality", default="balanced", show_default=True, type=click.Choice(["fast", "balanced", "full"]),
               help="diffusion preset: the photo is repainted at quarter, half or full size")
+@click.option("--scene", default="", help="what the photos show, for the diffusion (e.g. 'people on a square')")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality, lang):
+def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality, scene,
+        lang):
     """Repair a file or folder into OUT (--reports: a .report.json per file too)."""
     _fix_common(path, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
                 auto_ref=False, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""),
-                quality=quality)
+                quality=quality, prompt=scene or None)
 
 
 @main.command()
@@ -403,12 +406,14 @@ def learn(good: Path, out: Path):
               "faces. Network steps invent detail.")
 @click.option("--quality", default="balanced", show_default=True, type=click.Choice(["fast", "balanced", "full"]),
               help="diffusion preset: the photo is repainted at quarter, half or full size")
+@click.option("--scene", default="", help="what the photos show, for the diffusion (e.g. 'people on a square')")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality, lang):
+def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality,
+          scene, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
     reps = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
                        auto_ref=True, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""),
-                       quality=quality)
+                       quality=quality, prompt=scene or None)
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])

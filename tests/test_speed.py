@@ -369,3 +369,54 @@ def test_fp16_is_not_tried_on_the_processor_or_for_other_networks(tmp_path, monk
     lama = tmp_path / models.INPAINT.file
     lama.write_bytes(b"x")
     assert half.session(models.INPAINT, lama, lambda p: _S(p)).path == lama
+
+
+# ----------------------------------------------------------------------------- prompt
+
+
+def test_clip_tokenizer_merges_and_pads():
+    from fotomedik.ai.tokenizer import ClipTokenizer
+
+    vocab = {"<|startoftext|>": 49406, "<|endoftext|>": 49407, "a</w>": 320, "p": 1, "h": 2, "o": 3, "t": 4,
+             "o</w>": 5, "ph": 6, "ot": 7, "phot": 8, "photo</w>": 9, ",</w>": 10, "x": 11}
+    merges = [("p", "h"), ("o", "t"), ("ph", "ot"), ("phot", "o</w>")]
+    tok = ClipTokenizer(vocab, merges)
+    ids = tok.encode("A photo, photo")
+    assert ids[:6] == [49406, 320, 9, 10, 9, 49407] and len(ids) == 77 and set(ids[6:]) == {49407}
+    # an unknown piece ("x</w>") is skipped, not crashed on; a long prompt is cut to the length
+    assert tok.encode("xx a", length=5) == [49406, 11, 320, 49407, 49407]
+    assert len(tok.encode(" ".join(["a"] * 200))) == 77
+
+
+def test_prompt_guidance_runs_the_network_twice(tmp_path):
+    from fotomedik.ai.tokenizer import ClipTokenizer
+
+    sd, unet = _fake_sd()
+    sd.tokenizer = ClipTokenizer({"<|startoftext|>": 49406, "<|endoftext|>": 49407, "a</w>": 320}, [])
+    img = _photo(64, 64)
+    mask = np.zeros((64, 64), bool)
+    mask[16:48, 16:48] = True
+    unet.calls = 0
+    sd.inpaint(img, mask, steps=4, strength=1.0, prompt=None)
+    plain = unet.calls
+    unet.calls = 0
+    out = sd.inpaint(img, mask, steps=4, strength=1.0, prompt="a")
+    assert out.shape == img.shape and np.array_equal(out[~mask], img[~mask])
+    assert unet.calls == plain  # the fake takes a batch: prompt and no-prompt in one call
+    assert sd._pair_ok is True and set(sd._emb) == {"", "a"}
+
+
+def test_melted_detail_fades_into_soft_shapes():
+    from fotomedik.recipes.dcfield import build_field
+
+    rows, cols = 30, 40
+    arr = np.zeros((rows, cols))
+    okm = np.zeros((rows, cols), bool)
+    okm[0] = okm[-1] = True
+    arr[0, ::2] = 40.0  # a real row with fine detail (every other block bright)
+    base = np.full((rows, cols), 10.0)  # a flat thumbnail
+    f = build_field(arr, okm, 8, base, 2.0)
+    detail = lambda r: np.abs(np.diff(f.val[r])).mean()  # noqa: E731
+    assert detail(1) > 15  # next to the real row the detail is carried in as it is
+    assert detail(4) < detail(1) * 0.5  # a few rows in it has melted
+    assert detail(8) < 0.5  # and further in it is gone, not a streak

@@ -294,6 +294,18 @@ class MainWindow(QMainWindow):
         ext.addWidget(self.quality)
         ext.addStretch(1)
         outer.addLayout(ext)
+        scene = QHBoxLayout()
+        lab = QLabel("Scene:")
+        lab.setToolTip("A few words on what the photos show, for Maximum quality: Stable Diffusion\n"
+                       "paints the holes to match (e.g. \"people on a square in front of a cathedral\").\n"
+                       "Applies to every photo of this run; empty means a generic photograph.")
+        scene.addWidget(lab)
+        self.scene = QLineEdit()
+        self.scene.setPlaceholderText("what the photos show, e.g. people on a square in front of a cathedral (optional)")
+        self.scene.setEnabled(False)
+        self.steps["diffusion"].toggled.connect(self.scene.setEnabled)
+        scene.addWidget(self.scene, 1)
+        outer.addLayout(scene)
 
         prog = QHBoxLayout()
         self.bar = QProgressBar()
@@ -434,7 +446,8 @@ class MainWindow(QMainWindow):
 
         steps = [k for k, cb in self.steps.items() if cb.isChecked()]
         options = {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked(),
-                   "enhance": steps, "quality": self.quality.currentData()}
+                   "enhance": steps, "quality": self.quality.currentData(),
+                   "prompt": self.scene.text().strip() or None}
         self.aibox.setVisible(bool(steps))
         self.aibox.show_image(None)
         self.aistat.setVisible(bool(steps))

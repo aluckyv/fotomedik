@@ -176,7 +176,7 @@ class Enhancer:
     on_done(report) is called (from the thread) as each copy is written."""
 
     def __init__(self, sources, out: Path, steps, say=None, stop=None, on_done=None, engine=None,
-                 quality: str | None = None, half: bool = True):
+                 quality: str | None = None, half: bool = True, prompt: str | None = None):
         self.sources = list(sources)
         self.out = out
         self.say = say or (lambda s: None)
@@ -185,6 +185,7 @@ class Enhancer:
         self.engine = engine
         self.quality = quality
         self.half = half
+        self.prompt = prompt
         steps = [s for s in STEPS if s in set(steps)]
         if "diffusion" in steps and "ai" in steps:
             steps.remove("ai")  # diffusion does the holes
@@ -339,7 +340,8 @@ class Enhancer:
             arr = np.asarray(img.convert("RGB"))
             holes, unknown = photo_masks(data, rep.holes, rep.unknown)
             burst = photos.burst_for(i, self.say) if "burst" in steps else None
-            new, done = enhance_steps(arr, holes, unknown, engine, steps, burst, progress, self.quality, self.stop)
+            new, done = enhance_steps(arr, holes, unknown, engine, steps, burst, progress, self.quality, self.stop,
+                                      self.prompt)
         except Stopped:
             return
         except Exception as e:  # one photo must not stop the rest
@@ -358,11 +360,11 @@ class Enhancer:
 
 
 def run_extras(items: list[tuple[FileReport, Path | None]], out: Path, steps, say=None, stop=None,
-               on_done=None, engine=None, quality: str | None = None) -> str | None:
+               on_done=None, engine=None, quality: str | None = None, prompt: str | None = None) -> str | None:
     """Make the enhanced copy of every repaired photo that needs one, after the fact.
     items: (report, original path). Returns the device the networks ran on, "" when
     no network was needed, or None when nothing could be done (reasons go to say)."""
-    enh = Enhancer([src for _rep, src in items], out, steps, say, stop, on_done, engine, quality)
+    enh = Enhancer([src for _rep, src in items], out, steps, say, stop, on_done, engine, quality, prompt=prompt)
     if not enh.steps:
         return None
     enh.start()

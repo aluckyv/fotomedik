@@ -64,6 +64,13 @@ FACE = Model(
     "Apache-2.0 (GFPGAN, Tencent ARC)",
 )
 _SD = "https://huggingface.co/RanaLLC/stable-diffusion-v1-5-inpainting-onnx-fp16/resolve/main/"
+_CLIP = "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/"
+_CLIP_LICENSE = "MIT (OpenAI CLIP tokenizer files)"
+# the text encoder's vocabulary: a prompt steers what Stable Diffusion paints into the holes
+CLIP_VOCAB = Model("CLIP tokenizer (vocabulary)", "clip_vocab.json",
+                   (_CLIP + "vocab.json", _SD + "tokenizer/vocab.json"), None, 1, _CLIP_LICENSE)
+CLIP_MERGES = Model("CLIP tokenizer (merges)", "clip_merges.txt",
+                    (_CLIP + "merges.txt", _SD + "tokenizer/merges.txt"), None, 1, _CLIP_LICENSE)
 _SD_LICENSE = "CreativeML OpenRAIL-M (Stable Diffusion 1.5 inpainting, Runway/Stability AI)"
 SD_UNET = Model("Stable Diffusion inpainting (UNet)", "sd15inp_unet.onnx",
                 (_SD + "unet/model.onnx", "https://huggingface.co/sona-forge/sd15-inpainting-fp16/resolve/main/unet/model.onnx"),
@@ -79,7 +86,7 @@ STEP_MODELS = {
     "ai": (SR, INPAINT),
     "deblock": (DEBLOCK,),
     "faces": (FACE_DET, FACE),
-    "diffusion": (INPAINT, SR, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT),  # SR enlarges the repainted holes
+    "diffusion": (INPAINT, SR, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT, CLIP_VOCAB, CLIP_MERGES),  # SR enlarges the holes
 }
 ALL = tuple(m for ms in STEP_MODELS.values() for m in ms)
 

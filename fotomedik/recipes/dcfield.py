@@ -61,6 +61,42 @@ def vertical_reference(arr: np.ndarray, okm: np.ndarray) -> tuple[np.ndarray, np
     return val, dist
 
 
+MELT = 0.75  # blur (block columns, as sigma) per block row of distance from the real row
+
+
+def _blur_rows(a: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian blur of every row of `a` (edges repeat)."""
+    r = int(np.ceil(3 * sigma))
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    k /= k.sum()
+    pad = np.pad(a, ((0, 0), (r, r)), mode="edge")
+    out = np.zeros_like(a, dtype=float)
+    for j, kj in enumerate(k):
+        out += kj * pad[:, j : j + a.shape[1]]
+    return out
+
+
+def melt(resid: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    """The detail a real row carries into a hole (`resid`, per column) blurred along the
+    row the deeper it goes: sigma MELT * (distance - 1) block columns. Carried in as
+    it is, a row of heads turns into vertical streaks that reach down the whole hole;
+    melted, it fades into soft shapes like an out-of-focus picture would."""
+    sigma = np.clip(MELT * (np.nan_to_num(dist, nan=0.0, posinf=0.0) - 1.0), 0.0, None)
+    if not (sigma > 0.25).any():
+        return resid
+    levels = [1.0, 2.0, 4.0, 8.0, 16.0]
+    blurred = [resid] + [_blur_rows(resid, s) for s in levels]
+    bounds = [0.0] + levels
+    out = resid.copy()
+    for k in range(len(levels)):
+        lo, hi = bounds[k], bounds[k + 1]
+        sel = (sigma > lo) & (sigma <= hi) if k < len(levels) - 1 else sigma > lo
+        if sel.any():  # between two levels: the mix that gives the wanted blur
+            t = np.clip((sigma - lo) / (hi - lo), 0.0, 1.0)
+            out = np.where(sel, blurred[k] * (1 - t) + blurred[k + 1] * t, out)
+    return out
+
+
 def pull_push(arr: np.ndarray, known: np.ndarray) -> np.ndarray:
     """`arr` with the unknown blocks filled smoothly from all known ones around them,
     in every direction (a pyramid: averages are pulled down to coarse levels, then
@@ -135,7 +171,7 @@ def build_field(arr: np.ndarray, okm: np.ndarray, q: int, base: np.ndarray | Non
     resid = np.where(okm & known, arr - base, np.nan)
     rv, dist = vertical_reference(np.nan_to_num(resid), okm & known)
     w = np.where(np.isfinite(dist), np.exp(-np.maximum(0.0, dist - 1.0) / RESID_DECAY), 0.0)
-    val = base + np.where(np.isfinite(dist), rv, 0.0) * w
+    val = base + melt(np.where(np.isfinite(dist), rv, 0.0), dist) * w
     val = np.where(okm, arr, val)
     bs = max(base_sigma or sv, sv)
     sigma = bs + (sv - bs) * w

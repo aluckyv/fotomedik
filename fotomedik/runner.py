@@ -145,7 +145,8 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
     on_result(Result) is called as each photo finishes; on_status(str) for phases.
     options["enhance"] (steps, see ai.run) adds an enhanced copy of every repaired photo,
     made while the repairs go on (on_ai(Result) as each is made, on_ai_status(str) for
-    their progress; options["quality"] is the diffusion preset); options["ai"] means ["ai"]."""
+    their progress; options["quality"] is the diffusion preset, options["prompt"] what the
+    scene shows); options["ai"] means ["ai"]."""
     out.mkdir(parents=True, exist_ok=True)
     for p in paths:
         if p.is_dir() and p.resolve() == out.resolve():
@@ -174,7 +175,7 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
                 on_ai(by_rep[id(rep)])
 
         enhancer = Enhancer([p for p, _rel in files], out, steps, on_ai_status or say, stop,
-                            on_done=copy_made, quality=options.get("quality"))
+                            on_done=copy_made, quality=options.get("quality"), prompt=options.get("prompt"))
         enhancer.start()
     with Workers(jobs, len(files)) as workers:
         if len(files) > 1:

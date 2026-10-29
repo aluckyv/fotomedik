@@ -22,6 +22,8 @@ WINDOW = 512
 STRIDE = 384
 STEPS = 20
 STRENGTH = 0.6  # how far into the noise the start goes: higher invents more
+GUIDANCE = 5.0  # classifier-free guidance scale when a prompt is given
+DEFAULT_PROMPT = "a sharp, detailed photograph"
 LATENT_SCALE = 0.18215
 BOS, EOS = 49406, 49407  # CLIP tokens: an empty prompt is BOS, then EOS padding
 
@@ -47,18 +49,27 @@ def _dtype(inp):
 
 
 class Diffusion:
-    def __init__(self, unet, vae_enc, vae_dec, text):
+    """The four networks of Stable Diffusion inpainting and the DDIM loop around them.
+    With a tokenizer, a prompt steers what is painted (classifier-free guidance: every
+    step runs the network with and without the prompt and goes `guidance` times further
+    in the prompt's direction); without one the painting is unconditioned."""
+
+    def __init__(self, unet, vae_enc, vae_dec, text, tokenizer=None):
         self.unet, self.vae_enc, self.vae_dec, self.text = unet, vae_enc, vae_dec, text
-        self._emb = None
+        self.tokenizer = tokenizer
+        self._emb: dict[str, np.ndarray] = {}
+        self._pair_ok: bool | None = None  # whether the network takes prompt and no-prompt in one batch
         betas = np.linspace(0.00085 ** 0.5, 0.012 ** 0.5, 1000, dtype=np.float64) ** 2
         self.alphas = np.cumprod(1.0 - betas)
 
-    def embedding(self) -> np.ndarray:
-        if self._emb is None:
+    def embedding(self, prompt: str = "") -> np.ndarray:
+        """Text encoder output (1, 77, 768) for `prompt` ("" is the empty prompt)."""
+        key = " ".join(prompt.lower().split()) if (prompt and self.tokenizer is not None) else ""
+        if key not in self._emb:
             inp = self.text.get_inputs()[0]
-            ids = np.array([[BOS] + [EOS] * 76], dtype=_dtype(inp))
-            self._emb = self.text.run(None, {inp.name: ids})[0]
-        return self._emb
+            ids = self.tokenizer.encode(key) if key else [BOS] + [EOS] * 76
+            self._emb[key] = self.text.run(None, {inp.name: np.array([ids], dtype=_dtype(inp))})[0]
+        return self._emb[key]
 
     def encode(self, img: np.ndarray) -> np.ndarray:
         """uint8 (H, W, 3) -> latents (1, 4, H/8, W/8)."""
@@ -74,9 +85,28 @@ class Diffusion:
         x = self.vae_dec.run(None, {inp.name: (lat / LATENT_SCALE).astype(_dtype(inp))})[0].astype(np.float32)
         return np.clip(np.rint((x[0].transpose(1, 2, 0) + 1.0) * 127.5), 0, 255).astype(np.uint8)
 
+    def _noise(self, sample_n: str, t_n: str, enc_n: str, model_in, t: int, embs: list) -> list:
+        """The network's noise estimate for every embedding in `embs` (one batch when it can)."""
+        ins = {i.name: i for i in self.unet.get_inputs()}
+        tt = np.array([t], dtype=_dtype(ins[t_n]))
+        if len(embs) > 1 and self._pair_ok is not False:
+            try:
+                batch = np.concatenate([model_in] * len(embs), axis=0)
+                emb = np.concatenate(embs, axis=0).astype(_dtype(ins[enc_n]))
+                out = self.unet.run(None, {sample_n: batch, t_n: tt, enc_n: emb})[0].astype(np.float32)
+                if out.shape[0] == len(embs):
+                    self._pair_ok = True
+                    return [out[i : i + 1] for i in range(len(embs))]
+            except Exception:
+                pass
+            self._pair_ok = False
+        return [self.unet.run(None, {sample_n: model_in, t_n: tt, enc_n: e.astype(_dtype(ins[enc_n]))})[0]
+                .astype(np.float32) for e in embs]
+
     def inpaint(self, img: np.ndarray, mask: np.ndarray, steps: int = STEPS, strength: float = STRENGTH,
-                seed: int = 0) -> np.ndarray:
-        """img uint8 (S, S, 3) and mask bool (S, S), S a multiple of 64; masked part repainted."""
+                seed: int = 0, prompt: str | None = None, guidance: float = GUIDANCE) -> np.ndarray:
+        """img uint8 (S, S, 3) and mask bool (S, S), S a multiple of 64; masked part repainted.
+        prompt: what the holes should show (needs the tokenizer), guidance: how strongly."""
         rng = np.random.default_rng(seed)
         s = img.shape[0]
         m = mask.astype(np.float32)
@@ -95,12 +125,13 @@ class Diffusion:
         sample_n = next((n for n in names if "sample" in n), names[0])
         t_n = next((n for n in names if "time" in n), names[1])
         enc_n = next((n for n in names if "hidden" in n or "encoder" in n), names[2])
-        emb = self.embedding().astype(_dtype(ins[enc_n]))
+        guided = bool(prompt) and self.tokenizer is not None and guidance > 1.0
+        embs = [self.embedding(prompt), self.embedding("")] if guided else [self.embedding("")]
         for t in timesteps:
             t = int(t)
             model_in = np.concatenate([lat, lm, masked], axis=1).astype(_dtype(ins[sample_n]))
-            eps = self.unet.run(None, {sample_n: model_in, t_n: np.array([t], dtype=_dtype(ins[t_n])),
-                                       enc_n: emb})[0].astype(np.float32)
+            eps_all = self._noise(sample_n, t_n, enc_n, model_in, t, embs)
+            eps = eps_all[1] + guidance * (eps_all[0] - eps_all[1]) if guided else eps_all[0]
             a_t = self.alphas[t]
             prev = t - ratio
             a_prev = self.alphas[prev] if prev >= 0 else self.alphas[0]
@@ -123,7 +154,8 @@ def windows(holes: np.ndarray, size: int = WINDOW, stride: int = STRIDE) -> list
 
 
 def diffusion_fill(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, sd: Diffusion, progress=None,
-                   size: int = WINDOW, steps: int = STEPS, stop=None, stats: dict | None = None) -> np.ndarray:
+                   size: int = WINDOW, steps: int = STEPS, stop=None, stats: dict | None = None,
+                   prompt: str | None = None) -> np.ndarray:
     """Holes of `arr` repainted window by window; real pixels stay."""
     from .enhance import _check, _soft
 
@@ -141,7 +173,7 @@ def diffusion_fill(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, sd: 
         m = hm[y : y + size, x : x + size] & ~done[y : y + size, x : x + size]
         if not m.any():
             continue
-        res = sd.inpaint(tile, m, steps=steps, seed=i)
+        res = sd.inpaint(tile, m, steps=steps, seed=i, prompt=prompt)
         a = _soft(m, 2.0)[..., None]
         work[y : y + size, x : x + size] = np.clip(np.rint(tile * (1 - a) + res * a), 0, 255).astype(np.uint8)
         # the centre of a window counts as done; its border may be redone by the next one
@@ -155,24 +187,26 @@ def diffusion_fill(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, sd: 
 
 
 def repaint_holes(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine, quality: str | None = None,
-                  progress=None, stop=None) -> tuple[np.ndarray, str]:
+                  progress=None, stop=None, prompt: str | None = None) -> tuple[np.ndarray, str]:
     """Holes of `arr` repainted at the preset's working size and brought back to full
     size (Real-ESRGAN where the engine has it, bicubic otherwise). Real pixels stay.
-    Returns (rgb, a few words on how it was done)."""
+    prompt: what the scene shows (None: the default prompt). Returns (rgb, how it was done)."""
     from PIL import Image
 
     from .enhance import enlarge_holes, reduce, reduce_mask
 
     divisor, steps = PRESETS[quality or DEFAULT_PRESET]
+    prompt = DEFAULT_PROMPT if prompt is None else prompt
     h, w = holes.shape
     divisor = working_divisor(max(h, w), divisor)
     st: dict = {}
     if divisor == 1:
-        out = diffusion_fill(arr, holes, unknown, engine.sd, progress, steps=steps, stop=stop, stats=st)
+        out = diffusion_fill(arr, holes, unknown, engine.sd, progress, steps=steps, stop=stop, stats=st, prompt=prompt)
         return out, f"full size, {st.get('windows', 0)} windows"
     lo, lo_holes = reduce(arr, holes, divisor)
     lo_unknown = reduce_mask(unknown & holes, divisor) if unknown.any() else np.zeros_like(lo_holes)
-    lo_out = diffusion_fill(lo, lo_holes, lo_unknown, engine.sd, progress, steps=steps, stop=stop, stats=st)
+    lo_out = diffusion_fill(lo, lo_holes, lo_unknown, engine.sd, progress, steps=steps, stop=stop, stats=st,
+                            prompt=prompt)
     if engine.sr is not None:
         hi = enlarge_holes(lo_out, lo_holes, engine, divisor, None, stop) * 255.0
         how = "Real-ESRGAN"

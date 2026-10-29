@@ -201,8 +201,18 @@ class Engine:
                 self.inpaint_s = session(models.INPAINT)
             if self.sr is None:  # brings the repainted holes back to full size
                 self.sr = session(models.SR)
+            tok = None
+            try:  # the prompt's words -> token ids; without it the painting is unconditioned
+                from .tokenizer import ClipTokenizer
+
+                tok = ClipTokenizer.load(models.ensure(models.CLIP_VOCAB, progress, stop),
+                                         models.ensure(models.CLIP_MERGES, progress, stop))
+            except InterruptedError:
+                raise
+            except Exception as e:
+                self.notes.append(f"Stable Diffusion paints without a prompt (tokenizer files: {e})")
             self.sd = Diffusion(session(models.SD_UNET), session(models.SD_VAE_ENC), session(models.SD_VAE_DEC),
-                                session(models.SD_TEXT))
+                                session(models.SD_TEXT), tok)
         self.loaded |= steps
         on_gpu = [d for d in self.devices.values() if d != "CPU"]
         self.device = on_gpu[0] if on_gpu else "CPU"
@@ -367,12 +377,14 @@ def _took(t0: float) -> str:
 
 
 def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
-                  burst=None, progress=None, quality: str | None = None, stop=None) -> tuple[np.ndarray, list[str]]:
+                  burst=None, progress=None, quality: str | None = None, stop=None,
+                  prompt: str | None = None) -> tuple[np.ndarray, list[str]]:
     """The enhanced copy, step by step. Returns (rgb, what was done, with the time it took).
 
     burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots.
     progress(done, total, what) reports the tiles or windows of the slow steps.
-    quality: diffusion preset (see diffusion.PRESETS). Raises Stopped when `stop` is set."""
+    quality: diffusion preset (see diffusion.PRESETS); prompt: what the scene shows, for
+    the diffusion (None: a generic prompt). Raises Stopped when `stop` is set."""
     steps = set(steps)
     done: list[str] = []
     real = arr.copy()
@@ -403,7 +415,8 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             t0 = time.perf_counter()
             if unknown.any() and engine.inpaint_s is not None:  # a start for holes the thumbnail left blank
                 arr = inpaint_unknown(arr, unknown, engine)
-            arr, what = repaint_holes(arr, holes, unknown, engine, quality, report("Stable Diffusion window"), stop)
+            arr, what = repaint_holes(arr, holes, unknown, engine, quality, report("Stable Diffusion window"), stop,
+                                      prompt)
             arr = keep_block_means(arr, before, holes, holes & ~unknown)
             done.append(f"holes repainted (Stable Diffusion, follows the thumbnail; {what}, {_took(t0)})")
         elif "ai" in steps and (engine.sr is not None or engine.inpaint_s is not None):
