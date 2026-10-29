@@ -34,3 +34,44 @@ jobs:
         with:
           name: fastdec-windows-x64
           path: fotomedik/jpeg/_fastdec.dll
+
+  app-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . pyside6 pyinstaller
+      - name: build _fastdec.dll
+        run: python build_fastdec.py
+      - name: demo photos
+        run: python scripts/make_demo_photos.py demo
+      - name: app smoke test (from source)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python fotomedik_app.py --smoke demo demo_out_src shot_src.png
+      - name: package FotoMedik.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name FotoMedik
+          --add-binary "fotomedik/jpeg/_fastdec.dll;fotomedik/jpeg"
+          --exclude-module tkinter --exclude-module pytest
+          fotomedik_app.py
+      - name: smoke test of the packaged app
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process -FilePath dist\FotoMedik.exe -ArgumentList "--smoke","demo","demo_out_exe","shot_exe.png" -PassThru -Wait
+          Write-Host "exit code $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+          if (!(Test-Path demo_out_exe\healthy.jpg)) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FotoMedik-windows
+          path: dist/FotoMedik.exe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-screenshots
+          path: shot_*.png

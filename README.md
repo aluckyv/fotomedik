@@ -1,5 +1,16 @@
 # FotoMedik
 
+
+## The app (Windows)
+
+Download `FotoMedik-windows` from the latest successful run under **Actions** on
+GitHub, unzip, and start `FotoMedik.exe` — no Python or other installs needed.
+Drop a folder or photos onto the window (or use the buttons), check where the
+repaired copies go, press **Repair**. Click any photo in the list to compare
+before and after and read what was found and repaired. Originals are never
+changed.
+
+From source: `pip install -e . pyside6`, then `python -m fotomedik.gui`.
 Dijagnoza i popravka oštećenih fotografija (JPEG). Program kaže *šta* je pokvareno, popravi
 ono što se popraviti može i pošteno prijavi koliko je slike vraćeno. Originali se nikad ne diraju.
 

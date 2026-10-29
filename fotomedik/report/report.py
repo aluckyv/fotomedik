@@ -33,6 +33,7 @@ STRINGS = {
             "garbage_tail": "tuđi sadržaj na kraju fajla",
             "no_eoi": "nedostaje završni marker",
             "damaged_rst": "oštećeni restart markeri",
+            "internal_error": "greška u programu pri obradi ovog fajla",
         },
         "recipe": {
             "cardrecovery_xor": "dekodovan CardRecovery fajl",
@@ -69,6 +70,7 @@ STRINGS = {
             "garbage_tail": "foreign data at the end of the file",
             "no_eoi": "end marker missing",
             "damaged_rst": "damaged restart markers",
+            "internal_error": "program error while processing this file",
         },
         "recipe": {
             "cardrecovery_xor": "CardRecovery file decoded",
