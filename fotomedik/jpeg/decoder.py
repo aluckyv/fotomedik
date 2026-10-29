@@ -24,6 +24,10 @@ ERROR_REASONS = frozenset(
 )
 
 
+NEAR_MARKER_BITS = 3  # flipped bits tolerated in a marker found exactly where an interval ends
+FUZZY_RST_BITS = 2  # flipped bits tolerated in a marker found by searching
+
+
 class Unsupported(Exception):
     """Scan type the v0.1 decoder does not handle (progressive, 12-bit, arithmetic)."""
 
@@ -56,6 +60,7 @@ class Interval:
     ok: bool = False
     error: DecodeError | None = None
     resync_at: int | None = None  # for a failed interval: offset of the RST marker decoding resumed at
+    resync_skipped: int = 0  # intervals jumped over by that resync (0: the marker closes this interval)
 
 
 @dataclass
@@ -305,7 +310,17 @@ def decode_scan(
                 elif last_in_scan:
                     iv.ok = True  # data after the last MCU is just trailing bytes
                 else:
-                    err = DecodeError("bad_rst", mcu, br.byte_pos, 0, "no restart marker where one is expected")
+                    p = br.byte_pos
+                    expected = 0xD0 + (iv_index % 8)
+                    if dri and p + 1 < end and _hamming(data[p], 0xFF) + _hamming(data[p + 1], expected) <= NEAR_MARKER_BITS:
+                        # The interval decoded exactly its MCUs and ends on something one or
+                        # a few flipped bits away from the marker it must end with: that is it.
+                        iv.ok = True
+                        iv.end_marker = expected
+                        iv.end_marker_damaged = True
+                        br.seek(p + 2)
+                    else:
+                        err = DecodeError("bad_rst", mcu, p, 0, "no restart marker where one is expected")
             else:
                 marker, moff = m
                 iv.byte_end = moff
@@ -348,7 +363,7 @@ def decode_scan(
             hit = None
             j = k
             fuzzy_hit = False
-            for n, moff, fuzzy in _marker_candidates(data, search_from, end, k % 8):
+            for n, moff, fuzzy in _marker_candidates(data, search_from, end, k % 8, max_ham=FUZZY_RST_BITS):
                 dist = moff - iv.byte_start
                 spans_est = max(1.0, dist / avg)
                 if fuzzy:
@@ -356,6 +371,7 @@ def decode_scan(
                     if not (0.3 * avg <= dist <= 2.5 * avg):
                         continue
                     cand = k
+                    probe_len = min(8, dri)
                 else:
                     base = k + ((n - k) % 8)
                     cands = sorted(
@@ -364,16 +380,16 @@ def decode_scan(
                     rel_err, cand = cands[0]
                     if not (rel_err <= 0.6 or (cand == k and dist <= 3 * avg)):
                         continue
-                if (cand + 1) * dri < total:
-                    # A flipped bit can create a fake FF Dn inside the data: the bytes after a
-                    # real marker decode cleanly for a few MCUs, those after a fake one rarely do.
-                    # A fuzzy (damaged-looking) marker must prove itself over the whole next interval.
+                    # An intact FF Dn with exactly the number this interval must end with, at a
+                    # plausible distance, is trusted as is: fake markers need several unlucky
+                    # flips, while a probe would wrongly reject it whenever the *next* interval
+                    # happens to be damaged too. Markers that skip intervals must prove themselves.
+                    probe_len = 0 if cand == k else min(3, dri)
+                if probe_len and (cand + 1) * dri < total:
+                    # bytes after a real marker decode cleanly for a few MCUs, after a fake one rarely
                     probe = decode_scan(data, parse, ft, start_byte=moff + 2, end_byte=end,
-                                        first_mcu=(cand + 1) * dri, max_mcus=dri if fuzzy else min(3, dri),
-                                        resync=False)
+                                        first_mcu=(cand + 1) * dri, max_mcus=probe_len, resync=False)
                     if probe.error is not None and probe.error.reason != "eof":
-                        continue
-                    if fuzzy and not (probe.intervals and probe.intervals[0].ok and probe.intervals[0].end_marker is not None):
                         continue
                 hit, j, fuzzy_hit = (n, moff), cand, fuzzy
                 break
@@ -383,6 +399,7 @@ def decode_scan(
             n, moff = hit
             iv.byte_end = moff if iv.byte_end is None else iv.byte_end
             iv.resync_at = moff
+            iv.resync_skipped = j - k
             if fuzzy_hit:
                 iv.end_marker_damaged = True
             # intervals k+1..j are lost

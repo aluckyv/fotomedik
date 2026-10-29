@@ -136,3 +136,33 @@ def test_time_budget_option_respected(healthy_jpeg_rst):
     t = time.perf_counter()
     _run(data, time_budget=0.5)
     assert time.perf_counter() - t < 5
+
+
+def test_intact_marker_trusted_when_next_interval_damaged(healthy_jpeg_rst):
+    """Meteori case: interval 3 broken, RST3 intact, interval 4 broken right after it."""
+    ref, res, ft = _decode(healthy_jpeg_rst)
+    iv3, iv4 = ref.intervals[3], ref.intervals[4]
+    o1, m1 = breaking_flip(healthy_jpeg_rst, iv3.byte_start + 20, iv3.byte_end - 4)
+    o2, m2 = breaking_flip(healthy_jpeg_rst, iv4.byte_start + 1, iv4.byte_start + 40)
+    data = flip_bits(flip_bits(healthy_jpeg_rst, o1, m1), o2, m2)
+    sr, _, _ = _decode(data)
+    assert sr.intervals[3].resync_at == iv3.byte_end and sr.intervals[3].resync_skipped == 0
+    assert sr.intervals[4].mcu_first == 64 and not sr.intervals[4].ok
+    ctx = run_pipeline(Context(data=data, name="x"), recipes=[BitFlipRepair(), FillHoles()])
+    assert ctx.holes == []
+    assert_equivalent(ctx.data, healthy_jpeg_rst)
+
+
+def test_interval_with_destroyed_marker_repaired_and_marker_restored(healthy_jpeg_rst):
+    """Interval 5 broken and its RST5 hit by 3 flips (beyond fuzzy search): end is unknown."""
+    ref, res, ft = _decode(healthy_jpeg_rst)
+    iv5 = ref.intervals[5]
+    o1, m1 = breaking_flip(healthy_jpeg_rst, iv5.byte_start + 20, iv5.byte_end - 4)
+    data = flip_bits(healthy_jpeg_rst, o1, m1)
+    data = flip_bits(flip_bits(data, iv5.byte_end, 0x11), iv5.byte_end + 1, 0x02)  # FF D5 -> EE D7
+    sr, _, _ = _decode(data)
+    assert not sr.intervals[5].ok and sr.intervals[5].resync_skipped >= 1
+    ctx = run_pipeline(Context(data=data, name="x"), recipes=[BitFlipRepair(), FillHoles()])
+    assert ctx.holes == []
+    assert ctx.data[iv5.byte_end : iv5.byte_end + 2] == b"\xff\xd5"
+    assert_equivalent(ctx.data, healthy_jpeg_rst)

@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).parent
+ABI = 3  # must match FASTDEC_ABI in _fastdec.c
 _LIB = None
 _TRIED = False
 
@@ -45,6 +46,9 @@ def load() -> ctypes.CDLL | None:
         except OSError:
             continue
         try:
+            lib.fastdec_abi.restype = ctypes.c_int
+            if lib.fastdec_abi() != ABI:
+                continue  # stale library from an older build: use the Python reference
             f = lib.decode_mcus
             f.restype = _I64
             f.argtypes = [_P, _I64, _INT, _I64, ctypes.POINTER(Comp), _INT,
@@ -53,7 +57,8 @@ def load() -> ctypes.CDLL | None:
             g.restype = _I64
             g.argtypes = [_P, _I64, _I64, _INT, _I64, ctypes.POINTER(Comp), _INT,
                           _P, _P, _P, _P, _P,
-                          _P, _I64, _I64, _I64, _INT,
+                          _P, _I64, _I64, _I64, _INT, _INT,
+                          _P, _I64, _P,
                           _P, _P, _I64,
                           _P, _P, _P, _P,
                           _P, _P, _P, _P, _P]

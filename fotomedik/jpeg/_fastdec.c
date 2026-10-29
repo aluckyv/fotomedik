@@ -25,6 +25,12 @@
 #define EXPORT
 #endif
 
+#define FASTDEC_ABI 3  /* bump whenever an exported signature changes; fastdec.py checks it */
+
+EXPORT int fastdec_abi(void) { return FASTDEC_ABI; }
+
+static inline int popcount8(unsigned v) { int c = 0; while (v) { c += v & 1; v >>= 1; } return c; }
+
 enum { ERR_NONE = 0, ERR_BAD_HUFFMAN = 1, ERR_COEF_OVERFLOW = 2, ERR_DC_RANGE = 3, ERR_MARKER = 4, ERR_EOF = 5 };
 
 typedef struct {
@@ -246,11 +252,17 @@ static double roughness(const int32_t *dc, int64_t nblocks, const double *up_v, 
     return n ? total / (double)n : 0.0;
 }
 
-/* For each candidate i: flip data[offs[i]] ^= masks[i], decode from (start_byte,
- * start_bit) with preds0, restore the byte.
- *   res_dec[i]      MCUs decoded cleanly (from the resume point)
- *   res_complete[i] 1 if all `needed` MCUs decoded and the data ends exactly at marker_pos
- *                   (marker_pos < 0: no marker known, any clean end counts)
+/* For each candidate i: flip data[offs[i]] ^= masks[i], decode, restore the byte.
+ *
+ * Decoding resumes at the last known MCU starting at or before the flipped byte
+ * (mcu_bits[j], from a previous decode of the same interval starting at MCU m0):
+ * everything before it is unaffected by the flip, so its DC values are copied
+ * from cur_dc and the predictors come from the last blocks of MCU j-1
+ * (preds0 when j == 0). MCU counts below are relative to m0.
+ *   res_dec[i]      MCUs decoded cleanly
+ *   res_complete[i] 1 if all `needed` MCUs decoded and the data ends exactly at marker_pos;
+ *                   with marker_pos < 0 and expect_marker >= 0 the data must end on a pair
+ *                   within 3 flipped bits of FF <expect_marker>; with both < 0 any clean end counts
  *   res_pad[i]      1 if the final partial byte is padded with 1-bits
  *   res_rough[i]    smoothness over all blocks (complete) or over the first
  *                   max(1, dec - min_gain) MCUs (partial)
@@ -260,33 +272,59 @@ EXPORT int64_t eval_flips(uint8_t *data, int64_t data_len, int64_t start_byte, i
                           const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
                           const int32_t *mincode, const uint8_t *symbols,
                           const int32_t *preds0, int64_t needed, int64_t stage1_n,
-                          int64_t marker_pos, int min_gain,
+                          int64_t marker_pos, int expect_marker, int min_gain,
+                          const int64_t *mcu_bits, int64_t nknown, const int32_t *cur_dc,
                           const int64_t *offs, const uint8_t *masks, int64_t ncand,
                           const double *up_v, const double *dn_v, const int32_t *left_k, const double *w,
                           int32_t *res_dec, int8_t *res_complete, int8_t *res_pad, double *res_rough,
                           int32_t *scratch_dc) {
     tables_t t = { fast, maxcode, valptr, mincode, symbols };
     int bpm = 0;
-    for (int c = 0; c < ncomp; c++) bpm += comps[c].h * comps[c].v;
+    int last_block[8];
+    for (int c = 0; c < ncomp; c++) { bpm += comps[c].h * comps[c].v; last_block[c] = bpm - 1; }
     int32_t preds[8];
+    int32_t jpreds[8];
     int64_t out[6];
     for (int64_t i = 0; i < ncand; i++) {
         int64_t off = offs[i];
         uint8_t m = masks[i];
+        /* resume MCU: largest j with mcu_bits[j] <= off*8 */
+        int64_t j = 0;
+        if (nknown > 0 && start_byte <= off) {
+            int64_t lo = 0, hi = nknown - 1, bitpos = off * 8;
+            while (lo < hi) { int64_t mid = (lo + hi + 1) / 2; if (mcu_bits[mid] <= bitpos) lo = mid; else hi = mid - 1; }
+            j = (mcu_bits[lo] <= bitpos) ? lo : 0;
+        }
+        int64_t sb = start_byte; int sbit = start_bit;
+        if (j > 0) {
+            sb = mcu_bits[j] / 8; sbit = (int)(mcu_bits[j] % 8);
+            for (int c = 0; c < ncomp; c++) jpreds[c] = cur_dc[(j - 1) * bpm + last_block[c]];
+            memcpy(scratch_dc, cur_dc, sizeof(int32_t) * (size_t)(j * bpm));
+        } else {
+            memcpy(jpreds, preds0, sizeof(int32_t) * ncomp);
+        }
+        int32_t *dst = scratch_dc + j * bpm;
         data[off] ^= m;
-        memcpy(preds, preds0, sizeof(int32_t) * ncomp);
-        int64_t lim = stage1_n < needed ? stage1_n : needed;
-        int64_t n = run_decode(data, start_byte, start_bit, end, comps, ncomp, &t, lim, preds, NULL, scratch_dc, out);
-        if (out[0] == 0 && n == lim && lim < needed) {
-            memcpy(preds, preds0, sizeof(int32_t) * ncomp);
-            n = run_decode(data, start_byte, start_bit, end, comps, ncomp, &t, needed, preds, NULL, scratch_dc, out);
+        memcpy(preds, jpreds, sizeof(int32_t) * ncomp);
+        int64_t lim = (stage1_n < needed ? stage1_n : needed) - j;
+        if (lim < 1) lim = 1;
+        int64_t full = needed - j;
+        int64_t n = run_decode(data, sb, sbit, end, comps, ncomp, &t, lim, preds, NULL, dst, out);
+        if (out[0] == 0 && n == lim && lim < full) {
+            memcpy(preds, jpreds, sizeof(int32_t) * ncomp);
+            n = run_decode(data, sb, sbit, end, comps, ncomp, &t, full, preds, NULL, dst, out);
         }
         int complete = 0, pad_ok = 0;
-        if (out[0] == 0 && n == needed) {
+        if (out[0] == 0 && n == full) {
             int64_t p = aligned_end(data, data_len, out[4], (int)out[5], &pad_ok);
-            complete = marker_pos < 0 || p == marker_pos;
+            if (marker_pos >= 0) complete = p == marker_pos;
+            else if (expect_marker >= 0)  /* end unknown: must land on a (possibly damaged) marker */
+                complete = p + 1 < data_len &&
+                           popcount8(data[p] ^ 0xFFu) + popcount8(data[p + 1] ^ (unsigned)expect_marker) <= 3;
+            else complete = 1;
         }
         data[off] ^= m;
+        n += j;
         res_dec[i] = (int32_t)n;
         res_complete[i] = (int8_t)complete;
         res_pad[i] = (int8_t)pad_ok;

@@ -215,6 +215,11 @@ def py_aligned_end(data, length: int, eb: int, ebit: int) -> tuple[int, bool]:
     return p, pad_ok
 
 
+def near_marker(b0: int, b1: int, expect: int, max_bits: int = 3) -> bool:
+    """True when the byte pair is within max_bits flipped bits of FF <expect>."""
+    return bin(b0 ^ 0xFF).count("1") + bin(b1 ^ expect).count("1") <= max_bits
+
+
 def py_roughness(dc, nblocks: int, up_v, dn_v, left_k, w) -> float:
     total = 0.0
     n = 0
@@ -265,12 +270,25 @@ def decode_mcus(data, start_byte: int, start_bit: int, end: int, pk: Packed, pre
 
 def eval_flips(buf: np.ndarray, start_byte: int, start_bit: int, end: int, pk: Packed, preds0: np.ndarray,
                needed: int, stage1_n: int, marker_pos: int, min_gain: int,
-               offs: np.ndarray, masks: np.ndarray, geom) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+               offs: np.ndarray, masks: np.ndarray, geom,
+               mcu_bits: np.ndarray | None = None, cur_dc: np.ndarray | None = None,
+               expect_marker: int = -1,
+               ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate bit-flip candidates. buf must be a writable uint8 array (bytes are flipped and restored).
 
-    geom = (up_v, dn_v, left_k, w) per block of the `needed` MCUs (see r5_bitflip.geometry).
+    geom = (up_v, dn_v, left_k, w) per block of the `needed` MCUs (see r5_bitflip.IntervalGeom).
+    mcu_bits / cur_dc: bit starts and DC values (scan order) of the MCUs already decoded
+    from the resume point; each candidate then restarts at the MCU holding its byte.
     Returns (dec int32, complete bool, pad_ok bool, rough float64), one entry per candidate.
     """
+    if mcu_bits is None or cur_dc is None:
+        mcu_bits = np.zeros(0, dtype=np.int64)
+        cur_dc = np.zeros(0, dtype=np.int32)
+    mcu_bits = np.ascontiguousarray(mcu_bits, dtype=np.int64)
+    cur_dc = np.ascontiguousarray(cur_dc, dtype=np.int32)
+    nknown = len(mcu_bits)
+    bpm = pk.blocks_per_mcu
+    last_block = np.cumsum([h * v for h, v in pk.hv]) - 1
     ncand = len(offs)
     res_dec = np.zeros(ncand, dtype=np.int32)
     res_complete = np.zeros(ncand, dtype=np.int8)
@@ -288,7 +306,8 @@ def eval_flips(buf: np.ndarray, start_byte: int, start_bit: int, end: int, pk: P
         lib.eval_flips(
             _ptr(buf), len(buf), start_byte, start_bit, end, pk.c_comps, pk.ncomp,
             _ptr(pk.fast), _ptr(pk.maxcode), _ptr(pk.valptr), _ptr(pk.mincode), _ptr(pk.symbols),
-            _ptr(p0), needed, stage1_n, marker_pos, min_gain,
+            _ptr(p0), needed, stage1_n, marker_pos, expect_marker, min_gain,
+            _ptr(mcu_bits), nknown, _ptr(cur_dc),
             _ptr(offs), _ptr(masks), ncand,
             _ptr(up_v), _ptr(dn_v), _ptr(left_k), _ptr(w),
             _ptr(res_dec), _ptr(res_complete), _ptr(res_pad), _ptr(res_rough), _ptr(scratch),
@@ -298,25 +317,45 @@ def eval_flips(buf: np.ndarray, start_byte: int, start_bit: int, end: int, pk: P
     buf = memoryview(buf).cast("B")  # int indexing (numpy scalars would overflow in BitReader)
     for i in range(ncand):
         off, m = int(offs[i]), int(masks[i])
+        j = 0
+        if nknown and start_byte <= off:
+            j = int(np.searchsorted(mcu_bits, off * 8, side="right")) - 1
+            j = max(j, 0)
+        if j > 0:
+            sb, sbit = divmod(int(mcu_bits[j]), 8)
+            jpreds = [int(cur_dc[(j - 1) * bpm + lb]) for lb in last_block]
+            prefix = [int(x) for x in cur_dc[: j * bpm]]
+        else:
+            sb, sbit = start_byte, start_bit
+            jpreds = [int(x) for x in preds0]
+            prefix = []
         buf[off] ^= m
-        lim = min(stage1_n, needed)
-        p = [int(x) for x in preds0]
-        r = py_run_decode(buf, start_byte, start_bit, end, pk, lim, p, want_bits=False)
-        if r[1] == 0 and r[0] == lim and lim < needed:
-            p = [int(x) for x in preds0]
-            r = py_run_decode(buf, start_byte, start_bit, end, pk, needed, p, want_bits=False)
+        full = needed - j
+        lim = max(1, min(stage1_n, needed) - j)
+        p = list(jpreds)
+        r = py_run_decode(buf, sb, sbit, end, pk, lim, p, want_bits=False)
+        if r[1] == 0 and r[0] == lim and lim < full:
+            p = list(jpreds)
+            r = py_run_decode(buf, sb, sbit, end, pk, full, p, want_bits=False)
         n, err = r[0], r[1]
         complete = pad_ok = False
-        if err == 0 and n == needed:
+        if err == 0 and n == full:
             pos, pad_ok = py_aligned_end(buf, length, r[5], r[6])
-            complete = marker_pos < 0 or pos == marker_pos
+            if marker_pos >= 0:
+                complete = pos == marker_pos
+            elif expect_marker >= 0:
+                complete = pos + 1 < length and near_marker(buf[pos], buf[pos + 1], expect_marker)
+            else:
+                complete = True
         buf[off] ^= m
+        n += j
         res_dec[i] = n
         res_complete[i] = complete
         res_pad[i] = pad_ok
+        dc = prefix + list(r[8])
         if complete:
-            nb = n * pk.blocks_per_mcu
+            nb = n * bpm
         else:
-            nb = min(max(n - min_gain, 1), n) * pk.blocks_per_mcu
-        res_rough[i] = py_roughness(r[8], nb, up_v, dn_v, left_k, w) if nb > 0 else math.inf
+            nb = min(max(n - min_gain, 1), n) * bpm
+        res_rough[i] = py_roughness(dc, nb, up_v, dn_v, left_k, w) if nb > 0 else math.inf
     return res_dec, res_complete.astype(bool), res_pad.astype(bool), res_rough
