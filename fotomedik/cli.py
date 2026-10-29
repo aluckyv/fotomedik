@@ -56,10 +56,20 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
     return ctx, rep
 
 
+def _nothing_to_save(ctx: Context, rep: FileReport) -> bool:
+    """No photo data was found and nothing was repaired: a copy would not open either."""
+    fatal = {f["kind"] for f in rep.findings} & {"not_jpeg", "overwritten"}
+    return bool(fatal) and not ctx.applied and ctx.data == ctx.original
+
+
 def _write_outputs(ctx: Context, rep: FileReport, out_dir: Path, rel: Path) -> Path:
     out_name = ctx.suggested_name or rel.name
     target = out_dir / rel.parent / out_name
     target.parent.mkdir(parents=True, exist_ok=True)
+    if _nothing_to_save(ctx, rep):
+        rep.output_name = None
+        (target.parent / (Path(out_name).stem + ".report.json")).write_text(rep.to_json(), encoding="utf-8")
+        return target
     target.write_bytes(ctx.data)
     (target.parent / (Path(out_name).stem + ".report.json")).write_text(rep.to_json(), encoding="utf-8")
     return target
@@ -86,7 +96,8 @@ def _repair_file(args: tuple[str, str, str, dict, CameraProfile | None]) -> tupl
     relp = Path(rel)
     ctx, rep = repair_bytes(data, relp.name, options, profile)
     target = _write_outputs(ctx, rep, Path(out), relp)
-    rep.output_name = str(target.relative_to(Path(out)))
+    if rep.output_name is not None:
+        rep.output_name = str(target.relative_to(Path(out)))
     return rep, time.perf_counter() - t
 
 

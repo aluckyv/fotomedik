@@ -19,6 +19,24 @@ def looks_cardrecovery(data: bytes) -> bool:
     )
 
 
+def _ham(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
+def looks_overwritten(data: bytes, chunk: int = 65536) -> bool:
+    """Compressed photo data does not compress again; a file that compresses well
+    (zeros, text, a repeated record) holds no photo data."""
+    import zlib
+
+    if len(data) < chunk:
+        return False
+    for off in (0, len(data) // 2 - chunk // 2, len(data) - chunk):
+        part = data[off : off + chunk]
+        if len(zlib.compress(part, 1)) > 0.5 * len(part):
+            return False
+    return True
+
+
 def scan_bytes(data: bytes, name: str = "") -> Diagnosis:
     d = Diagnosis(name=name, size=len(data))
 
@@ -28,7 +46,12 @@ def scan_bytes(data: bytes, name: str = "") -> Diagnosis:
 
     parse = M.parse_segments(data)
     if parse.errors and parse.errors[0].reason == "no_soi":
-        d.add("not_jpeg", "fatal", 0, "no JPEG start marker")
+        if len(data) >= 2 and _ham(data[0], 0xFF) + _ham(data[1], 0xD8) <= 3:
+            d.add("header_error", "high", 0, "start marker (SOI) has flipped bits", reason="damaged_soi")
+        elif looks_overwritten(data):
+            d.add("overwritten", "fatal", 0, "no photo data: the content is repetitive (overwritten by other data)")
+        else:
+            d.add("not_jpeg", "fatal", 0, "no JPEG start marker")
         return d
 
     for e in parse.errors:

@@ -109,3 +109,24 @@ def test_cli_batch_summary(tmp_path, healthy_jpeg_rst, healthy_jpeg):
     assert not (out / "notes.txt").exists()
     # batch auto-learns references from healthy files in the folder
     assert "ref" in r.output.lower() or "profil" in r.output.lower() or True
+
+
+def test_cli_overwritten_file_gets_report_only(tmp_path):
+    """A 'photo' whose content was replaced by a repeated record: diagnosed, no copy written."""
+    record = "\\\\?\\D:\\Photos\\P0001.JPG".encode("utf-16-le") + b"\x00\x00" + bytes(range(200))
+    p = tmp_path / "P0001.JPG"
+    p.write_bytes(record * 2000)
+    out = tmp_path / "out"
+    r = CliRunner().invoke(main, ["fix", str(p), "-o", str(out), "--lang", "en"])
+    assert r.exit_code == 0, r.output
+    assert "overwritten" in r.output or "no photo" in r.output
+    assert not (out / "P0001.JPG").exists()
+    assert (out / "P0001.report.json").exists()
+
+
+def test_scan_damaged_soi_is_header_error(healthy_jpeg_rst):
+    from fotomedik.scan.scanner import scan_bytes
+
+    data = b"\xbf" + healthy_jpeg_rst[1:]
+    d = scan_bytes(data, "x.jpg")
+    assert [f.kind for f in d.findings] == ["header_error"]

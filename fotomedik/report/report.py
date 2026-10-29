@@ -20,8 +20,10 @@ STRINGS = {
         "fallback_thumb": "Glavna slika nije spasiva — sačuvan je ugrađeni thumbnail.",
         "thumb_guided": "Rupe su popunjene prema ugrađenoj sličici (thumbnail): tačne boje i grubi oblici, bez sitnih detalja.",
         "output": "Izlazni fajl",
+        "no_output": "nije napravljen (nema šta da se sačuva)",
         "kind": {
             "not_jpeg": "fajl nije JPEG (ili je početak uništen)",
+            "overwritten": "u fajlu nema fotografije — sadržaj je prepisan drugim podacima",
             "cardrecovery_xor": "CardRecovery privremeni fajl (XOR kodiran)",
             "header_error": "oštećen header (markeri/dužine/tabele)",
             "missing_tables": "nedostaju tabele u headeru",
@@ -54,8 +56,10 @@ STRINGS = {
         "fallback_thumb": "Main image unrecoverable — the embedded thumbnail was saved instead.",
         "thumb_guided": "Holes were filled following the embedded thumbnail: right colours and rough shapes, no fine detail.",
         "output": "Output file",
+        "no_output": "none (nothing to save)",
         "kind": {
             "not_jpeg": "not a JPEG (or the start is destroyed)",
+            "overwritten": "no photo in the file — its content was overwritten by other data",
             "cardrecovery_xor": "CardRecovery temp file (XOR encoded)",
             "header_error": "damaged header (markers/lengths/tables)",
             "missing_tables": "tables missing from header",
@@ -82,7 +86,7 @@ STRINGS = {
 @dataclass
 class FileReport:
     name: str
-    output_name: str
+    output_name: str | None
     size_in: int
     size_out: int
     recovered_pct: float | None
@@ -160,5 +164,5 @@ class FileReport:
             lines.append(s["thumb_guided"])
         if self.fallback == "thumbnail":
             lines.append(s["fallback_thumb"])
-        lines.append(f"{s['output']}: {self.output_name}")
+        lines.append(f"{s['output']}: {self.output_name or s['no_output']}")
         return "\n".join(lines)
