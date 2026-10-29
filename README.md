@@ -1,6 +1,12 @@
 # FotoMedik
 
 
+Dijagnoza i popravka oštećenih fotografija (JPEG). Program kaže *šta* je pokvareno, popravi
+ono što se popraviti može i pošteno prijavi koliko je slike vraćeno. Originali se nikad ne diraju.
+
+Diagnose and repair corrupted photos (JPEG). Tells you *what* is broken, repairs what can be
+repaired, and reports honestly how much of the image came back. Originals are never touched.
+
 ## The app (Windows)
 
 Download `FotoMedik-windows` from the latest successful run under **Actions** on
@@ -11,11 +17,6 @@ before and after and read what was found and repaired. Originals are never
 changed.
 
 From source: `pip install -e . pyside6`, then `python -m fotomedik.gui`.
-Dijagnoza i popravka oštećenih fotografija (JPEG). Program kaže *šta* je pokvareno, popravi
-ono što se popraviti može i pošteno prijavi koliko je slike vraćeno. Originali se nikad ne diraju.
-
-Diagnose and repair corrupted photos (JPEG). Tells you *what* is broken, repairs what can be
-repaired, and reports honestly how much of the image came back. Originals are never touched.
 
 ## Instalacija (Windows, Python 3.11+)
 
