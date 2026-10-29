@@ -264,6 +264,7 @@ def decode_scan(
     max_mcus: int | None = None,
     start_bit: int = 0,
     init_preds: dict[int, int] | None = None,
+    resync: bool = True,
 ) -> ScanResult:
     frame = ft.frame
     if frame.progressive or frame.marker not in (0xC0, 0xC1):
@@ -402,11 +403,10 @@ def decode_scan(
             if first_error is None:
                 first_error = err
             intervals.append(iv)
-            if not dri or partial and end_byte is not None and err.reason != "bad_rst":
-                # Without restart markers there is nothing to resync on.
-                if not dri:
-                    iv.byte_end = end if parse.eoi_offset is None or end_byte is not None else parse.eoi_offset
-                    break
+            if not dri or not resync:
+                # Without restart markers there is nothing to resync on (and probes never resync).
+                iv.byte_end = end if parse.eoi_offset is None or end_byte is not None else parse.eoi_offset
+                break
             # Resync: find the next RST marker and work out which interval it closes.
             # A flipped bit can also *create* a fake FF Dn; a marker whose sequence
             # number does not fit the byte distance is skipped.
@@ -441,7 +441,8 @@ def decode_scan(
                     # real marker decode cleanly for a few MCUs, those after a fake one rarely do.
                     # A fuzzy (damaged-looking) marker must prove itself over the whole next interval.
                     probe = decode_scan(data, parse, ft, start_byte=moff + 2, end_byte=end,
-                                        first_mcu=(cand + 1) * dri, max_mcus=dri if fuzzy else min(3, dri))
+                                        first_mcu=(cand + 1) * dri, max_mcus=dri if fuzzy else min(3, dri),
+                                        resync=False)
                     if probe.error is not None and probe.error.reason != "eof":
                         continue
                     if fuzzy and not (probe.intervals and probe.intervals[0].ok and probe.intervals[0].end_marker is not None):
