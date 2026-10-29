@@ -27,7 +27,8 @@ from ..jpeg import decoder as D
 from ..jpeg import kernel as K
 from ..scan.garbage import last_dense_damage
 from .base import Context, Recipe
-from .r9_holes import block_mask, decode_for, junk_onset, tail_blocks, vertical_reference
+from .dcfield import block_mask, build_field, thumbnail_base
+from .r9_holes import decode_for, junk_onset, tail_blocks
 from .registry import register
 
 DROP_FIRST = 2  # the first MCUs of a tail start inside the damage
@@ -38,15 +39,19 @@ MAX_REF_DIST = 8  # block rows: farther clean rows say little about a tail's DC
 
 
 class References:
-    """Per component: DC interpolated from the nearest clean rows above/below and the
-    distance to them (block rows), from the decode before any repair."""
+    """Per component: the DC the surroundings suggest for every block (nearest clean rows
+    above/below, guided by the Exif thumbnail when it has one - see dcfield), from the
+    decode before any repair."""
 
-    def __init__(self, sr: D.ScanResult, ft):
+    def __init__(self, sr: D.ScanResult, ft, thumb=None):
         self.comps, self.per_row, _rows = D._scan_components(ft)
         self.ref = {}
         for c in self.comps:
             arr = sr.dc[c.cid]
-            self.ref[c.cid] = vertical_reference(arr, block_mask(sr.mcu_ok, arr, c.h, c.v, self.per_row))
+            q = ft.quant[ft.frame.component(c.cid).tq].dc
+            f = build_field(arr, block_mask(sr.mcu_ok, arr, c.h, c.v, self.per_row), q,
+                            thumb.dc[c.cid] if thumb else None, thumb.sigma[c.cid] if thumb else None)
+            self.ref[c.cid] = (f.val, f.dist)
 
     def blocks(self, first_mcu: int, n: int):
         """Per component (cid, column slice in dc_rel, reference values, distances), shape (n, h*v)."""
@@ -204,7 +209,13 @@ class TailRecovery(Recipe):
         total = sr.total_mcus
         tails: dict[int, dict] = {}
         recovered = 0
-        refs = References(sr, ft)
+        clean = sr.mcu_ok.copy()
+        for iv in sr.intervals:
+            if not iv.ok:
+                clean[iv.mcu_first : iv.mcu_first + iv.mcu_count] = False
+        thumb = thumbnail_base(data, ft, sr, clean)
+        ctx.memo["thumb_base"] = thumb
+        refs = References(sr, ft, thumb)
         for iv, last, marker_pos in self._spans(sr, parse):
             j = last
             mpos = marker_pos

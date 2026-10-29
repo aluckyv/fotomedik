@@ -28,40 +28,13 @@ from ..jpeg.encoder import BitWriter, encode_flat_mcus, gray_dc
 from ..jpeg.tables import FrameTables, TableError
 from ..jpeg.writer import assemble, rst_marker
 from .base import Context, Hole, Recipe
+from .dcfield import block_mask, build_field, thumbnail_base, vertical_reference  # noqa: F401
 from .registry import register
 
 BACKOFF_MCUS = 3  # MCUs dropped before a detected error (silent desync margin)
-JUNK_LEVEL = 6.0  # median anomaly (in units of the vertical prediction error) of a junk prefix
+JUNK_LEVEL = 6.0  # median anomaly (in units of the reference's expected error) of a junk prefix
 MARK_YCC = (105, 212, 235)  # magenta in YCbCr
 TAIL_REF_ROUNDS = (2.0, 6.0, math.inf)  # mean reference distance (block rows) accepted per round
-
-
-def block_mask(mcu_ok: np.ndarray, arr: np.ndarray, h: int, v: int, per_row: int) -> np.ndarray:
-    """Per-block mask of one component: the block's MCU is trusted and its DC known."""
-    rows, cols = arr.shape
-    okm = np.repeat(np.repeat(mcu_ok[: (rows // v) * per_row].reshape(rows // v, per_row), v, 0), h, 1)
-    return okm[:rows, :cols] & ~np.isnan(arr)
-
-
-def vertical_reference(arr: np.ndarray, okm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per block: DC interpolated linearly between the nearest trusted blocks above and
-    below in the same column (the block itself where trusted), and the distance in
-    block rows to the nearer of them (0 where trusted, inf where the column has none)."""
-    rows, cols = arr.shape
-    ridx = np.arange(rows)[:, None].repeat(cols, 1)
-    above = np.maximum.accumulate(np.where(okm, ridx, -1), axis=0)
-    below = np.minimum.accumulate(np.where(okm, ridx, rows)[::-1], axis=0)[::-1]
-    colidx = np.arange(cols)[None, :].repeat(rows, 0)
-    va = np.where(above >= 0, arr[np.clip(above, 0, rows - 1), colidx], np.nan)
-    vb = np.where(below < rows, arr[np.clip(below, 0, rows - 1), colidx], np.nan)
-    da = (ridx - above).astype(float)
-    db = (below - ridx).astype(float)
-    lin = (va * db + vb * da) / np.where(da + db > 0, da + db, 1)
-    val = np.where(np.isnan(va), vb, np.where(np.isnan(vb), va, lin))
-    dist = np.minimum(np.where(above >= 0, da, np.inf), np.where(below < rows, db, np.inf))
-    val = np.where(okm, arr, val)
-    dist = np.where(okm, 0.0, dist)
-    return val, dist
 
 
 def tail_blocks(first: int, n: int, h: int, v: int, per_row: int) -> tuple[np.ndarray, np.ndarray]:
@@ -99,27 +72,17 @@ def junk_onset(s: np.ndarray, min_t: float = 6.0, ratio: float = 2.5, floor: flo
     return onset
 
 
-def vertical_noise(arr: np.ndarray, okm: np.ndarray, q: int) -> float:
-    """Typical gray-level error of predicting a clean block from the blocks above and below."""
-    m = okm[1:-1] & okm[:-2] & okm[2:]
-    if not m.any():
-        return 1.0
-    err = np.abs(arr[1:-1] - (arr[:-2] + arr[2:]) / 2.0)[m]
-    return max(1.0, float(np.median(err)) * q / 8.0)
-
-
-def anomaly_series(refs: dict, comps, per_row: int, qdc: dict, noise: dict, dc: dict, first: int, n: int,
-                   max_dist: float = 8) -> np.ndarray:
-    """Per MCU: worst component of |DC - reference| in units of that component's typical
-    vertical prediction error (`noise`). `refs`: cid -> (values, distances) from
-    vertical_reference; dc: cid -> the MCUs' first-block DC values. NaN without reference."""
+def anomaly_series(fields: dict, comps, per_row: int, qdc: dict, dc: dict, first: int, n: int) -> np.ndarray:
+    """Per MCU: worst component of |DC - reference| in units of the reference's expected
+    error. `fields`: cid -> dcfield.Field; dc: cid -> the MCUs' first-block DC values.
+    NaN where no reference exists."""
     out = np.full(n, np.nan)
     for cid, h, v in comps:
-        val, dist = refs[cid]
+        f = fields[cid]
         br, bc = tail_blocks(first, n, h, v, per_row)
-        rv, dv = val[br[:, 0], bc[:, 0]], dist[br[:, 0], bc[:, 0]]
-        a = np.abs(dc[cid] - rv) * qdc[cid] / 8.0 / noise[cid]
-        a = np.where((dv <= max_dist) & ~np.isnan(rv), a, np.nan)
+        rv, sg = f.val[br[:, 0], bc[:, 0]], f.sigma[br[:, 0], bc[:, 0]]
+        a = np.abs(dc[cid] - rv) * qdc[cid] / 8.0 / sg
+        a = np.where(np.isfinite(sg) & ~np.isnan(rv), a, np.nan)
         out = np.where(np.isnan(out), a, np.where(np.isnan(a), out, np.maximum(out, a)))
     return out
 
@@ -208,9 +171,17 @@ class FillHoles(Recipe):
         for iv in sr.intervals:
             if not iv.ok:
                 clean[iv.mcu_first : iv.mcu_first + iv.mcu_count] = False
-        clean_masks = {cid: block_mask(clean, sr.dc[cid], h, v, mcus_per_row) for cid, h, v in comps}
-        prefix_refs = {cid: vertical_reference(sr.dc[cid], clean_masks[cid]) for cid, h, v in comps}
-        noise = {cid: vertical_noise(sr.dc[cid], clean_masks[cid], qdc[cid]) for cid, h, v in comps}
+        thumb = ctx.memo.get("thumb_base")
+        if thumb is None and "thumb_base" not in ctx.memo:
+            thumb = thumbnail_base(data, ft, sr, clean)
+            ctx.memo["thumb_base"] = thumb
+
+        def fields_for(arr_of, mask):
+            return {cid: build_field(arr_of[cid], block_mask(mask, arr_of[cid], h, v, mcus_per_row), qdc[cid],
+                                     thumb.dc[cid] if thumb else None, thumb.sigma[cid] if thumb else None)
+                    for cid, h, v in comps}
+
+        prefix_fields = fields_for(sr.dc, clean)
 
         def untrust_tail(iv, keep):
             """Shrink `keep` by the safety margin, and to just before a silent desync:
@@ -221,14 +192,13 @@ class FillHoles(Recipe):
                 idx = np.arange(iv.mcu_first, iv.mcu_first + n)
                 mrow, mcol = np.divmod(idx, mcus_per_row)
                 first_dc = {cid: sr.dc[cid][mrow * v, mcol * h] for cid, h, v in comps}
-                s_ = anomaly_series(prefix_refs, comps, mcus_per_row, qdc, noise, first_dc, iv.mcu_first, n)
+                s_ = anomaly_series(prefix_fields, comps, mcus_per_row, qdc, first_dc, iv.mcu_first, n)
                 onset = junk_onset(s_)
                 if onset is not None:
                     keep = min(keep, max(0, onset - 1))  # the MCU before the jump is already suspect
                 # junk from the very start (the interval's beginning rotted): no step to find,
-                # but the MCUs sit far from the rows right next to them all along
-                near = anomaly_series(prefix_refs, comps, mcus_per_row, qdc, noise, first_dc, iv.mcu_first, n,
-                                      max_dist=1)[:keep]
+                # but the MCUs sit far from their reference all along
+                near = s_[:keep]
                 near = near[~np.isnan(near)]
                 if len(near) >= 4 and float(np.median(near)) >= JUNK_LEVEL:
                     keep = 0
@@ -267,8 +237,7 @@ class FillHoles(Recipe):
         for max_dist in TAIL_REF_ROUNDS:
             if not pending:
                 break
-            refs = {cid: vertical_reference(work_dc[cid], block_mask(trusted, work_dc[cid], h, v, mcus_per_row))
-                    for cid, h, v in comps}
+            refs = fields_for(work_dc, trusted)
             later = []
             for pl in pending:
                 tail = pl["tail"]
@@ -282,8 +251,7 @@ class FillHoles(Recipe):
                         dists.append(0.0)
                         continue
                     br, bc = tail_blocks(f, n, h, v, mcus_per_row)
-                    val, dist = refs[cid]
-                    rv, dv = val[br, bc], dist[br, bc]
+                    rv, dv = refs[cid].val[br, bc], refs[cid].dist[br, bc]
                     r = rel[:, col : col + h * v]
                     good = np.isfinite(dv) & ~np.isnan(rv)
                     dists.append(float(np.mean(dv[good])) if good.any() else math.inf)
@@ -318,10 +286,10 @@ class FillHoles(Recipe):
             trusted[covered:] = False
 
         # ---------------------------------------------------------------- interpolation sources
-        interp: dict[int, np.ndarray] = {}
-        for cid, h, v in comps:
-            val, _dist = vertical_reference(work_dc[cid], block_mask(trusted, work_dc[cid], h, v, mcus_per_row))
-            interp[cid] = np.nan_to_num(val, nan=0.0)
+        interp = {}
+        for cid, f in fields_for(work_dc, trusted).items():
+            lim = (1024 + qdc[cid]) // qdc[cid] - 1  # stay inside the legal DC range
+            interp[cid] = np.clip(np.nan_to_num(f.val, nan=0.0), -lim, lim)
 
         def fill_targets(first, count, last_override=None):
             per_block: dict[int, list[int]] = {}
