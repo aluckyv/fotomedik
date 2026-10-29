@@ -196,6 +196,37 @@ def _hamming(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
+_POP = np.array([bin(i).count("1") for i in range(256)], dtype=np.int8)
+
+
+def _marker_candidates(data: bytes, start: int, end: int, expected: int, max_ham: int = 1) -> list[tuple[int, int, bool]]:
+    """RST-like byte pairs in [start, end): (n, offset, fuzzy), sorted by offset.
+
+    Exact FF Dn markers are always listed; pairs within `max_ham` flipped bits of
+    FF D<expected> are listed as fuzzy candidates with n = expected.
+    """
+    out: list[tuple[int, int, bool]] = []
+    p = start
+    while True:
+        p = data.find(b"\xff", p, end - 1)
+        if p < 0:
+            break
+        n = data[p + 1]
+        if 0xD0 <= n <= 0xD7:
+            out.append((n - 0xD0, p, False))
+        p += 1
+    if end - start > 2:
+        arr = np.frombuffer(data, dtype=np.uint8)[start:end]
+        h = _POP[arr[:-1] ^ 0xFF].astype(np.int16) + _POP[arr[1:] ^ (0xD0 + expected)]
+        for i in np.flatnonzero(h <= max_ham):
+            off = start + int(i)
+            if data[off] == 0xFF and 0xD0 <= data[off + 1] <= 0xD7:
+                continue  # exact marker, already listed
+            out.append((expected, off, True))
+    out.sort(key=lambda t: t[1])
+    return out
+
+
 # --------------------------------------------------------------------------- main entry
 
 
@@ -388,35 +419,43 @@ def decode_scan(
             search_from = max(err.byte_offset, iv.byte_start + 1)
             hit = None
             j = k
-            while True:
-                found = _find_rst(data, search_from, end)
-                if found is None:
-                    break
-                n, moff = found
-                spans_est = max(1.0, (moff - iv.byte_start) / avg)
-                base = k + ((n - k) % 8)
-                cands = sorted(
-                    (abs((c - k + 1) - spans_est) / spans_est, c) for c in (base, base + 8, base + 16, base + 24)
-                )
-                rel_err, cand = cands[0]
-                plausible = rel_err <= 0.6 or (cand == k and (moff - iv.byte_start) <= 3 * avg)
-                if plausible and (cand + 1) * dri < total:
+            fuzzy_hit = False
+            for n, moff, fuzzy in _marker_candidates(data, search_from, end, k % 8):
+                dist = moff - iv.byte_start
+                spans_est = max(1.0, dist / avg)
+                if fuzzy:
+                    # a damaged copy of the very marker this interval should end with
+                    if not (0.3 * avg <= dist <= 2.5 * avg):
+                        continue
+                    cand = k
+                else:
+                    base = k + ((n - k) % 8)
+                    cands = sorted(
+                        (abs((c - k + 1) - spans_est) / spans_est, c) for c in (base, base + 8, base + 16, base + 24)
+                    )
+                    rel_err, cand = cands[0]
+                    if not (rel_err <= 0.6 or (cand == k and dist <= 3 * avg)):
+                        continue
+                if (cand + 1) * dri < total:
                     # A flipped bit can create a fake FF Dn inside the data: the bytes after a
                     # real marker decode cleanly for a few MCUs, those after a fake one rarely do.
+                    # A fuzzy (damaged-looking) marker must prove itself over the whole next interval.
                     probe = decode_scan(data, parse, ft, start_byte=moff + 2, end_byte=end,
-                                        first_mcu=(cand + 1) * dri, max_mcus=min(3, dri))
+                                        first_mcu=(cand + 1) * dri, max_mcus=dri if fuzzy else min(3, dri))
                     if probe.error is not None and probe.error.reason != "eof":
-                        plausible = False
-                if plausible:
-                    hit, j = found, cand
-                    break
-                search_from = moff + 2  # implausible: probably a fake marker, keep looking
+                        continue
+                    if fuzzy and not (probe.intervals and probe.intervals[0].ok and probe.intervals[0].end_marker is not None):
+                        continue
+                hit, j, fuzzy_hit = (n, moff), cand, fuzzy
+                break
             if hit is None:
                 iv.byte_end = end if end_byte is not None else (parse.eoi_offset or end)
                 break
             n, moff = hit
             iv.byte_end = moff if iv.byte_end is None else iv.byte_end
             iv.resync_at = moff
+            if fuzzy_hit:
+                iv.end_marker_damaged = True
             # intervals k+1..j are lost
             for skipped in range(k + 1, j + 1):
                 sf = skipped * dri

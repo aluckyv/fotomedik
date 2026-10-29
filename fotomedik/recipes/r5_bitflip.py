@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 import time
 
+import numpy as np
+
 from ..jpeg import decoder as D
 from ..jpeg import markers as M
 from ..jpeg.tables import FrameTables
@@ -26,8 +28,14 @@ W_FWD = 2  # bytes at/after the detection point
 TWO_BIT_WINDOW = 24
 MAX_ROUNDS = 8  # flips per interval
 MIN_GAIN = 3  # MCUs of extra progress needed to accept a partial fix
+BEAM = 3  # distinct partial outcomes explored per round when nothing completes
+PER_OUTCOME = 3  # equivalent-looking flips explored per outcome
+MAX_EXPANSIONS = 40  # search nodes per interval
+ENOUGH_COMPLETE = 8  # stop scanning once this many *distinct* complete outcomes were found
+PER_INTERVAL_MIN = 3.0  # seconds; each failed interval gets at least this much of the budget
+PER_INTERVAL_MAX = 30.0
 DEFAULT_TIME_BUDGET = 120.0  # seconds per file
-ANOMALY_LEVELS = 80
+ANOMALY_LEVELS = 64
 
 _ONE_BIT = [1 << b for b in range(8)]
 _TWO_BIT = [(1 << a) | (1 << b) for a in range(8) for b in range(a + 1, 8)]
@@ -77,14 +85,15 @@ def _first_anomaly(cur: D.ScanResult, base: D.ScanResult, ft: FrameTables, first
 def _roughness(r: D.ScanResult, base: D.ScanResult, ft: FrameTables, first: int, count: int) -> float:
     """How jumpy the DC is inside the interval vs. neighbours (gray levels, lower = smoother).
 
+    Plain mean of neighbour differences (a pooled tail/percentile metric proved
+    non-monotonic: candidates can swap which blocks land in the tail).
     All scan components count (a wrong flip often shifts only a chroma plane).
     Vertical differences use the full-file decode `base` for the rows above/below
     (only where those MCUs decoded cleanly), horizontal ones the candidate itself.
     """
     frame = ft.frame
     interleaved = len(ft.scan.components) > 1
-    total = 0.0
-    n = 0
+    diffs: list[float] = []
     for sc in ft.scan.components:
         fc = frame.component(sc.id)
         h, v = (fc.h, fc.v) if interleaved else (1, 1)
@@ -101,19 +110,20 @@ def _roughness(r: D.ScanResult, base: D.ScanResult, ft: FrameTables, first: int,
                     if math.isnan(a):
                         continue
                     if bcol > 0 and not math.isnan(arr[brow, bcol - 1]):
-                        total += abs(a - arr[brow, bcol - 1]) * q
-                        n += 1
+                        # horizontal jumps inside the candidate weigh double: a wrong flip
+                        # starts/ends a shifted run with a step the picture never had
+                        diffs.append(2.0 * abs(a - arr[brow, bcol - 1]) * q)
                     if by == 0 and brow > 0:
                         up_m = ((brow - 1) // v) * per_row + bcol // h
                         if base.mcu_ok[up_m] and not math.isnan(barr[brow - 1, bcol]):
-                            total += abs(a - barr[brow - 1, bcol]) * q
-                            n += 1
+                            diffs.append(abs(a - barr[brow - 1, bcol]) * q)
                     if by == v - 1 and brow + 1 < barr.shape[0]:
                         dn_m = ((brow + 1) // v) * per_row + bcol // h
                         if dn_m < len(base.mcu_ok) and base.mcu_ok[dn_m] and not math.isnan(barr[brow + 1, bcol]):
-                            total += abs(a - barr[brow + 1, bcol]) * q
-                            n += 1
-    return total / n if n else 0.0
+                            diffs.append(abs(a - barr[brow + 1, bcol]) * q)
+    if not diffs:
+        return 0.0
+    return float(np.mean(diffs))
 
 
 class _Interval:
@@ -145,9 +155,9 @@ def repair_interval(
     'complete' candidate much rougher than that is a wrong flip that happens to decode.
     """
     spec = _Interval(iv, parse, len(buf))
-    flips: list[tuple[int, int]] = []
 
-    def decode_from(start_byte, start_bit, first_mcu, preds):
+    def decode_from(start_byte, start_bit, first_mcu, preds, max_mcus=None):
+        n = spec.count - (first_mcu - spec.first)
         return D.decode_scan(
             bytes(buf),
             parse,
@@ -156,17 +166,21 @@ def repair_interval(
             start_bit=start_bit,
             end_byte=spec.decode_end,
             first_mcu=first_mcu,
-            max_mcus=spec.count - (first_mcu - spec.first),
+            max_mcus=n if max_mcus is None else min(n, max_mcus),
             init_preds=preds,
         )
 
-    for _round in range(MAX_ROUNDS):
+    expansions = [0]
+
+    def search(depth: int, flips: list[tuple[int, int]]):
+        """Depth-limited beam search. Returns (complete, progress, roughness, flips)."""
         cur = decode_from(spec.start, 0, spec.first, None)
         if _complete(cur, spec.count, spec.marker_pos):
-            return True, flips, "repaired"
-        if time.monotonic() > deadline:
-            return False, flips, "budget"
+            return (True, spec.count, _roughness(cur, base, ft, spec.first, spec.count), list(flips))
         progress = _decoded(cur)
+        if depth >= MAX_ROUNDS or time.monotonic() > deadline or expansions[0] >= MAX_EXPANSIONS:
+            return (False, progress, float("inf"), list(flips))
+        expansions[0] += 1
         # Where to look: the detection point, and the first visibly implausible MCU before
         # it (a desync is often noticed hundreds of bytes after the flipped bit).
         if cur.error is not None and cur.error.reason in ("bad_huffman", "coef_overflow", "dc_range", "eof"):
@@ -178,11 +192,13 @@ def repair_interval(
         mi = _first_anomaly(cur, base, ft, spec.first, spec.count)
         hint = e_byte
         if mi is not None and mi - spec.first < len(cur.mcus):
-            hint = min(e_byte, cur.mcus[mi - spec.first].bit_start // 8 + 2)
+            # an image edge can look like an anomaly too, so never trust it further back
+            # than a few windows before the detection point
+            hint = max(min(e_byte, cur.mcus[mi - spec.first].bit_start // 8 + 2), e_byte - 4 * W_BACK)
         hi = min(e_byte + W_FWD, spec.decode_end - (2 if spec.marker_pos is not None else 0))
         lo = max(spec.start, hint - W_BACK)
         if hi <= lo:
-            return False, flips, "unrepaired"
+            return (False, progress, float("inf"), list(flips))
         # Resume point: last MCU that starts before the window (its predictors are known)
         m0 = spec.first
         for m in cur.mcus:
@@ -196,14 +212,20 @@ def repair_interval(
         else:
             start_off, start_bit, preds0 = spec.start, 0, None
 
-        best_partial: tuple[int, float, int, int] | None = None  # (decoded, roughness, off, mask)
+        partials: dict[tuple[int, float], list[tuple[int, int, int]]] = {}  # (dec, rough) -> [(dir, off, mask)]
         complete: list[tuple[float, int, int, int]] = []  # (roughness, direction_penalty, off, mask)
 
+        # Stage 1 decodes only a little past the detection point (cheap, kills most
+        # candidates); stage 2 decodes to the marker for the survivors.
+        err_mcu = cur.error.mcu_index if cur.error is not None else spec.first + spec.count
+        stage1_n = max(1, err_mcu - m0 + MIN_GAIN + 1)
+
         def consider(off: int, mask: int) -> None:
-            nonlocal best_partial
             was_zero = not (buf[off] & mask)
             buf[off] ^= mask
-            r = decode_from(start_off, start_bit, m0, dict(preds0) if preds0 else None)
+            r = decode_from(start_off, start_bit, m0, dict(preds0) if preds0 else None, max_mcus=stage1_n)
+            if r.error is None and _decoded(r) >= stage1_n and stage1_n < spec.count - (m0 - spec.first):
+                r = decode_from(start_off, start_bit, m0, dict(preds0) if preds0 else None)
             buf[off] ^= mask
             if _complete(r, spec.count - (m0 - spec.first), spec.marker_pos):
                 # Several different flips can decode "completely"; rank them by how
@@ -213,32 +235,37 @@ def repair_interval(
             dec = (m0 - spec.first) + _decoded(r)
             if dec < progress + MIN_GAIN:
                 return
-            # Among partial fixes prefer more progress, then the smoother decoded prefix
-            # (a wrong flip that happens to decode further usually leaves a DC step behind).
-            if best_partial is None or dec > best_partial[0] + MIN_GAIN or abs(dec - best_partial[0]) <= MIN_GAIN:
-                # judge smoothness on the prefix before the next error (the last few MCUs
-                # before a detection are usually already garbage)
-                n_ok = max(1, dec - (m0 - spec.first) - MIN_GAIN)
-                rough = _roughness(r, base, ft, m0, n_ok)
-                if best_partial is None or dec > best_partial[0] + MIN_GAIN or rough < best_partial[1]:
-                    best_partial = (dec, rough, off, mask)
+            # judge smoothness on the prefix before the next error (the last few MCUs
+            # before a detection are usually already garbage)
+            n_ok = max(1, dec - (m0 - spec.first) - MIN_GAIN)
+            key = (dec, round(_roughness(r, base, ft, m0, n_ok), 3))
+            partials.setdefault(key, []).append((0 if was_zero else 1, off, mask))
 
         limit_rough = max(1.5 * baseline, baseline + 6.0)
 
         def acceptable() -> list:
             return [c for c in complete if c[0] <= limit_rough]
 
-        # Single-bit flips in the window; widen the window while nothing acceptable turns up.
-        scanned_lo = hi
-        for span in (W_BACK, 3 * W_BACK, 8 * W_BACK):
+        def enough() -> bool:
+            # many flips are equivalent (same effect, different bit); count distinct outcomes
+            return len({round(c[0], 2) for c in acceptable()}) >= ENOUGH_COMPLETE
+
+        # Single-bit flips, nearest to the hint first (the anomaly start is the best guess
+        # for where the flip is); widen the window while nothing acceptable turns up and
+        # stop once a few complete candidates exist (the smoothest wins).
+        scanned: set[int] = set()
+        for si, span in enumerate((W_BACK, 3 * W_BACK, 8 * W_BACK)):
             new_lo = max(spec.start, hint - span)
-            for off in range(scanned_lo - 1, new_lo - 1, -1):
+            new_hi = hi if si == 0 else min(hi, hint + span)  # first window always reaches the detection point
+            offs = sorted((o for o in range(new_lo, new_hi) if o not in scanned), key=lambda o: abs(o - hint))
+            for off in offs:
+                scanned.add(off)
                 for mask in _ONE_BIT:
                     consider(off, mask)
-                if time.monotonic() > deadline:
+                # the first window is always scanned fully (quality); wider ones stop early
+                if (si > 0 and enough()) or time.monotonic() > deadline:
                     break
-            scanned_lo = new_lo
-            if acceptable() or time.monotonic() > deadline or new_lo == spec.start:
+            if acceptable() or time.monotonic() > deadline or (new_lo == spec.start and new_hi == hi):
                 break
         if not acceptable() and time.monotonic() <= deadline:
             for off in range(hi - 1, max(lo, e_byte - TWO_BIT_WINDOW) - 1, -1):
@@ -251,15 +278,41 @@ def repair_interval(
             good.sort()
             _, _, off, mask = good[0]
             buf[off] ^= mask
-            flips.append((off, mask))
-            continue  # re-decode from the start to confirm (and catch leftovers)
-        if best_partial is not None and best_partial[0] >= progress + MIN_GAIN:
-            _, _, off, mask = best_partial
+            res = search(depth + 1, flips + [(off, mask)])  # re-decode from the start to confirm
             buf[off] ^= mask
-            flips.append((off, mask))
-            continue
-        return False, flips, "unrepaired" if time.monotonic() <= deadline else "budget"
-    return False, flips, "too many errors"
+            if res[0]:
+                return res
+        # No clean completion: try the most promising partial fixes (distinct outcomes),
+        # deeper. Equivalent-looking flips can differ later in the interval, so a small
+        # beam beats a greedy choice.
+        best = (False, progress, float("inf"), list(flips))
+        ranked = sorted(partials.items(), key=lambda kv: (-kv[0][0], kv[0][1]))[:BEAM]
+        branches: list[tuple[int, int]] = []
+        for (dec, _rough), lst in ranked:
+            # flips with an identical prefix outcome can still differ later in the
+            # interval: explore a couple of each, 0->1 repairs first (the likelier damage)
+            lst.sort()
+            branches += [(off, mask) for _d, off, mask in lst[:PER_OUTCOME]]
+        for off, mask in branches:
+            if time.monotonic() > deadline:
+                break
+            buf[off] ^= mask
+            res = search(depth + 1, flips + [(off, mask)])
+            buf[off] ^= mask
+            if res[0] and (not best[0] or res[2] < best[2]):
+                best = res
+            elif not best[0] and not res[0] and res[1] > best[1]:
+                best = res
+        return best
+
+    ok, progress, _rough, chosen = search(0, [])
+    for off, mask in chosen:
+        buf[off] ^= mask
+    if ok:
+        return True, chosen, "repaired"
+    if time.monotonic() > deadline:
+        return False, chosen, "budget"
+    return False, chosen, "unrepaired" if chosen or expansions[0] else "unrepaired"
 
 
 @register
@@ -298,12 +351,15 @@ class BitFlipRepair(Recipe):
         repaired = unrepaired = 0
         notes: dict[str, int] = {}
         skipped_for_time = 0
-        for iv in self._candidates(sr, attempted):
+        cands = self._candidates(sr, attempted)
+        per_interval = min(PER_INTERVAL_MAX, max(PER_INTERVAL_MIN, budget / max(1, len(cands))))
+        for iv in cands:
             if time.monotonic() > deadline:
                 skipped_for_time += 1
                 continue
             attempted.add(iv.index)
-            ok, flips, note = repair_interval(buf, parse, ft, sr, iv, deadline, baseline)
+            iv_deadline = min(deadline, time.monotonic() + per_interval)
+            ok, flips, note = repair_interval(buf, parse, ft, sr, iv, iv_deadline, baseline)
             all_flips += [[o, m] for o, m in flips]
             if ok:
                 repaired += 1

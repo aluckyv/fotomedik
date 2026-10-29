@@ -132,6 +132,22 @@ def test_damaged_rst_marker_itself(healthy_jpeg_rst):
         assert sr.intervals[k].ok
 
 
+def test_resync_on_damaged_rst_marker_recovers_following_interval(healthy_jpeg_rst):
+    """RST5 with a flipped bit: interval 5 is fine and interval 6 must not be lost."""
+    ref, _, _ = _decode(healthy_jpeg_rst)
+    iv = ref.intervals[5]
+    broken = flip_bits(healthy_jpeg_rst, iv.byte_end + 1, 0x20)  # FF D5 -> FF F5
+    sr, _, _ = _decode(broken)
+    assert sr.intervals[5].ok and sr.intervals[5].end_marker_damaged
+    assert sr.intervals[6].ok and sr.intervals[6].mcu_first == 96
+    # now damage the data of interval 5 AND its marker: interval 6 must still be found
+    off, mask = breaking_flip(broken, iv.byte_start + 4, iv.byte_end - 4)
+    sr2, _, _ = _decode(flip_bits(broken, off, mask))
+    assert not sr2.intervals[5].ok
+    assert sr2.intervals[6].ok and sr2.intervals[6].mcu_first == 96 and sr2.intervals[6].byte_start == ref.intervals[6].byte_start
+    assert all(iv.ok for iv in sr2.intervals[7:])
+
+
 def test_unsupported_progressive(healthy_progressive):
     res = M.parse_segments(healthy_progressive)
     ft = FrameTables.from_parse(res)

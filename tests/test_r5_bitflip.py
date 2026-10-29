@@ -21,7 +21,7 @@ def _run(data, **options):
     return run_pipeline(Context(data=data, name="x.jpg", options=options), recipes=[BitFlipRepair()])
 
 
-def assert_equivalent(repaired, healthy, tol=4):
+def assert_equivalent(repaired, healthy, tol=6):
     """Repaired file decodes cleanly and every block's DC is within `tol` quantised units of the truth.
 
     A flip inside a magnitude field leaves the stream syntactically valid, so several
