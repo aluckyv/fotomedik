@@ -105,7 +105,8 @@ class FileReport:
     height: int | None = None
     # holes nothing is known about (no thumbnail there): MCU ranges, for the AI copy
     unknown: list = field(default_factory=list, repr=False)
-    ai_output: str | None = None  # the AI copy, when one was made
+    ai_output: str | None = None  # the enhanced copy, when one was made
+    enhanced: list = field(default_factory=list)  # what went into it
 
     @classmethod
     def from_context(cls, ctx: Context, findings_before: list[dict] | None = None, width=None, height=None) -> "FileReport":
@@ -138,7 +139,8 @@ class FileReport:
             "applied": self.applied,
             "holes": self.holes,
             "fallback": self.fallback,
-            "ai_output": self.ai_output,
+            "enhanced_output": self.ai_output,
+            "enhanced": self.enhanced,
             "log": self.log,
         }
 

@@ -21,27 +21,32 @@ jobs:
 
   ai-models:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev,ai]" pytest-github-actions-annotate-failures
+      - run: pip install -e ".[dev,ai]" opencv-python-headless pytest-github-actions-annotate-failures
       - run: python build_fastdec.py
       - uses: actions/cache@v4
         with:
           path: models
-          key: ai-models-v1
-      - name: real Real-ESRGAN and LaMa models
+          key: ai-models-v2
+      - name: real networks (Real-ESRGAN, LaMa, FBCNN, GFPGAN, Stable Diffusion)
         env:
           FOTOMEDIK_AI_MODELS: "1"
           FOTOMEDIK_MODELS: models
         run: pytest -q -s tests/test_ai_models.py
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ai-check
-          path: ai_check/
+      - name: publish the check pictures (release "ci-preview")
+        if: always() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls ai_check || exit 0
+          gh release view ci-preview >/dev/null 2>&1 || gh release create ci-preview --prerelease --title "CI preview pictures" --notes "Pictures from the AI model tests (not an app release)."
+          gh release upload ci-preview ai_check/*.png --clobber
 
   dll-windows:
     runs-on: windows-latest
@@ -68,7 +73,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e . pyside6 pyinstaller onnxruntime-directml
+      - run: pip install -e . pyside6 pyinstaller onnxruntime-directml opencv-python-headless
       - name: build _fastdec.dll
         run: python build_fastdec.py
       - name: demo photos
@@ -101,7 +106,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: models
-          key: ai-models-v1
+          key: ai-models-win-v2
       - name: AI smoke test of the packaged app (real models)
         shell: pwsh
         env:

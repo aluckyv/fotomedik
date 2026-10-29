@@ -15,7 +15,7 @@ class Model:
     name: str
     file: str
     urls: tuple[str, ...]
-    sha256: str
+    sha256: str | None  # None: not pinned yet (the computed hash is saved next to the file)
     size_mb: int
     license: str
 
@@ -37,7 +37,51 @@ INPAINT = Model(
     208,
     "Apache-2.0 (LaMa, Suvorov et al.; trained on Places2)",
 )
-ALL = (SR, INPAINT)
+DEBLOCK = Model(
+    "FBCNN (JPEG artifact removal)",
+    "fbcnn-color.onnx",
+    ("https://huggingface.co/Hawkynt/photomanager-models/resolve/main/fbcnn-color.onnx",),
+    None,
+    288,
+    "Apache-2.0 (FBCNN, Jiang, Zhang, Timofte)",
+)
+FACE_DET = Model(
+    "YuNet (face detection)",
+    "face_detection_yunet_2023mar.onnx",
+    ("https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",
+     "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/"
+     "face_detection_yunet_2023mar.onnx"),
+    None,
+    1,
+    "MIT (OpenCV Zoo, YuNet)",
+)
+FACE = Model(
+    "GFPGAN 1.4 (face restoration)",
+    "gfpgan_1.4.onnx",
+    ("https://huggingface.co/facefusion/models-3.0.0/resolve/main/gfpgan_1.4.onnx",),
+    None,
+    340,
+    "Apache-2.0 (GFPGAN, Tencent ARC)",
+)
+_SD = "https://huggingface.co/RanaLLC/stable-diffusion-v1-5-inpainting-onnx-fp16/resolve/main/"
+_SD_LICENSE = "CreativeML OpenRAIL-M (Stable Diffusion 1.5 inpainting, Runway/Stability AI)"
+SD_UNET = Model("Stable Diffusion inpainting (UNet)", "sd15inp_unet.onnx",
+                (_SD + "unet/model.onnx", "https://huggingface.co/sona-forge/sd15-inpainting-fp16/resolve/main/unet/model.onnx"),
+                None, 1720, _SD_LICENSE)
+SD_VAE_ENC = Model("Stable Diffusion (image encoder)", "sd15inp_vae_encoder.onnx", (_SD + "vae_encoder/model.onnx",),
+                   None, 68, _SD_LICENSE)
+SD_VAE_DEC = Model("Stable Diffusion (image decoder)", "sd15inp_vae_decoder.onnx", (_SD + "vae_decoder/model.onnx",),
+                   None, 99, _SD_LICENSE)
+SD_TEXT = Model("Stable Diffusion (text encoder)", "sd15inp_text_encoder.onnx", (_SD + "text_encoder/model.onnx",),
+                None, 246, _SD_LICENSE)
+
+STEP_MODELS = {
+    "ai": (SR, INPAINT),
+    "deblock": (DEBLOCK,),
+    "faces": (FACE_DET, FACE),
+    "diffusion": (SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT),
+}
+ALL = tuple(m for ms in STEP_MODELS.values() for m in ms)
 
 
 def model_dir() -> Path:
@@ -58,8 +102,17 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def missing() -> list[Model]:
-    return [m for m in ALL if not (model_dir() / m.file).exists()]
+def needed(steps) -> list[Model]:
+    out: list[Model] = []
+    for st in steps:
+        for m in STEP_MODELS.get(st, ()):
+            if m not in out:
+                out.append(m)
+    return out
+
+
+def missing(steps=("ai",)) -> list[Model]:
+    return [m for m in needed(steps) if not (model_dir() / m.file).exists()]
 
 
 def ensure(model: Model, progress=None, stop=None) -> Path:
@@ -89,9 +142,11 @@ def ensure(model: Model, progress=None, stop=None) -> Path:
                     done += len(chunk)
                     if progress:
                         progress(done, total, model)
-            if h.hexdigest() != model.sha256:
+            if model.sha256 is not None and h.hexdigest() != model.sha256:
                 raise ValueError(f"checksum mismatch ({h.hexdigest()[:12]}…)")
             os.replace(tmp, path)
+            if model.sha256 is None:  # remembered, to pin it in a later version
+                path.with_name(path.name + ".sha256").write_text(h.hexdigest() + "\n", encoding="ascii")
             return path
         except InterruptedError:
             tmp.unlink(missing_ok=True)

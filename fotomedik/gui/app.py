@@ -243,18 +243,41 @@ class MainWindow(QMainWindow):
         self.reports = QCheckBox("Save a report file for each photo")
         self.reports.setToolTip("Writes <photo>.report.json next to every repaired copy")
         act.addWidget(self.reports)
-        self.ai = QCheckBox("AI copy")
-        self.ai.setToolTip("Also save <photo>_ai.jpg: areas rebuilt from the thumbnail are sharpened (Real-ESRGAN)\n"
-                           "and holes nothing is known about are filled (LaMa). The added detail is invented by\n"
-                           "the AI, so it is a separate copy. Uses the graphics card when it can.\n"
-                           "The first time it downloads the models (about 275 MB).")
-        act.addWidget(self.ai)
         act.addStretch(1)
         self.openb = QPushButton("Open results folder")
         self.openb.setEnabled(False)
         self.openb.clicked.connect(self._open_output)
         act.addWidget(self.openb)
         outer.addLayout(act)
+
+        # ---- enhanced copy (<photo>_enhanced.jpg): optional steps
+        ext = QHBoxLayout()
+        lab = QLabel("Enhanced copy:")
+        lab.setToolTip("Also save <photo>_enhanced.jpg next to the repaired copy.\n"
+                       "The repaired copy itself always stays faithful to the file.")
+        ext.addWidget(lab)
+        self.steps = {}
+        tips = {
+            "burst": "Fill holes with REAL pixels from another shot of the same scene\n"
+                     "(taken within 3 minutes), aligned and colour-matched. Nothing invented.",
+            "deblock": "Remove JPEG blocks and noise from the whole picture (FBCNN, ~290 MB once).",
+            "ai": "Sharpen areas rebuilt from the thumbnail (Real-ESRGAN) and fill holes nothing\n"
+                  "is known about (LaMa). Invented detail. ~275 MB once.",
+            "faces": "Restore faces (GFPGAN, ~340 MB once). Can make a face look like someone else.",
+            "diffusion": "Maximum quality: holes repainted by Stable Diffusion following the thumbnail.\n"
+                         "Needs a graphics card (minutes per photo on the processor). ~2.1 GB once.",
+        }
+        from ..ai.run import STEP_NAMES
+
+        for key in ("burst", "deblock", "ai", "faces", "diffusion"):
+            cb = QCheckBox(STEP_NAMES[key].capitalize())
+            cb.setToolTip(tips[key])
+            ext.addWidget(cb)
+            self.steps[key] = cb
+        self.steps["burst"].setChecked(True)
+        self.ai = self.steps["ai"]  # older name (smoke test)
+        ext.addStretch(1)
+        outer.addLayout(ext)
 
         prog = QHBoxLayout()
         self.bar = QProgressBar()
@@ -270,7 +293,7 @@ class MainWindow(QMainWindow):
         # ---- results: list | before/after + report
         split = QSplitter(Qt.Orientation.Horizontal)
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Photo", "Real data", "Result", "Time", "AI"])
+        self.table.setHorizontalHeaderLabels(["Photo", "Real data", "Result", "Time", "Enhanced"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -288,7 +311,7 @@ class MainWindow(QMainWindow):
         pics = QHBoxLayout()
         self.before = ImageBox("Before — as a normal viewer shows it")
         self.after = ImageBox("After — repaired copy")
-        self.aibox = ImageBox("AI copy — invented detail in the holes")
+        self.aibox = ImageBox("Enhanced copy")
         pics.addWidget(self.before, 1)
         pics.addWidget(self.after, 1)
         pics.addWidget(self.aibox, 1)
@@ -374,9 +397,10 @@ class MainWindow(QMainWindow):
         self.openb.setEnabled(True)
         self.out_dir = out
 
+        steps = [k for k, cb in self.steps.items() if cb.isChecked()]
         options = {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked(),
-                   "ai": self.ai.isChecked()}
-        self.aibox.setVisible(self.ai.isChecked())
+                   "enhance": steps}
+        self.aibox.setVisible(bool(steps))
         self.aibox.show_image(None)
         self.thread = QThread(self)
         self.worker = RepairWorker(paths, out, options)
@@ -459,12 +483,14 @@ class MainWindow(QMainWindow):
         if self.aibox.isVisible():
             ai = r.ai_output
             self.aibox.show_image(load_preview(ai) if ai and ai.exists() else None,
-                                  "No holes to enhance" if not r.report.holes else "Not made yet")
+                                  "Nothing to enhance" if not r.report.holes else "Not made (yet)")
         text = r.report.format_text("en")
         if r.output:
             text += f"\nSaved as: {r.output}"
         if r.ai_output:
-            text += f"\nAI copy: {r.ai_output}  (detail in the holes is invented)"
+            text += f"\nEnhanced copy: {r.ai_output}"
+            for d in r.report.enhanced:
+                text += f"\n  - {d}"
         self.report.setPlainText(text)
 
     def _open_output(self) -> None:
@@ -545,7 +571,11 @@ def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, a
     from PySide6.QtCore import QTimer
 
     log = open(shot.with_suffix(".txt"), "w", encoding="utf-8")  # noqa: SIM115
-    w.ai.setChecked(ai)
+    for cb in w.steps.values():
+        cb.setChecked(False)
+    if ai:
+        for k in ("burst", "ai", "deblock", "faces"):
+            w.steps[k].setChecked(True)
     w._set_inputs([src])
     w.outp.setText(str(out))
     w.outp.setModified(True)

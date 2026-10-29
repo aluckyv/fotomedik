@@ -82,17 +82,26 @@ def _grow(mask: np.ndarray, px: int) -> np.ndarray:
 # ----------------------------------------------------------------------------- engine
 
 
-class Engine:
-    """The two networks. Sessions are ONNX Runtime sessions or anything with the same
-    `run(None, {name: array})` / `get_inputs()` interface (the tests use stand-ins)."""
+ORT_DTYPES = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(int64)": np.int64,
+              "tensor(int32)": np.int32, "tensor(double)": np.float64}
 
-    def __init__(self, sr=None, inpaint=None, device: str = "CPU"):
+
+class Engine:
+    """The networks the chosen steps need. Sessions are ONNX Runtime sessions or anything
+    with the same `run(None, {name: array})` / `get_inputs()` interface (the tests use
+    stand-ins). face_det is the path of the YuNet model (OpenCV runs it)."""
+
+    def __init__(self, sr=None, inpaint=None, device: str = "CPU", deblock=None, face_det=None, face=None, sd=None):
         self.sr = sr
         self.inpaint_s = inpaint
         self.device = device
+        self.deblock_s = deblock
+        self.face_det = face_det
+        self.face_s = face
+        self.sd = sd
 
     @classmethod
-    def load(cls, progress=None, stop=None) -> "Engine":
+    def load(cls, progress=None, stop=None, steps=("ai",)) -> "Engine":
         import onnxruntime as ort
 
         from . import models
@@ -100,6 +109,7 @@ class Engine:
         avail = ort.get_available_providers()
         providers = [p for p in ("DmlExecutionProvider", "CUDAExecutionProvider") if p in avail]
         providers.append("CPUExecutionProvider")
+        used = {"v": "CPUExecutionProvider"}
 
         def session(model):
             path = models.ensure(model, progress, stop)
@@ -108,15 +118,30 @@ class Engine:
                 so.enable_mem_pattern = False
                 so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             try:
-                return ort.InferenceSession(str(path), sess_options=so, providers=providers)
+                s = ort.InferenceSession(str(path), sess_options=so, providers=providers)
             except Exception:  # the graphics card refused the model: use the processor
-                return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+                s = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            if hasattr(s, "get_providers") and s.get_providers()[0] != "CPUExecutionProvider":
+                used["v"] = s.get_providers()[0]
+            return s
 
-        sr = session(models.SR)
-        inp = session(models.INPAINT)
-        used = sr.get_providers()[0] if hasattr(sr, "get_providers") else "CPUExecutionProvider"
-        device = {"DmlExecutionProvider": "GPU (DirectML)", "CUDAExecutionProvider": "GPU (CUDA)"}.get(used, "CPU")
-        return cls(sr, inp, device)
+        eng = cls()
+        steps = set(steps)
+        if "ai" in steps:
+            eng.sr = session(models.SR)
+            eng.inpaint_s = session(models.INPAINT)
+        if "deblock" in steps:
+            eng.deblock_s = session(models.DEBLOCK)
+        if "faces" in steps:
+            eng.face_det = str(models.ensure(models.FACE_DET, progress, stop))
+            eng.face_s = session(models.FACE)
+        if "diffusion" in steps:
+            from .diffusion import Diffusion
+
+            eng.sd = Diffusion(session(models.SD_UNET), session(models.SD_VAE_ENC), session(models.SD_VAE_DEC),
+                               session(models.SD_TEXT))
+        eng.device = {"DmlExecutionProvider": "GPU (DirectML)", "CUDAExecutionProvider": "GPU (CUDA)"}.get(used["v"], "CPU")
+        return eng
 
     def enlarge4(self, tile: np.ndarray) -> np.ndarray:
         """float32 (h, w, 3) in 0..1 -> (4h, 4w, 3) in 0..1."""
@@ -194,6 +219,77 @@ def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known:
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)
 
 
+DEBLOCK_TILE = 512
+DEBLOCK_PAD = 16
+
+
+def deblock(arr: np.ndarray, engine: Engine) -> np.ndarray:
+    """Remove JPEG blocking and ringing from the whole picture (FBCNN), tile by tile."""
+    s = engine.deblock_s
+    name = s.get_inputs()[0].name
+    h, w = arr.shape[:2]
+    x = arr.astype(np.float32) / 255.0
+    out = np.empty_like(x)
+    p = DEBLOCK_PAD
+    padded = np.pad(x, ((p, p + DEBLOCK_TILE), (p, p + DEBLOCK_TILE), (0, 0)), mode="reflect")
+    for y in range(0, h, DEBLOCK_TILE):
+        for x0 in range(0, w, DEBLOCK_TILE):
+            th, tw = min(DEBLOCK_TILE, h - y), min(DEBLOCK_TILE, w - x0)
+            ph, pw = -(-(th + 2 * p) // 8) * 8, -(-(tw + 2 * p) // 8) * 8  # the network halves 3 times
+            tile = padded[y : y + ph, x0 : x0 + pw]
+            inp = np.ascontiguousarray(tile.transpose(2, 0, 1)[None], dtype=np.float32)
+            res = [r for r in s.run(None, {name: inp}) if getattr(r, "ndim", 0) == 4][0][0].transpose(1, 2, 0)
+            out[y : y + th, x0 : x0 + tw] = res[p : p + th, p : p + tw]
+    return np.clip(np.rint(out * 255.0), 0, 255).astype(np.uint8)
+
+
+def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
+                  burst=None, progress=None) -> tuple[np.ndarray, list[str]]:
+    """The enhanced copy, step by step. Returns (rgb, what was done).
+
+    burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots."""
+    steps = set(steps)
+    done: list[str] = []
+    real = arr.copy()
+    unknown = unknown & holes
+    if "burst" in steps and burst is not None and holes.any():
+        arr, filled = burst(arr, holes)
+        if filled.any():
+            done.append(f"similar shots: {100 * filled.sum() / max(1, holes.sum()):.0f} % of the holes")
+            real = np.where(filled[..., None], arr, real)
+            holes = holes & ~filled
+            unknown = unknown & ~filled
+    if "deblock" in steps and engine.deblock_s is not None:
+        arr = deblock(arr, engine)
+        real = arr.copy()  # the cleaned picture is the base from here on
+        done.append("JPEG blocks and noise removed")
+    if holes.any():
+        before = arr
+        if "diffusion" in steps and engine.sd is not None:
+            from .diffusion import diffusion_fill
+
+            arr = diffusion_fill(arr, holes, unknown, engine.sd, progress)
+            arr = keep_block_means(arr, before, holes, holes & ~unknown)
+            done.append("holes repainted (Stable Diffusion, follows the thumbnail)")
+        elif "ai" in steps and (engine.sr is not None or engine.inpaint_s is not None):
+            if unknown.any() and engine.inpaint_s is not None:
+                arr = inpaint_unknown(arr, unknown, engine)
+                done.append("unknown holes filled (LaMa)")
+            if engine.sr is not None:
+                filled_arr = arr
+                arr = sharpen_holes(arr, holes, engine, progress)
+                arr = keep_block_means(arr, filled_arr, holes, holes & ~unknown)
+                done.append("holes sharpened (Real-ESRGAN)")
+        arr = np.where(holes[..., None], arr, real)
+    if "faces" in steps and engine.face_s is not None:
+        from .faces import restore_faces
+
+        arr, n = restore_faces(arr, engine)
+        if n:
+            done.append(f"{n} face(s) restored (GFPGAN)")
+    return arr, done
+
+
 def enhance(img: Image.Image, holes: np.ndarray, unknown: np.ndarray, engine: Engine, progress=None) -> Image.Image:
     """AI copy: unknown holes filled (LaMa), all holes sharpened (Real-ESRGAN).
     Pixels outside `holes` are returned unchanged."""
@@ -210,14 +306,29 @@ def enhance(img: Image.Image, holes: np.ndarray, unknown: np.ndarray, engine: En
     return Image.fromarray(arr)
 
 
+def photo_masks(data: bytes, holes, unknown) -> tuple[np.ndarray, np.ndarray]:
+    """Pixel masks (holes, unknown holes) of a repaired JPEG from its MCU ranges."""
+    geo = mcu_geometry(data)
+    hm = mcu_mask(holes, geo) if holes else np.zeros((geo[4], geo[3]), dtype=bool)
+    um = mcu_mask(unknown, geo) if unknown else np.zeros_like(hm)
+    return hm, um
+
+
+def save_jpeg(arr: np.ndarray, exif: bytes | None) -> bytes:
+    buf = io.BytesIO()
+    kw = {"quality": 95, "subsampling": 0}
+    if exif:
+        kw["exif"] = exif
+    Image.fromarray(arr).save(buf, "JPEG", **kw)
+    return buf.getvalue()
+
+
 def enhance_file(data: bytes, holes, unknown, engine: Engine, progress=None) -> bytes | None:
     """JPEG bytes of the AI copy of a repaired file, or None when it has no holes.
     holes/unknown: MCU ranges. EXIF is kept."""
     if not holes:
         return None
-    geo = mcu_geometry(data)
-    hm = mcu_mask(holes, geo)
-    um = mcu_mask(unknown, geo) if unknown else np.zeros_like(hm)
+    hm, um = photo_masks(data, holes, unknown)
     img = Image.open(io.BytesIO(data))
     exif = img.info.get("exif")
     out = enhance(img, hm, um, engine, progress)

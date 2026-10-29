@@ -310,7 +310,7 @@ def scan(path: Path, lang: str):
 
 
 def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
-                jobs: int = 0, reports: bool = False, ai: bool = False):
+                jobs: int = 0, reports: bool = False, enhance: str = ""):
     if path.is_dir() and out.resolve() == path.resolve():
         raise click.ClickException("output folder must differ from the input folder (originals are never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
@@ -325,8 +325,9 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
             options["ref_candidates"], options["thumb_refs"] = _learn_candidates(files, click.echo, jobs, workers)
         work = [(str(p), str(rel), str(out), options, profile) for p, rel in files]
         results = workers.map(_repair_file, work, cost=lambda it: os.path.getsize(it[0]), counted=True)
-    if ai:
-        from .ai.run import run_ai
+    steps = [x.strip() for x in enhance.split(",") if x.strip()]
+    if steps:
+        from .ai.run import run_extras
 
         def ai_done(rep: FileReport) -> None:
             if reports_wanted:  # the report was written before the AI copy existed
@@ -335,9 +336,10 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
                     rp.write_text(rep.to_json(), encoding="utf-8")
 
         reports_wanted = reports
-        device = run_ai([rep for rep, _s in results], out, click.echo, on_done=ai_done)
+        device = run_extras([(rep, files[i][0]) for i, (rep, _s) in enumerate(results)], out, steps, click.echo,
+                            on_done=ai_done)
         if device:
-            click.echo(f"[ai] copies made on {device}")
+            click.echo(f"[enhance] networks ran on {device}")
     reports: list[FileReport] = []
     for rep, secs in results:
         reports.append(rep)
@@ -358,12 +360,15 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 @click.option("--thorough", is_flag=True, help="search much longer for flipped bits (60 s per file)")
 @click.option("--jobs", default=0, show_default="all CPU cores", help="files repaired in parallel")
 @click.option("--reports", is_flag=True, help="also write a .report.json next to every repaired photo")
-@click.option("--ai", is_flag=True, help="also make an AI copy (_ai.jpg): holes sharpened and filled (invented detail)")
+@click.option("--ai", is_flag=True, help="same as --enhance burst,ai")
+@click.option("--enhance", default="", help="enhanced copy (_enhanced.jpg) with these steps, comma separated: "
+              "burst (similar shots), deblock (JPEG clean-up), ai (sharpen and fill), diffusion (max quality), "
+              "faces. Network steps invent detail.")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, lang):
+def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, lang):
     """Repair a file or folder into OUT (--reports: a .report.json per file too)."""
     _fix_common(path, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
-                auto_ref=False, jobs=jobs, reports=reports, ai=ai)
+                auto_ref=False, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""))
 
 
 @main.command()
@@ -389,12 +394,15 @@ def learn(good: Path, out: Path):
 @click.option("--thorough", is_flag=True, help="search much longer for flipped bits (60 s per file)")
 @click.option("--jobs", default=0, show_default="all CPU cores", help="files repaired in parallel")
 @click.option("--reports", is_flag=True, help="also write a .report.json next to every repaired photo")
-@click.option("--ai", is_flag=True, help="also make an AI copy (_ai.jpg): holes sharpened and filled (invented detail)")
+@click.option("--ai", is_flag=True, help="same as --enhance burst,ai")
+@click.option("--enhance", default="", help="enhanced copy (_enhanced.jpg) with these steps, comma separated: "
+              "burst (similar shots), deblock (JPEG clean-up), ai (sharpen and fill), diffusion (max quality), "
+              "faces. Network steps invent detail.")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, lang):
+def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
     reps = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
-                       auto_ref=True, jobs=jobs, reports=reports, ai=ai)
+                       auto_ref=True, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""))
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])

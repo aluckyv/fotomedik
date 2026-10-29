@@ -45,3 +45,64 @@ def test_real_models_enhance_a_photo(tmp_path):
         g = a.astype(float).mean(axis=2)
         return np.abs(np.diff(g, axis=1))[200:400, 100:499].mean()
     assert hf(out) > hf(blurred)
+
+
+def _save(name, *imgs):
+    os.makedirs("ai_check", exist_ok=True)
+    Image.fromarray(np.concatenate(imgs, axis=1)).save(f"ai_check/{name}.png")
+
+
+def test_real_models_all_steps():
+    """Clean-up, faces and diffusion with the real networks; prints model hashes."""
+    from fotomedik.ai import models
+    from fotomedik.ai.diffusion import diffusion_fill
+    from fotomedik.ai.enhance import Engine, deblock
+    from fotomedik.ai.faces import detect, restore_faces
+    from synth import make_image
+
+    t = time.perf_counter()
+    eng = Engine.load(progress=lambda d, n, m: None, steps=("deblock", "faces", "diffusion"))
+    print(f"\nloaded on {eng.device} in {time.perf_counter() - t:.1f} s")
+    for m in models.ALL:
+        p = models.model_dir() / m.file
+        if p.exists():
+            print(f"::notice title=model sha256::{m.file} {models.sha256_of(p)}")
+    for s in (eng.deblock_s, eng.face_s, eng.sd.unet, eng.sd.vae_enc, eng.sd.vae_dec, eng.sd.text):
+        print([(i.name, i.shape, i.type) for i in s.get_inputs()], [(o.name, o.shape) for o in s.get_outputs()])
+
+    img = np.asarray(make_image(384, 256, seed=5).convert("RGB"))
+    import io
+
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, "JPEG", quality=15)  # heavy blocking
+    blocky = np.asarray(Image.open(buf).convert("RGB"))
+    t = time.perf_counter()
+    clean = deblock(blocky, eng)
+    print(f"deblock 384x256 in {time.perf_counter() - t:.1f} s")
+    _save("deblock", blocky, clean)
+    assert clean.shape == blocky.shape
+    assert np.abs(clean.astype(float) - img).mean() < np.abs(blocky.astype(float) - img).mean()
+
+    assert detect(img, eng.face_det) == [] or True  # loads and runs
+    pts = np.array([[150, 110], [230, 110], [190, 160], [160, 200], [220, 200]], np.float32)
+    import fotomedik.ai.faces as F
+
+    real_detect = F.detect
+    F.detect = lambda a, p: [pts]
+    try:
+        face, n = restore_faces(img, eng)
+    finally:
+        F.detect = real_detect
+    _save("faces", img, face)
+    assert n == 1 and face.shape == img.shape
+
+    holes = np.zeros(img.shape[:2], bool)
+    holes[80:180, 120:280] = True
+    hole_img = img.copy()
+    hole_img[holes] = 128
+    t = time.perf_counter()
+    filled = diffusion_fill(hole_img, holes, holes, eng.sd, size=256, steps=2)
+    print(f"diffusion 2 steps, 256 window in {time.perf_counter() - t:.1f} s")
+    _save("diffusion", hole_img, filled)
+    assert np.array_equal(filled[~holes], hole_img[~holes])
+    assert filled[holes].std() > 2

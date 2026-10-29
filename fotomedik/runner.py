@@ -51,7 +51,8 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
         on_result=None, on_status=None, stop: threading.Event | None = None, on_ai=None) -> list[Result]:
     """Repair everything under `paths` into `out`. Originals are never written.
     on_result(Result) is called as each photo finishes; on_status(str) for phases.
-    With options["ai"], an "_ai" copy of every photo with holes follows (on_ai(Result))."""
+    options["enhance"] (steps, see ai.run) adds an enhanced copy of every repaired photo
+    after the repairs (on_ai(Result) as each is made); options["ai"] means ["ai"]."""
     out.mkdir(parents=True, exist_ok=True)
     for p in paths:
         if p.is_dir() and p.resolve() == out.resolve():
@@ -119,10 +120,11 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
                     except Exception as e:  # one bad file must not stop the batch
                         rep, secs = failed(i, e)
                     done(i, rep, secs)
-    if options.get("ai") and results and not (stop is not None and stop.is_set()):
+    steps = list(options.get("enhance") or (["ai"] if options.get("ai") else []))
+    if steps and results and not (stop is not None and stop.is_set()):
         by_rep = {id(r.report): r for r in results}
-        from .ai.run import run_ai
+        from .ai.run import run_extras
 
-        run_ai([r.report for r in results], out, say, stop,
-               on_done=(lambda rep: on_ai(by_rep[id(rep)])) if on_ai else None)
+        run_extras([(r.report, r.source) for r in results], out, steps, say, stop,
+                   on_done=(lambda rep: on_ai(by_rep[id(rep)])) if on_ai else None)
     return results
