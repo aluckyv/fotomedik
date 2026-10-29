@@ -151,3 +151,19 @@ def garbage_ranges(stats: list[ClusterStat]) -> list[tuple[int, int]]:
         else:
             ranges.append((s.offset, s.offset + s.length))
     return ranges
+
+
+def last_broken_stuffing(data: bytes, lo: int, hi: int) -> int | None:
+    """Offset of the last FF in [lo, hi) not followed by 00, a marker byte or FF.
+
+    In entropy-coded data every FF is followed by 00 (stuffing) or a marker, so a
+    broken pair is a certain point of damage: intact data can only resume after it.
+    """
+    p = hi - 1
+    while True:
+        p = data.rfind(b"\xff", lo, p)
+        if p < 0:
+            return None
+        n = data[p + 1]
+        if not (n == 0x00 or 0xD0 <= n <= 0xD9 or n == 0xFF):
+            return p

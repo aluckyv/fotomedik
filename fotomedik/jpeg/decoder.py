@@ -146,7 +146,8 @@ def _hamming(a: int, b: int) -> int:
 _POP = np.array([bin(i).count("1") for i in range(256)], dtype=np.int8)
 
 
-def _marker_candidates(data: bytes, start: int, end: int, expected: int, max_ham: int = 1) -> list[tuple[int, int, bool]]:
+def _marker_candidates(data: bytes, start: int, end: int, expected: int, max_ham: int = 1,
+                       fuzzy_end: int | None = None) -> list[tuple[int, int, bool]]:
     """RST-like byte pairs in [start, end): (n, offset, fuzzy), sorted by offset.
 
     Exact FF Dn markers are always listed; pairs within `max_ham` flipped bits of
@@ -162,8 +163,9 @@ def _marker_candidates(data: bytes, start: int, end: int, expected: int, max_ham
         if 0xD0 <= n <= 0xD7:
             out.append((n - 0xD0, p, False))
         p += 1
-    if end - start > 2:
-        arr = np.frombuffer(data, dtype=np.uint8)[start:end]
+    fend = end if fuzzy_end is None else min(end, fuzzy_end)
+    if fend - start > 2:
+        arr = np.frombuffer(data, dtype=np.uint8)[start:fend]
         h = _POP[arr[:-1] ^ 0xFF].astype(np.int16) + _POP[arr[1:] ^ (0xD0 + expected)]
         for i in np.flatnonzero(h <= max_ham):
             off = start + int(i)
@@ -366,7 +368,10 @@ def decode_scan(
             # Candidates in file order. A damaged look-alike must prove itself over the
             # whole next interval (measured on real photos: random positions in Huffman
             # data often decode 8+ MCUs cleanly, so short probes accept fakes).
-            for n, moff, fuzzy in _marker_candidates(data, search_from, end, k % 8, max_ham=FUZZY_RST_BITS):
+            # markers further than ~26 intervals cannot be matched to a sequence number anyway
+            horizon = min(end, int(iv.byte_start + 26 * avg * 1.6) + 2)
+            for n, moff, fuzzy in _marker_candidates(data, search_from, horizon, k % 8, max_ham=FUZZY_RST_BITS,
+                                                     fuzzy_end=int(iv.byte_start + 2.5 * avg) + 2):
                 dist = moff - iv.byte_start
                 spans_est = max(1.0, dist / avg)
                 if fuzzy:

@@ -23,12 +23,14 @@ import numpy as np
 
 from ..jpeg import decoder as D
 from ..jpeg import kernel as K
+from ..scan.garbage import last_broken_stuffing
 from .base import Context, Recipe
 from .r9_holes import decode_for
 from .registry import register
 
-DROP_FIRST = 1  # first MCU of a tail may be junk that merely ended on a true boundary
+DROP_FIRST = 3  # first MCUs of a tail may be junk that resynchronised onto the true parse
 GIVE_UP = 512  # bytes scanned past the last convergent start before stopping
+MAX_HEAD = 6  # MCUs a start may take to land on the reference parse
 MIN_TAIL = 2  # MCUs worth splicing
 ANOMALY_LEVELS = 96  # gray levels: leading tail MCUs this far off their neighbours are dropped
 MAX_TRIM = 8
@@ -84,10 +86,57 @@ def _left_offsets(sr: D.ScanResult, ft, first_mcu: int, dc_rel: np.ndarray) -> d
     return out
 
 
+def find_interval_start(data: bytes, pk: K.Packed, lo: int, hi: int, mpos: int, count: int,
+                        known: list[int], prev_marker: int | None = None) -> int | None:
+    """Byte offset where a whole interval ending at `mpos` starts, or None.
+
+    An interval starts on a byte boundary right after the previous marker, with all
+    DC predictors at 0, and holds exactly `count` MCUs. Candidates are byte offsets
+    in [lo, hi); each is decoded a few MCUs until it lands on the reference parse
+    `known` (MCU start bits of the tail, ending at mpos), which fixes its MCU count.
+    Every candidate passing a full decode with all checks on is collected. Junk that
+    starts inside the first true MCU can pass too, so the winner is the one preceded
+    by the most marker-like byte pair (the previous interval's damaged RST), then the
+    earliest.
+    """
+    if not known:
+        return None
+    rem = {b: len(known) - i for i, b in enumerate(known)}
+    found: list[tuple[int, int]] = []
+    for s in range(lo, hi):
+        preds = np.zeros(pk.ncomp, dtype=np.int32)
+        n, err, _eb, _ebit, _mk, end_b, end_bit, bits, _dc = K.decode_mcus(data, s, 0, mpos + 2, pk, preds, 8)
+        total = None
+        for i in range(1, len(bits)):
+            if int(bits[i]) in rem:
+                total = i + rem[int(bits[i])]
+                break
+        if total is None and err is None:
+            e = end_b * 8 + end_bit
+            if e in rem:
+                total = n + rem[e]
+        if total != count:
+            continue
+        preds = np.zeros(pk.ncomp, dtype=np.int32)
+        n, err, _eb, _ebit, _mk, end_b, end_bit, _bits, _dc = K.decode_mcus(data, s, 0, mpos + 2, pk, preds, count)
+        if n == count and err is None:
+            a, pad = K.py_aligned_end(data, len(data), end_b, end_bit)
+            if a == mpos and pad:
+                if s >= 2 and prev_marker is not None:
+                    ham = bin(data[s - 2] ^ 0xFF).count("1") + bin(data[s - 1] ^ prev_marker).count("1")
+                else:
+                    ham = 16
+                found.append((ham, s))
+    if not found:
+        return None
+    found.sort()
+    return found[0][1]
+
+
 @register
 class TailRecovery(Recipe):
     name = "tail_recovery"
-    priority = 55  # after bit-flip repair, before hole filling
+    priority = 45  # before bit-flip repair: it tells R5 where damage is small enough to be worth it
     description = "Recover the intact end of an interval after a rotted stretch by resynchronising on its marker"
 
     def _spans(self, sr: D.ScanResult, parse) -> list[tuple[D.Interval, int, int]]:
@@ -126,17 +175,36 @@ class TailRecovery(Recipe):
             while j >= iv.index:
                 first_of_j = j * dri if dri else iv.mcu_first
                 count_j = min(dri, total - first_of_j) if dri else total - iv.mcu_first
+                if count_j <= 0:
+                    j -= 1
+                    continue
                 lo = iv.byte_start
-                n, start_bit, bits = K.tail_scan(data, lo, mpos, pk, count_j, GIVE_UP)
+                bad = last_broken_stuffing(data, lo, mpos)
+                if bad is not None:
+                    lo = bad + 2  # certain damage: intact data resumes after it
+                n, start_bit, bits = K.tail_scan(data, lo, mpos, pk, count_j, GIVE_UP, MAX_HEAD)
                 if n < MIN_TAIL + DROP_FIRST:
                     break
-                full = n == count_j and dri and start_bit % 8 == 0 and j > iv.index
+                full = False
+                if dri and j > iv.index:
+                    # a later interval of the span may be intact from its very start
+                    avg = max(64, (iv.byte_end or mpos) - iv.byte_start) / max(1, last - iv.index + 1)
+                    # the true start may lie a few MCUs inside the found tail (junk head)
+                    hi_s = bits[min(len(bits) - 1, DROP_FIRST + MAX_HEAD)] // 8 + 1
+                    s0 = find_interval_start(data, pk, max(lo, int(mpos - 2.5 * avg)), min(mpos, hi_s),
+                                             mpos, count_j, bits, 0xD0 + ((j - 1) % 8))
+                    if s0 is not None:
+                        full = True
+                        n, start_bit = count_j, s0 * 8
+                        preds = np.zeros(pk.ncomp, dtype=np.int32)
+                        bits = [int(b) for b in K.decode_mcus(data, s0, 0, mpos + 2, pk, preds, count_j)[7]]
                 drop = 0 if full else DROP_FIRST
                 n_tail = n - drop
                 s_bit = bits[drop]
                 first_tail = first_of_j + count_j - n_tail
                 preds = np.zeros(pk.ncomp, dtype=np.int32)
-                dn, err, *_rest, end_b, end_bit, _bs, dc_rel = K.decode_mcus(data, s_bit // 8, s_bit % 8, mpos + 2, pk, preds, n_tail)
+                dn, err, *_rest, end_b, end_bit, _bs, dc_rel = K.decode_mcus(data, s_bit // 8, s_bit % 8, mpos + 2, pk, preds,
+                                                                             n_tail, check_dc=False)
                 if dn != n_tail or err is not None:
                     break
                 if full:
@@ -176,6 +244,23 @@ class TailRecovery(Recipe):
                     base = dc_rel[trim - 1][[sum(h * v for h, v in pk.hv[:i + 1]) - 1 for i in range(pk.ncomp)]]
                     delta = {cid: delta[cid] + float(base[i]) for i, cid in enumerate(pk.cids)}
                     dc_rel = dc_rel_t - base[np.repeat(np.arange(pk.ncomp), [h * v for h, v in pk.hv])]
+                # keep every spliced DC inside the legal range (|DC*q| <= 1024+q): a bad
+                # neighbour estimate must not produce a file decoders reject
+                ok = True
+                col = 0
+                for ci, cid in enumerate(pk.cids):
+                    q = pk.qdc[ci]
+                    lim = (1024 + q) // q
+                    nb_c = pk.hv[ci][0] * pk.hv[ci][1]
+                    rel = dc_rel[:, col : col + nb_c]
+                    lo_d, hi_d = -lim - int(rel.min()), lim - int(rel.max())
+                    if lo_d > hi_d:
+                        ok = False
+                        break
+                    delta[cid] = float(min(max(delta[cid], lo_d), hi_d))
+                    col += nb_c
+                if not ok:
+                    break
                 tails[j] = {
                     "start_bit": int(s_bit),
                     "end_bit": int(end_b * 8 + end_bit),

@@ -139,7 +139,7 @@ def _py_symbol(br: BitReader, t: HuffmanTable, fast: list[int]) -> int:
     raise _Bad(1)
 
 
-def _py_mcu(br: BitReader, pk: Packed, preds: list[int], dc: list[int]) -> None:
+def _py_mcu(br: BitReader, pk: Packed, preds: list[int], dc: list[int], check_dc: bool = True) -> None:
     """Decode one MCU, appending its DC values; raises _Bad / MarkerHit / EOFError."""
     for ci, (h, v, dc_t, ac_t, dc_fast, ac_fast, q) in enumerate(pk.py):
         for _ in range(h * v):
@@ -149,7 +149,7 @@ def _py_mcu(br: BitReader, pk: Packed, preds: list[int], dc: list[int]) -> None:
             diff = br.receive_extend(s0)
             preds[ci] += diff
             dcv = preds[ci]
-            if abs(dcv * q) > 1024 + q:
+            if check_dc and abs(dcv * q) > 1024 + q:
                 raise _Bad(3)
             k = 1
             while k < 64:
@@ -172,7 +172,7 @@ def _py_mcu(br: BitReader, pk: Packed, preds: list[int], dc: list[int]) -> None:
 
 
 def py_run_decode(data, start_byte: int, start_bit: int, end: int, pk: Packed, max_mcus: int,
-                  preds: list[int], want_bits: bool = True):
+                  preds: list[int], want_bits: bool = True, check_dc: bool = True):
     """Returns (n, err, err_byte, err_bit, marker, end_byte, end_bit, bitstarts, dc_flat)."""
     br = BitReader(data, start_byte, end)
     bitstarts: list[int] = []
@@ -188,7 +188,7 @@ def py_run_decode(data, start_byte: int, start_bit: int, end: int, pk: Packed, m
             if want_bits:
                 o, b = br.tell()
                 bitstarts.append(o * 8 + b)
-            _py_mcu(br, pk, preds, dc)
+            _py_mcu(br, pk, preds, dc, check_dc)
             n += 1
     except _Bad as e:
         err = e.code
@@ -246,8 +246,10 @@ def py_roughness(dc, nblocks: int, up_v, dn_v, left_k, w) -> float:
 # --------------------------------------------------------------------------- public API
 
 
-def decode_mcus(data, start_byte: int, start_bit: int, end: int, pk: Packed, preds: np.ndarray, max_mcus: int):
+def decode_mcus(data, start_byte: int, start_bit: int, end: int, pk: Packed, preds: np.ndarray, max_mcus: int,
+                check_dc: bool = True):
     """Decode up to max_mcus MCUs. `preds` (int32[ncomp]) is updated in place.
+    check_dc=False skips the DC range test (for data whose predictor is unknown).
 
     Returns (n, err_name, err_byte, err_bit, marker, end_byte, end_bit, bitstarts[n], dc[n, bpm]).
     """
@@ -262,12 +264,13 @@ def decode_mcus(data, start_byte: int, start_bit: int, end: int, pk: Packed, pre
         n = int(lib.decode_mcus(
             _ptr(arr), start_byte, start_bit, end, pk.c_comps, pk.ncomp,
             _ptr(pk.fast), _ptr(pk.maxcode), _ptr(pk.valptr), _ptr(pk.mincode), _ptr(pk.symbols),
-            max_mcus, _ptr(preds), _ptr(bitstarts), _ptr(dc_vals), _ptr(out),
+            max_mcus, _ptr(preds), _ptr(bitstarts), _ptr(dc_vals), _ptr(out), 1 if check_dc else 0,
         ))
         return (n, ERR_NAMES[int(out[0])], int(out[1]), int(out[2]), int(out[3]), int(out[4]), int(out[5]),
                 bitstarts[:n], dc_vals[: n * bpm].reshape(n, bpm))
     p = [int(x) for x in preds]
-    n, err, eb, ebit, marker, end_b, end_bit, bits, dc = py_run_decode(data, start_byte, start_bit, end, pk, max_mcus, p)
+    n, err, eb, ebit, marker, end_b, end_bit, bits, dc = py_run_decode(data, start_byte, start_bit, end, pk, max_mcus, p,
+                                                                       check_dc=check_dc)
     preds[:] = p
     return (n, ERR_NAMES[err], eb, ebit, marker, end_b, end_bit,
             np.asarray(bits, dtype=np.int64), np.asarray(dc, dtype=np.int32).reshape(n, bpm))
@@ -366,7 +369,7 @@ def eval_flips(buf: np.ndarray, start_byte: int, start_bit: int, end: int, pk: P
     return res_dec, res_complete.astype(bool), res_pad.astype(bool), res_rough
 
 
-def py_tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give_up: int):
+def py_tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give_up: int, max_head: int = 3):
     """Reference for the C tail_scan (see _fastdec.c). Returns (n, start_bit, mcu_start_bits)."""
     length = len(data)
     known: list[int] = []
@@ -392,6 +395,8 @@ def py_tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give
             n, total, q, spliced = 0, -1, 0, False
             trial: list[int] = []
             while n < max_mcus:
+                if known and n > max_head:
+                    break  # garbage until it happened to resync
                 eb, ebit = br.tell()
                 pos = eb * 8 + ebit
                 trial.append(pos)
@@ -402,7 +407,7 @@ def py_tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give
                         total, spliced = n + (len(known) - q), True
                         break
                 try:
-                    _py_mcu(br, pk, preds, dc)
+                    _py_mcu(br, pk, preds, dc, check_dc=False)  # predictor unknown: no DC range test
                 except (_Bad, MarkerHit, EOFError):
                     break
                 n += 1
@@ -424,12 +429,12 @@ def py_tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give
     return best_n, best_bit, known
 
 
-def tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give_up: int = 512):
+def tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give_up: int = 512, max_head: int = 3):
     """Longest decodable tail ending exactly at marker_pos: (n_mcus, start_bit, mcu_start_bits)."""
     lib = fastdec.load()
     if lib is None:
         return py_tail_scan(memoryview(as_array(data)).cast("B") if isinstance(data, np.ndarray) else data,
-                            lo, marker_pos, pk, max_mcus, give_up)
+                            lo, marker_pos, pk, max_mcus, give_up, max_head)
     arr = as_array(data)
     known = np.zeros(max_mcus + 1, dtype=np.int64)
     trial = np.zeros(max_mcus + 1, dtype=np.int64)
@@ -437,6 +442,6 @@ def tail_scan(data, lo: int, marker_pos: int, pk: Packed, max_mcus: int, give_up
     n = int(lib.tail_scan(
         _ptr(arr), len(arr), lo, marker_pos, pk.c_comps, pk.ncomp,
         _ptr(pk.fast), _ptr(pk.maxcode), _ptr(pk.valptr), _ptr(pk.mincode), _ptr(pk.symbols),
-        max_mcus, give_up, _ptr(best), _ptr(known), _ptr(trial),
+        max_mcus, give_up, max_head, _ptr(best), _ptr(known), _ptr(trial),
     ))
     return n, int(best[0]), [int(x) for x in known[:n]]

@@ -45,15 +45,33 @@ PER_OUTCOME = 3  # equivalent-looking flips explored per outcome
 MAX_EXPANSIONS = 40  # search nodes per interval
 ENOUGH_COMPLETE = 8  # stop widening once this many *distinct* complete outcomes exist
 CHUNK = 64  # offsets per kernel call in the wider windows
-PER_INTERVAL_MIN = 0.5  # seconds; each failed interval gets at least this much of the budget
-PER_INTERVAL_MAX = 20.0
-DEFAULT_TIME_BUDGET = 60.0  # seconds per file
+PER_INTERVAL_MIN = 0.1  # seconds; each failed interval gets at least this much of the budget
+PER_INTERVAL_MAX = 1.0
+DEFAULT_TIME_BUDGET = 5.0  # seconds per file ("thorough" mode raises it)
+SMALL_DAMAGE = 600  # bytes between the detection point and a recovered tail worth a flip search
 ANOMALY_LEVELS = 64
 
 _ONE_BIT = np.array([1 << b for b in range(8)], dtype=np.uint8)
 _TWO_BIT = np.array([(1 << a) | (1 << b) for a in range(8) for b in range(a + 1, 8)], dtype=np.uint8)
 
 REPAIRABLE = ("bad_huffman", "coef_overflow", "dc_range", "unexpected_marker", "bad_rst")
+ROT_WINDOW = 2048  # bytes after the detection point inspected for dense damage
+ROT_BAD_FF = 2  # broken FF-stuffing pairs in that window that mark a rotted stretch
+
+
+def rotted(data: bytes, lo: int, hi: int) -> bool:
+    """Dense damage (several broken FF00 stuffing pairs close together) cannot be undone by
+    flipping a few bits; R10/R9 deal with it. Isolated flips leave at most one."""
+    bad = 0
+    p = data.find(b"\xff", lo, hi)
+    while 0 <= p < hi - 1:
+        n = data[p + 1]
+        if not (n == 0x00 or 0xD0 <= n <= 0xD9 or n == 0xFF):
+            bad += 1
+            if bad >= ROT_BAD_FF:
+                return True
+        p = data.find(b"\xff", p + 1, hi)
+    return False
 
 
 # --------------------------------------------------------------------------- smoothness
@@ -426,7 +444,9 @@ class BitFlipRepair(Recipe):
     priority = 50
     description = "Undo flipped bits in scan data by trial decoding up to the next restart marker"
 
-    def _candidates(self, sr: D.ScanResult, attempted: set[int]) -> list[D.Interval]:
+    def _candidates(self, sr: D.ScanResult, attempted: set[int], data: bytes | None = None,
+                    rot: set[int] | None = None, tails: dict | None = None,
+                    thorough: bool = False) -> list[D.Interval]:
         out = []
         for iv in sr.intervals:
             if iv.ok or iv.error is None or iv.error.reason not in REPAIRABLE:
@@ -435,6 +455,31 @@ class BitFlipRepair(Recipe):
                 continue
             if iv.byte_end is not None and iv.byte_end <= iv.byte_start and iv.resync_at is None:
                 continue
+            if tails is not None and iv.index not in tails and not thorough:
+                # no intact tail found: the damage runs (nearly) to the marker - rot, or
+                # several flips; a long search rarely pays off outside thorough mode
+                attempted.add(iv.index)
+                if rot is not None:
+                    rot.add(iv.index)
+                continue
+            if tails is not None and iv.index in tails:
+                # R10 found where intact data resumes: a long damaged stretch before it is rot
+                gap = tails[iv.index]["start_bit"] // 8 - iv.error.byte_offset
+                if gap > SMALL_DAMAGE:
+                    attempted.add(iv.index)
+                    if rot is not None:
+                        rot.add(iv.index)
+                    continue
+            if data is not None:
+                lo = max(iv.byte_start, iv.error.byte_offset - 64)
+                hi = min(len(data), iv.error.byte_offset + ROT_WINDOW)
+                if iv.resync_at is not None:
+                    hi = min(hi, iv.resync_at)
+                if rotted(data, lo, hi):
+                    attempted.add(iv.index)
+                    if rot is not None:
+                        rot.add(iv.index)
+                    continue
             out.append(iv)
         return out
 
@@ -443,7 +488,8 @@ class BitFlipRepair(Recipe):
         if got is None:
             return None
         attempted = ctx.memo.setdefault("bitflip_attempted", set())
-        return got if self._candidates(got[2], attempted) else None
+        thorough = float(ctx.options.get("time_budget", DEFAULT_TIME_BUDGET)) >= 30
+        return got if self._candidates(got[2], attempted, ctx.data, None, ctx.memo.get("tails"), thorough) else None
 
     def fix(self, ctx: Context, got) -> None:
         parse, ft, sr = got
@@ -457,11 +503,14 @@ class BitFlipRepair(Recipe):
         notes: dict[str, int] = {}
         skipped_for_time = 0
         stats: dict = {}
+        rotted_total = 0
         t0 = time.monotonic()
         # Repairing an interval can expose the next one (its marker was not trusted
         # before), so re-decode and continue until nothing new appears.
         while time.monotonic() <= deadline:
-            cands = self._candidates(sr, attempted)
+            rot: set[int] = set()
+            cands = self._candidates(sr, attempted, bytes(buf), rot, ctx.memo.get("tails"), budget >= 30)
+            rotted_total += len(rot)
             if not cands:
                 break
             remaining = deadline - time.monotonic()
@@ -476,6 +525,8 @@ class BitFlipRepair(Recipe):
                 all_flips += [[o, m] for o, m in flips]
                 if ok:
                     repaired += 1
+                    if ctx.memo.get("tails"):
+                        ctx.memo["tails"].pop(iv.index, None)
                 else:
                     unrepaired += 1
                     notes[note] = notes.get(note, 0) + 1
@@ -486,6 +537,8 @@ class BitFlipRepair(Recipe):
             msg += " (" + ", ".join(f"{k}: {v}" for k, v in notes.items()) + ")"
         if skipped_for_time:
             msg += f"; {skipped_for_time} skipped: time budget {budget:.0f}s exhausted"
+        if rotted_total:
+            msg += f"; {rotted_total} left to tail recovery (densely damaged)"
         extra = dict(repaired=repaired, unrepaired=unrepaired, candidates=stats.get("candidates", 0),
                      seconds=round(time.monotonic() - t0, 2))
         if all_flips:

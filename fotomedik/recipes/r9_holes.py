@@ -22,6 +22,7 @@ import math
 import numpy as np
 
 from ..jpeg import decoder as D
+from ..jpeg import kernel as K
 from ..jpeg import markers as M
 from ..jpeg.encoder import BitWriter, encode_flat_mcus, gray_dc
 from ..jpeg.tables import FrameTables, TableError
@@ -224,6 +225,41 @@ class FillHoles(Recipe):
                 out[cid] = 0 if math.isnan(val) else int(val)
             return out
 
+        pk = K.packed_for(ft)
+
+        def build_interval(iv, keep, tail, reason, preds_in):
+            """Entropy bytes of one rebuilt interval: kept prefix + fill + spliced tail."""
+            w = BitWriter()
+            prefix = b""
+            p_ = preds_in
+            if keep > 0:
+                cut = mcu_info[iv.mcu_first + keep]
+                off, bit = divmod(cut.bit_start, 8)
+                prefix = data[iv.byte_start : off]
+                if prefix.endswith(b"\xff"):
+                    prefix += b"\x00"
+                if bit:
+                    w.put_bits(data[off] >> (8 - bit), bit)
+                p_ = last_block_preds(iv.mcu_first + keep - 1)
+            n_tail = tail["n"] if tail is not None else 0
+            gap = iv.mcu_count - keep - n_tail
+            hole = None
+            if gap > 0:
+                override = tail["delta"] if tail is not None else None
+                encode_flat_mcus(ft, gap, {}, p_, fill_targets(iv.mcu_first + keep, gap, override), writer=w)
+                hole = Hole(iv.mcu_first + keep, gap, reason)
+            if tail is not None:
+                _stream_bits(w, data, tail["start_bit"], tail["end_bit"])
+            return prefix + w.finish(), n_tail, hole
+
+        def interval_ok(piece, iv) -> bool:
+            if not dri:
+                return True  # checked with the whole file below
+            buf = piece + b"\xff\xd9"
+            pr = np.zeros(pk.ncomp, dtype=np.int32)
+            n, err, *_ = K.decode_mcus(buf, 0, 0, len(buf), pk, pr, iv.mcu_count)
+            return n == iv.mcu_count and err is None
+
         # ---------------------------------------------------------------- pass 2: build
         pieces: list[bytes] = []
         holes: list[Hole] = []
@@ -239,28 +275,16 @@ class FillHoles(Recipe):
                     preds = last_block_preds(iv.mcu_first + iv.mcu_count - 1)
             else:
                 pl = plan[iv.index]
-                keep, tail, reason = pl["keep"], pl["tail"], pl["reason"]
-                w = BitWriter()
-                prefix = b""
-                if keep > 0:
-                    cut = mcu_info[iv.mcu_first + keep]
-                    off, bit = divmod(cut.bit_start, 8)
-                    prefix = data[iv.byte_start : off]
-                    if prefix.endswith(b"\xff"):
-                        prefix += b"\x00"
-                    if bit:
-                        w.put_bits(data[off] >> (8 - bit), bit)
-                    preds = last_block_preds(iv.mcu_first + keep - 1)
-                n_tail = tail["n"] if tail is not None else 0
-                gap = iv.mcu_count - keep - n_tail
-                if gap > 0:
-                    override = tail["delta"] if tail is not None else None
-                    encode_flat_mcus(ft, gap, {}, preds, fill_targets(iv.mcu_first + keep, gap, override), writer=w)
-                    holes.append(Hole(iv.mcu_first + keep, gap, reason))
-                if tail is not None:
-                    _stream_bits(w, data, tail["start_bit"], tail["end_bit"])
-                    spliced += n_tail
-                pieces.append(prefix + w.finish())
+                piece, n_spliced, hole = build_interval(iv, pl["keep"], pl["tail"], pl["reason"], dict(preds))
+                if pl["tail"] is not None and not interval_ok(piece, iv):
+                    # the spliced tail does not decode in place: rebuild without it
+                    f = pl["tail"]["first_mcu"]
+                    trusted[f : f + pl["tail"]["n"]] = False
+                    piece, n_spliced, hole = build_interval(iv, pl["keep"], None, pl["reason"], dict(preds))
+                pieces.append(piece)
+                spliced += n_spliced
+                if hole is not None:
+                    holes.append(hole)
             last_index = iv.index
             if dri and iv.mcu_first + iv.mcu_count < total:
                 pieces.append(rst_marker(iv.index))

@@ -99,14 +99,19 @@ def test_tail_scan_parity_and_recovery():
             buf[o] ^= 1 << int(rng.integers(0, 8))
     broken = bytes(buf)
 
+    from fotomedik.scan.garbage import last_broken_stuffing
+
+    bad = last_broken_stuffing(broken, iv.byte_start, iv.byte_end)
+    lo = iv.byte_start if bad is None else bad + 2
+
     def run():
-        return kernel.tail_scan(broken, iv.byte_start, iv.byte_end, pk, iv.mcu_count)
+        return kernel.tail_scan(broken, lo, iv.byte_end, pk, iv.mcu_count)
 
     c, py = _both(run)
     assert c == py
     n, start_bit, bits = c
     true_starts = [m.bit_start for m in ref.mcus if iv.mcu_first <= m.index < iv.mcu_first + iv.mcu_count]
-    # a good share of the interval comes back, and the tail's MCU boundaries (after the
-    # first, possibly junk, MCU) are exactly the true ones
+    # a good share of the interval comes back, and after the first few (possibly junk)
+    # MCUs the tail's boundaries are exactly the true ones
     assert n >= iv.mcu_count // 3
-    assert bits[1:] == true_starts[-(n - 1):]
+    assert bits[3:] == true_starts[-(n - 3):]

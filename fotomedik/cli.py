@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import os
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import click
@@ -63,18 +65,53 @@ def _write_outputs(ctx: Context, rep: FileReport, out_dir: Path, rel: Path) -> P
     return target
 
 
-def _learn_candidates(files: list[tuple[Path, Path]], echo) -> list[CameraProfile]:
+def _profile_of(args: tuple[str, str]) -> CameraProfile | None:
+    """Worker: a reference profile from a file whose header and most of the scan are healthy."""
+    path, rel = args
+    try:
+        data = Path(path).read_bytes()
+        d = scan_bytes(data, Path(rel).name)
+        if not d.openable or d.recovered_fraction < 0.5:
+            return None
+        return CameraProfile.from_jpeg(data, source=rel)
+    except Exception:
+        return None
+
+
+def _repair_file(args: tuple[str, str, str, dict, CameraProfile | None]) -> tuple[FileReport, float]:
+    """Worker: repair one file and write its outputs. Runs in a separate process."""
+    path, rel, out, options, profile = args
+    t = time.perf_counter()
+    data = Path(path).read_bytes()
+    relp = Path(rel)
+    ctx, rep = repair_bytes(data, relp.name, options, profile)
+    target = _write_outputs(ctx, rep, Path(out), relp)
+    rep.output_name = str(target.relative_to(Path(out)))
+    return rep, time.perf_counter() - t
+
+
+def _pool_map(fn, items: list, jobs: int, cost=None):
+    """Map in parallel processes, results in input order; in-process for jobs <= 1.
+
+    `cost(item)` orders the submission (biggest first) so long files do not end up
+    last on an otherwise idle pool.
+    """
+    if jobs <= 1 or len(items) <= 1:
+        return [fn(it) for it in items]
+    order = sorted(range(len(items)), key=(lambda i: -cost(items[i])) if cost else (lambda i: i))
+    out: list = [None] * len(items)
+    with ProcessPoolExecutor(max_workers=min(jobs, len(items))) as ex:
+        for i, res in zip(order, ex.map(fn, [items[i] for i in order])):
+            out[i] = res
+    return out
+
+
+def _learn_candidates(files: list[tuple[Path, Path]], echo, jobs: int = 1) -> list[CameraProfile]:
     """Healthy headers in the set become reference profiles for the damaged ones."""
     profiles: list[CameraProfile] = []
     seen: set[tuple] = set()
-    for p, rel in files:
-        try:
-            data = p.read_bytes()
-            d = scan_bytes(data, rel.name)
-            if not d.openable or d.recovered_fraction < 0.5:
-                continue
-            prof = CameraProfile.from_jpeg(data, source=str(rel))
-        except Exception:
+    for prof in _pool_map(_profile_of, [(str(p), str(rel)) for p, rel in files], jobs):
+        if prof is None:
             continue
         key = (prof.model, prof.width, prof.height, tuple(prof.dqt), tuple(prof.dht), prof.restart_interval)
         if key in seen:
@@ -104,26 +141,27 @@ def scan(path: Path, lang: str):
         click.echo("")
 
 
-def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool):
+def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
+                jobs: int = 0):
     if path.is_dir() and out.resolve() == path.resolve():
         raise click.ClickException("output folder must differ from the input folder (originals are never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
+    jobs = jobs or (os.cpu_count() or 1)
+    t0 = time.perf_counter()
     options = {"mark_holes": mark_holes, "keep_damaged": keep_damaged, "time_budget": time_budget}
     profile = CameraProfile.from_json(Path(ref).read_text(encoding="utf-8")) if ref else None
-    files = list(_iter_files(path))
+    files = [(p, rel) for p, rel in _iter_files(path) if not p.resolve().is_relative_to(out.resolve())]
     if auto_ref and len(files) > 1:
-        options["ref_candidates"] = _learn_candidates(files, click.echo)
+        options["ref_candidates"] = _learn_candidates(files, click.echo, jobs)
+    work = [(str(p), str(rel), str(out), options, profile) for p, rel in files]
+    results = _pool_map(_repair_file, work, jobs, cost=lambda it: os.path.getsize(it[0]))
     reports: list[FileReport] = []
-    for p, rel in files:
-        data = p.read_bytes()
-        if p.resolve().is_relative_to(out.resolve()):
-            continue
-        ctx, rep = repair_bytes(data, rel.name, options, profile)
-        target = _write_outputs(ctx, rep, out, rel)
-        rep.output_name = str(target.relative_to(out))
+    for rep, secs in results:
         reports.append(rep)
         click.echo(rep.format_text(lang))
+        click.echo(f"({secs:.1f} s)")
         click.echo("")
+    click.echo(f"{len(reports)} file(s) in {time.perf_counter() - t0:.1f} s ({jobs} parallel job(s))")
     return reports
 
 
@@ -133,11 +171,14 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 @click.option("--ref", type=click.Path(exists=True), help="camera profile JSON from `learn`")
 @click.option("--mark-holes", is_flag=True, help="paint unrecovered areas magenta instead of blending")
 @click.option("--keep-damaged", is_flag=True, help="keep decoded blocks of intervals that did not resync (noisier)")
-@click.option("--time-budget", default=120.0, show_default=True, help="seconds per file for bit-flip search")
+@click.option("--time-budget", default=5.0, show_default=True, help="seconds per file for bit-flip search")
+@click.option("--thorough", is_flag=True, help="search much longer for flipped bits (60 s per file)")
+@click.option("--jobs", default=0, show_default="all CPU cores", help="files repaired in parallel")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def fix(path, out, ref, mark_holes, keep_damaged, time_budget, lang):
+def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, lang):
     """Repair a file or folder into OUT (+ a .report.json per file)."""
-    _fix_common(path, out, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref=False)
+    _fix_common(path, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
+                auto_ref=False, jobs=jobs)
 
 
 @main.command()
@@ -159,11 +200,14 @@ def learn(good: Path, out: Path):
 @click.option("--ref", type=click.Path(exists=True))
 @click.option("--mark-holes", is_flag=True)
 @click.option("--keep-damaged", is_flag=True)
-@click.option("--time-budget", default=120.0, show_default=True)
+@click.option("--time-budget", default=5.0, show_default=True)
+@click.option("--thorough", is_flag=True, help="search much longer for flipped bits (60 s per file)")
+@click.option("--jobs", default=0, show_default="all CPU cores", help="files repaired in parallel")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, lang):
+def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
-    reports = _fix_common(folder, out, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref=True)
+    reports = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
+                          auto_ref=True, jobs=jobs)
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])

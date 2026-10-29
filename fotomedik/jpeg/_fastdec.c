@@ -25,7 +25,7 @@
 #define EXPORT
 #endif
 
-#define FASTDEC_ABI 4  /* bump whenever an exported signature changes; fastdec.py checks it */
+#define FASTDEC_ABI 6  /* bump whenever an exported signature changes; fastdec.py checks it */
 
 EXPORT int fastdec_abi(void) { return FASTDEC_ABI; }
 
@@ -143,7 +143,7 @@ static inline int decode_symbol(reader_t *r, int slot, const tables_t *t, int *s
 
 /* Decode one MCU; DC values go to dc_out[0..bpm). Returns 0 or an error code. */
 static inline int decode_mcu(reader_t *r, const comp_t *comps, int ncomp, const tables_t *t,
-                             int32_t *preds, int32_t *dc_out) {
+                             int32_t *preds, int32_t *dc_out, int check_dc) {
     int err = 0;
     int bi = 0;
     for (int c = 0; c < ncomp; c++) {
@@ -162,7 +162,7 @@ static inline int decode_mcu(reader_t *r, const comp_t *comps, int ncomp, const 
             int32_t dcv = preds[c];
             int64_t mag = (int64_t)dcv * cp->qdc;
             if (mag < 0) mag = -mag;
-            if (mag > 1024 + cp->qdc) return ERR_DC_RANGE;
+            if (check_dc && mag > 1024 + cp->qdc) return ERR_DC_RANGE;
             int k = 1;
             while (k < 64) {
                 int rs;
@@ -195,7 +195,7 @@ static void reader_init(reader_t *r, const uint8_t *data, int64_t start_byte, in
 static int64_t run_decode(const uint8_t *data, int64_t start_byte, int start_bit, int64_t end,
                           const comp_t *comps, int ncomp, const tables_t *t,
                           int64_t max_mcus, int32_t *preds,
-                          int64_t *mcu_bitstart, int32_t *dc_vals, int64_t *out) {
+                          int64_t *mcu_bitstart, int32_t *dc_vals, int64_t *out, int check_dc) {
     reader_t r;
     reader_init(&r, data, start_byte, end);
     int err = 0;
@@ -206,7 +206,7 @@ static int64_t run_decode(const uint8_t *data, int64_t start_byte, int start_bit
     int64_t eb; int ebit;
     for (n = 0; n < max_mcus && !err; n++) {
         if (mcu_bitstart) { tell(&r, &eb, &ebit); mcu_bitstart[n] = eb * 8 + ebit; }
-        err = decode_mcu(&r, comps, ncomp, t, preds, dc_vals + n * bpm);
+        err = decode_mcu(&r, comps, ncomp, t, preds, dc_vals + n * bpm, check_dc);
         if (err) break;
     }
     out[0] = err;
@@ -225,9 +225,9 @@ EXPORT int64_t decode_mcus(const uint8_t *data, int64_t start_byte, int start_bi
                            const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
                            const int32_t *mincode, const uint8_t *symbols,
                            int64_t max_mcus, int32_t *preds,
-                           int64_t *mcu_bitstart, int32_t *dc_vals, int64_t *out) {
+                           int64_t *mcu_bitstart, int32_t *dc_vals, int64_t *out, int check_dc) {
     tables_t t = { fast, maxcode, valptr, mincode, symbols };
-    return run_decode(data, start_byte, start_bit, end, comps, ncomp, &t, max_mcus, preds, mcu_bitstart, dc_vals, out);
+    return run_decode(data, start_byte, start_bit, end, comps, ncomp, &t, max_mcus, preds, mcu_bitstart, dc_vals, out, check_dc);
 }
 
 /* Where the interval ends after the last MCU: next byte boundary, FF00-stuffed
@@ -319,10 +319,10 @@ EXPORT int64_t eval_flips(uint8_t *data, int64_t data_len, int64_t start_byte, i
         int64_t lim = (stage1_n < needed ? stage1_n : needed) - j;
         if (lim < 1) lim = 1;
         int64_t full = needed - j;
-        int64_t n = run_decode(data, sb, sbit, end, comps, ncomp, &t, lim, preds, NULL, dst, out);
+        int64_t n = run_decode(data, sb, sbit, end, comps, ncomp, &t, lim, preds, NULL, dst, out, 1);
         if (out[0] == 0 && n == lim && lim < full) {
             memcpy(preds, jpreds, sizeof(int32_t) * ncomp);
-            n = run_decode(data, sb, sbit, end, comps, ncomp, &t, full, preds, NULL, dst, out);
+            n = run_decode(data, sb, sbit, end, comps, ncomp, &t, full, preds, NULL, dst, out, 1);
         }
         int complete = 0, pad_ok = 0;
         if (out[0] == 0 && n == full) {
@@ -355,8 +355,10 @@ EXPORT int64_t eval_flips(uint8_t *data, int64_t data_len, int64_t start_byte, i
  * when decoding from it reaches the marker exactly (1-bit padding allowed) after
  * at most max_mcus MCUs. The first success is decoded to the end; later (earlier
  * in the file) starts stop as soon as they land on a known MCU boundary of the
- * reference parse (splice), so each costs a few MCUs. Scanning stops after
- * `give_up` bytes without a success (inside the damage nothing converges).
+ * reference parse (splice), so each costs a few MCUs. A start inside the
+ * damage also "decodes" (garbage) and eventually lands on the true parse, but
+ * only after many MCUs: once a reference exists, a start must splice within
+ * `max_head` MCUs to count. Scanning stops after `give_up` bytes without a success.
  *
  * Returns the number of MCUs of the longest tail (0 if none) and its start in
  * *best_bit (absolute bit position); known[0..return) then holds the MCU start
@@ -365,7 +367,7 @@ EXPORT int64_t tail_scan(const uint8_t *data, int64_t data_len, int64_t lo, int6
                          const comp_t *comps, int ncomp,
                          const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
                          const int32_t *mincode, const uint8_t *symbols,
-                         int64_t max_mcus, int64_t give_up, int64_t *best_bit,
+                         int64_t max_mcus, int64_t give_up, int64_t max_head, int64_t *best_bit,
                          int64_t *known, int64_t *trial) {
     tables_t t = { fast, maxcode, valptr, mincode, symbols };
     int32_t preds[8];
@@ -390,6 +392,7 @@ EXPORT int64_t tail_scan(const uint8_t *data, int64_t data_len, int64_t lo, int6
             int64_t q = 0; /* pointer into known */
             int spliced = 0;
             while (n < max_mcus) {
+                if (nknown && n > max_head) break;  /* garbage until it happened to resync */
                 int64_t eb; int ebit;
                 tell(&r, &eb, &ebit);
                 int64_t pos = eb * 8 + ebit;
@@ -398,7 +401,7 @@ EXPORT int64_t tail_scan(const uint8_t *data, int64_t data_len, int64_t lo, int6
                     while (q < nknown && known[q] < pos) q++;
                     if (q < nknown && known[q] == pos) { total = n + (nknown - q); spliced = 1; break; }
                 }
-                err = decode_mcu(&r, comps, ncomp, &t, preds, dc);
+                err = decode_mcu(&r, comps, ncomp, &t, preds, dc, 0);  /* predictor unknown: no DC range test */
                 if (err) break;
                 n++;
                 /* reached the marker? */
