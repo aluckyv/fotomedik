@@ -28,3 +28,15 @@ def test_same_build_is_not_offered(monkeypatch):
     monkeypatch.setattr(updater, "BUILD", 7)
     monkeypatch.setattr(updater, "_get", _fake(7))
     assert updater.check() is None
+
+
+def test_restart_does_not_inherit_packaged_app_variables(monkeypatch):
+    from fotomedik.gui import updater
+
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", r"C:\Temp\_MEI123")
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    monkeypatch.setenv("_MEIPASS2", r"C:\Temp\_MEI123")
+    monkeypatch.setenv("PATH", "/bin")
+    env = updater.fresh_env()
+    assert not any(k.startswith("_PYI_") or k == "_MEIPASS2" for k in env)
+    assert env["PYINSTALLER_RESET_ENVIRONMENT"] == "1" and env["PATH"] == "/bin"

@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 from pathlib import Path
 
@@ -168,9 +169,20 @@ class Workers:
         order = sorted(range(len(items)), key=(lambda i: -cost(items[i])) if cost else (lambda i: i))
         out: list = [None] * len(items)
         task = partial(_counted, fn) if counted else fn
-        for i, res in zip(order, self.ex.map(task, [items[i] for i in order])):
-            out[i] = res
+        try:
+            for i, res in zip(order, self.ex.map(task, [items[i] for i in order])):
+                out[i] = res
+        except BrokenProcessPool:
+            # worker processes could not start (or died): finish the work in this process
+            self.broken()
+            return [fn(it) for it in items]
         return out
+
+    def broken(self) -> None:
+        """Stop using worker processes for the rest of the run."""
+        if self.ex is not None:
+            self.ex.shutdown(wait=False, cancel_futures=True)
+            self.ex = None
 
     def __enter__(self):
         return self

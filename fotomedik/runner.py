@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import os
 import threading
-from concurrent.futures import FIRST_COMPLETED, wait
+from concurrent.futures import FIRST_COMPLETED, CancelledError, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -101,6 +102,13 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
                     i = pending.pop(f)
                     try:
                         rep, secs = f.result()
+                    except (BrokenProcessPool, CancelledError):
+                        # worker processes could not start: repair here, one by one
+                        workers.broken()
+                        try:
+                            rep, secs = _repair_file(work[i])
+                        except Exception as e:
+                            rep, secs = failed(i, e)
                     except Exception as e:  # one bad file must not stop the batch
                         rep, secs = failed(i, e)
                     done(i, rep, secs)

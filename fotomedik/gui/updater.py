@@ -99,7 +99,20 @@ def install_and_restart(new_exe: Path) -> None:
     flags = 0
     if sys.platform == "win32":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    subprocess.Popen([str(cur)], creationflags=flags, close_fds=True)
+    subprocess.Popen([str(cur)], creationflags=flags, close_fds=True, env=fresh_env())
+
+
+def fresh_env() -> dict:
+    """Environment for starting the new exe as an independent program.
+
+    The packaged app sets private variables that tie its own sub-processes to the
+    folder it unpacked itself into. Inherited by the new exe, they make it reuse
+    the old app's folder, which is deleted when the old app quits, so its worker
+    processes fail with "Failed to start embedded python interpreter"."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("_PYI_") and k not in ("_MEIPASS2", "_PYI_SPLASH_IPC")}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
 
 
 def cleanup_old() -> None:
