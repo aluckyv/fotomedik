@@ -26,7 +26,7 @@
 #define EXPORT
 #endif
 
-#define FASTDEC_ABI 10  /* bump whenever an exported signature changes; fastdec.py checks it */
+#define FASTDEC_ABI 11  /* bump whenever an exported signature changes; fastdec.py checks it */
 
 EXPORT int fastdec_abi(void) { return FASTDEC_ABI; }
 
@@ -395,9 +395,10 @@ static int64_t tf_get(tgraph_t *g, int64_t pos, int *fresh) {
     return i;
 }
 
-static const int64_t *tf_sort_pos;
+/* sort key travels with the index: no shared state, so threads may run tail_flow at once */
+typedef struct { int64_t pos, idx; } tf_pair_t;
 static int tf_cmp(const void *a, const void *b) {
-    int64_t x = tf_sort_pos[*(const int64_t *)a], y = tf_sort_pos[*(const int64_t *)b];
+    int64_t x = ((const tf_pair_t *)a)->pos, y = ((const tf_pair_t *)b)->pos;
     return (x > y) - (x < y);
 }
 
@@ -418,7 +419,7 @@ EXPORT int64_t tail_flow(const uint8_t *data, int64_t data_len, int64_t lo, int6
     g.bestf = malloc(sizeof(int32_t) * (size_t)max_nodes);
     g.hkey = malloc(sizeof(int64_t) * (size_t)hsize);
     g.hval = malloc(sizeof(int64_t) * (size_t)hsize);
-    int64_t *order = malloc(sizeof(int64_t) * (size_t)max_nodes);
+    tf_pair_t *order = malloc(sizeof(tf_pair_t) * (size_t)max_nodes);
     int64_t result = -1;
     if (!g.pos || !g.next || !g.starts || !g.flow || !g.best || !g.bestf || !g.hkey || !g.hval || !order) goto done;
     memset(g.hkey, 0xFF, sizeof(int64_t) * (size_t)hsize);  /* all -1 */
@@ -450,12 +451,14 @@ EXPORT int64_t tail_flow(const uint8_t *data, int64_t data_len, int64_t lo, int6
         }
     }
     /* flow: positions in ascending order, every node hands its flow to its successor */
-    for (int64_t i = 0; i < g.n; i++) { order[i] = i; g.flow[i] = g.starts[i]; g.best[i] = -1; g.bestf[i] = 0; }
-    tf_sort_pos = g.pos;
-    qsort(order, (size_t)g.n, sizeof(int64_t), tf_cmp);
+    for (int64_t i = 0; i < g.n; i++) {
+        order[i].pos = g.pos[i]; order[i].idx = i;
+        g.flow[i] = g.starts[i]; g.best[i] = -1; g.bestf[i] = 0;
+    }
+    qsort(order, (size_t)g.n, sizeof(tf_pair_t), tf_cmp);
     int64_t term = -1;
     for (int64_t k = 0; k < g.n; k++) {
-        int64_t v = order[k];
+        int64_t v = order[k].idx;
         int64_t nx = g.next[v];
         if (nx == TF_TERM) { if (term < 0 || g.flow[v] > g.flow[term]) term = v; continue; }
         if (nx < 0) continue;
@@ -473,4 +476,145 @@ done:
     free(g.pos); free(g.next); free(g.starts); free(g.flow); free(g.best); free(g.bestf);
     free(g.hkey); free(g.hval); free(order);
     return result;
+}
+
+/* Whole-interval start search (R10 spans): byte offsets s in [lo, hi) are tried as the
+ * start of an interval of `count` MCUs ending at marker_pos (fresh predictors, DC range
+ * checks on). A probe of up to `probe` MCUs must land on the reference parse known[]
+ * (ascending MCU start bits of the tail, ending at the marker), which fixes the MCU
+ * count; candidates with the right count are decoded in full and must end exactly on
+ * the marker with valid padding. Among them the one preceded by the most marker-like
+ * byte pair (prev_marker; < 0: unknown) wins, then the earliest. Returns s or -1. */
+static int64_t find_known(const int64_t *known, int64_t n, int64_t pos) {
+    int64_t lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int64_t mid = (lo + hi) / 2;
+        if (known[mid] == pos) return mid;
+        if (known[mid] < pos) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
+EXPORT int64_t find_interval_start(const uint8_t *data, int64_t data_len, int64_t lo, int64_t hi, int64_t marker_pos,
+                                   const comp_t *comps, int ncomp,
+                                   const int32_t *fast, const int32_t *maxcode, const int32_t *valptr,
+                                   const int32_t *mincode, const uint8_t *symbols,
+                                   int64_t count, const int64_t *known, int64_t nknown, int prev_marker, int probe) {
+    tables_t t = { fast, maxcode, valptr, mincode, symbols };
+    int32_t preds[8], dc[64];
+    int64_t best = -1; int best_ham = 1 << 20;
+    for (int64_t s = lo; s < hi; s++) {
+        reader_t r;
+        reader_init(&r, data, s, marker_pos + 2);
+        memset(preds, 0, sizeof preds);
+        int64_t total = -1;
+        for (int k = 1; k <= probe; k++) {
+            if (decode_mcu(&r, comps, ncomp, &t, preds, dc, 1)) break;
+            int64_t eb; int ebit; tell(&r, &eb, &ebit);
+            int64_t j = find_known(known, nknown, eb * 8 + ebit);
+            if (j >= 0) { total = k + (nknown - j); break; }
+        }
+        if (total != count) continue;
+        reader_init(&r, data, s, marker_pos + 2);
+        memset(preds, 0, sizeof preds);
+        int64_t n = 0;
+        while (n < count && !decode_mcu(&r, comps, ncomp, &t, preds, dc, 1)) n++;
+        if (n != count) continue;
+        int64_t eb; int ebit; tell(&r, &eb, &ebit);
+        int pad_ok;
+        if (aligned_end(data, data_len, eb, ebit, &pad_ok) != marker_pos || !pad_ok) continue;
+        int ham = 16;
+        if (s >= 2 && prev_marker >= 0) ham = popcount8(data[s - 2] ^ 0xFF) + popcount8(data[s - 1] ^ (unsigned)prev_marker);
+        if (ham < best_ham) { best_ham = ham; best = s; }
+    }
+    return best;
+}
+
+/* ------------------------------------------------------------------ bit writer
+ * State st[3] = {bytes written, bit accumulator, bits in accumulator}; bytes are
+ * FF00-stuffed as they are written. Functions return 0, or -1 when `cap` is too small. */
+static inline int bw_emit(uint8_t *out, int64_t cap, int64_t *st, uint32_t val, int n) {
+    if (n <= 0) return 0;
+    uint64_t acc = (uint64_t)st[1];
+    int nb = (int)st[2];
+    acc = (acc << n) | ((uint64_t)val & ((1ULL << n) - 1));
+    nb += n;
+    while (nb >= 8) {
+        nb -= 8;
+        uint8_t b = (uint8_t)(acc >> nb);
+        if (st[0] + 2 > cap) return -1;
+        out[st[0]++] = b;
+        if (b == 0xFF) out[st[0]++] = 0x00;
+    }
+    acc &= nb ? ((1ULL << nb) - 1) : 0;
+    st[1] = (int64_t)acc; st[2] = nb;
+    return 0;
+}
+
+EXPORT int bw_put(uint8_t *out, int64_t cap, int64_t *st, uint32_t val, int n) {
+    return bw_emit(out, cap, st, val, n);
+}
+
+/* Pad the last byte with 1-bits. */
+EXPORT int bw_finish(uint8_t *out, int64_t cap, int64_t *st) {
+    int nb = (int)st[2];
+    if (nb) return bw_emit(out, cap, st, (1u << (8 - nb)) - 1, 8 - nb);
+    return 0;
+}
+
+/* Append entropy-coded bits [start_bit, end_bit) of data (positions as the decoder
+ * reports them: offsets in the stuffed stream), unstuffed, to the writer. */
+EXPORT int bw_copy(uint8_t *out, int64_t cap, int64_t *st, const uint8_t *data, int64_t data_len,
+                   int64_t start_bit, int64_t end_bit) {
+    int64_t p = start_bit / 8;
+    int first = 1;
+    while (p * 8 < end_bit && p < data_len) {
+        uint8_t b = data[p];
+        int lo_bit = first ? (int)(start_bit % 8) : 0;
+        int hi_bit = (p + 1) * 8 <= end_bit ? 8 : (int)(end_bit - p * 8);
+        int n = hi_bit - lo_bit;
+        if (n > 0 && bw_emit(out, cap, st, (uint32_t)(b >> (8 - hi_bit)) & ((1u << n) - 1), n)) return -1;
+        first = 0;
+        if (b == 0xFF && p + 1 < data_len && data[p + 1] == 0x00) p += 2; else p += 1;
+    }
+    return 0;
+}
+
+/* DC-only MCUs (flat blocks: DC difference, then EOB) with the file's own tables.
+ * targets: int32[mcu_count * bpm] DC per block in MCU order; preds: int32[ncomp] in/out.
+ * dc_len/dc_code: int32[ncomp][16] Huffman code per DC category (len 0 = absent);
+ * eob_len/eob_code: int32[ncomp]. Steps a table cannot express are clamped.
+ * Returns 0, -1 (buffer too small) or -2 (DC table without category 0). */
+EXPORT int encode_dc_fill(uint8_t *out, int64_t cap, int64_t *st, const comp_t *comps, int ncomp,
+                          const int32_t *dc_len, const int32_t *dc_code, const int32_t *eob_len, const int32_t *eob_code,
+                          int64_t mcu_count, const int32_t *targets, int32_t *preds) {
+    int64_t k = 0;
+    for (int64_t m = 0; m < mcu_count; m++) {
+        for (int c = 0; c < ncomp; c++) {
+            int nb = comps[c].h * comps[c].v;
+            const int32_t *ln = dc_len + c * 16, *cd = dc_code + c * 16;
+            for (int b = 0; b < nb; b++) {
+                int32_t diff = targets[k++] - preds[c];
+                int32_t a = diff < 0 ? -diff : diff;
+                int want = 0;
+                while (a >> want) want++;
+                int s = want;
+                while (s > 0 && ln[s] == 0) s--;
+                if (s == 0 && ln[0] == 0) return -2;
+                if (s < want) {
+                    int32_t lim = (1 << s) - 1;
+                    if (diff > lim) diff = lim;
+                    if (diff < -lim) diff = -lim;
+                }
+                if (bw_emit(out, cap, st, (uint32_t)cd[s], ln[s])) return -1;
+                if (s) {
+                    uint32_t mag = (uint32_t)(diff >= 0 ? diff : diff + (1 << s) - 1);
+                    if (bw_emit(out, cap, st, mag, s)) return -1;
+                }
+                preds[c] += diff;
+                if (bw_emit(out, cap, st, (uint32_t)eob_code[c], eob_len[c])) return -1;
+            }
+        }
+    }
+    return 0;
 }

@@ -24,6 +24,7 @@ import math
 import numpy as np
 
 from ..jpeg import decoder as D
+from .. import parallel
 from ..jpeg import kernel as K
 from ..scan.garbage import last_dense_damage
 from .base import Context, Recipe
@@ -126,53 +127,6 @@ def leading_junk(anom: np.ndarray, floor: float = ANOMALY_MIN, gap: int = 4) -> 
     return trim
 
 
-def find_interval_start(data: bytes, pk: K.Packed, lo: int, hi: int, mpos: int, count: int,
-                        known: list[int], prev_marker: int | None = None) -> int | None:
-    """Byte offset where a whole interval ending at `mpos` starts, or None.
-
-    An interval starts on a byte boundary right after the previous marker, with all
-    DC predictors at 0, and holds exactly `count` MCUs. Candidates are byte offsets
-    in [lo, hi); each is decoded a few MCUs until it lands on the reference parse
-    `known` (MCU start bits of the tail, ending at mpos), which fixes its MCU count.
-    Every candidate passing a full decode with all checks on is collected. Junk that
-    starts inside the first true MCU can pass too, so the winner is the one preceded
-    by the most marker-like byte pair (the previous interval's damaged RST), then the
-    earliest.
-    """
-    if not known:
-        return None
-    rem = {b: len(known) - i for i, b in enumerate(known)}
-    found: list[tuple[int, int]] = []
-    for s in range(lo, hi):
-        preds = np.zeros(pk.ncomp, dtype=np.int32)
-        n, err, _eb, _ebit, _mk, end_b, end_bit, bits, _dc = K.decode_mcus(data, s, 0, mpos + 2, pk, preds, 8)
-        total = None
-        for i in range(1, len(bits)):
-            if int(bits[i]) in rem:
-                total = i + rem[int(bits[i])]
-                break
-        if total is None and err is None:
-            e = end_b * 8 + end_bit
-            if e in rem:
-                total = n + rem[e]
-        if total != count:
-            continue
-        preds = np.zeros(pk.ncomp, dtype=np.int32)
-        n, err, _eb, _ebit, _mk, end_b, end_bit, _bits, _dc = K.decode_mcus(data, s, 0, mpos + 2, pk, preds, count)
-        if n == count and err is None:
-            a, pad = K.py_aligned_end(data, len(data), end_b, end_bit)
-            if a == mpos and pad:
-                if s >= 2 and prev_marker is not None:
-                    ham = bin(data[s - 2] ^ 0xFF).count("1") + bin(data[s - 1] ^ prev_marker).count("1")
-                else:
-                    ham = 16
-                found.append((ham, s))
-    if not found:
-        return None
-    found.sort()
-    return found[0][1]
-
-
 @register
 class TailRecovery(Recipe):
     name = "tail_recovery"
@@ -191,6 +145,113 @@ class TailRecovery(Recipe):
                 out.append((iv, iv.index, parse.eoi_offset))  # last interval / no restart markers
         return out
 
+    def _span(self, data, sr, ft, pk, refs, span) -> dict[int, dict]:
+        """Tails recovered for one failed span (interval index -> tail)."""
+        iv, last, marker_pos = span
+        dri = ft.restart_interval
+        total = sr.total_mcus
+        tails: dict[int, dict] = {}
+        j = last
+        mpos = marker_pos
+        while j >= iv.index:
+            first_of_j = j * dri if dri else iv.mcu_first
+            count_j = min(dri, total - first_of_j) if dri else total - iv.mcu_first
+            if count_j <= 0:
+                j -= 1
+                continue
+            lo = iv.byte_start
+            bad = last_dense_damage(data, lo, mpos)
+            if bad is not None:
+                lo = bad + 2  # end of a rotted stretch: intact data resumes after it
+            bits, _flows = K.tail_flow(data, lo, mpos, pk, count_j)
+            n = len(bits)
+            if n < MIN_TAIL + DROP_FIRST:
+                break
+            start_bit = bits[0]
+            full = False
+            if dri and j > iv.index:
+                # a later interval of the span may be intact from its very start
+                avg = max(64, (iv.byte_end or mpos) - iv.byte_start) / max(1, last - iv.index + 1)
+                # the true start may lie a few MCUs inside the found tail (junk head)
+                hi_s = bits[min(len(bits) - 1, DROP_FIRST + 12)] // 8 + 1
+                s0 = K.find_interval_start(data, max(lo, int(mpos - 2.5 * avg)), min(mpos, hi_s),
+                                           mpos, pk, count_j, bits, 0xD0 + ((j - 1) % 8))
+                if s0 is not None:
+                    full = True
+                    n, start_bit = count_j, s0 * 8
+                    preds = np.zeros(pk.ncomp, dtype=np.int32)
+                    bits = [int(b) for b in K.decode_mcus(data, s0, 0, mpos + 2, pk, preds, count_j)[7]]
+            drop = 0 if full else DROP_FIRST
+            n_tail = n - drop
+            s_bit = bits[drop]
+            first_tail = first_of_j + count_j - n_tail
+            preds = np.zeros(pk.ncomp, dtype=np.int32)
+            dn, err, *_rest, end_b, end_bit, _bs, dc_rel = K.decode_mcus(data, s_bit // 8, s_bit % 8, mpos + 2, pk, preds,
+                                                                         n_tail, check_dc=False)
+            if dn != n_tail or err is not None:
+                break
+            if full:
+                delta = {cid: 0.0 for cid in pk.cids}
+            else:
+                delta = refs.offsets(first_tail, dc_rel)
+                left = _left_offsets(sr, ft, first_tail, dc_rel)
+                delta = {cid: (delta[cid] if delta[cid] is not None else (left[cid] if left[cid] is not None else 0.0))
+                         for cid in pk.cids}
+            # trim leading MCUs that clash with their neighbours (junk before convergence)
+            trim = 0
+            if not full:
+                k = min(TRIM_SCAN, n_tail - MIN_TAIL)
+                anom = head_anomaly(refs, first_tail, dc_rel, delta, pk)
+                trim = leading_junk(anom)
+                # junk decoded inside the damage drifts: a step down in the anomaly
+                clean_part = anom[n_tail // 2 :]
+                sig = float(np.nanmedian(clean_part)) if not np.all(np.isnan(clean_part)) else 1.0
+                onset = junk_onset((anom / max(1.0, sig))[::-1])
+                if onset is not None:
+                    trim = max(trim, n_tail - onset)
+                trim = min(k, trim)
+            if trim:
+                s_bit = bits[drop + trim]
+                n_tail -= trim
+                first_tail += trim
+                dc_rel_t = dc_rel[trim:]
+                # predictor shifts with the dropped MCUs: relative values restart at 0
+                base = dc_rel[trim - 1][[sum(h * v for h, v in pk.hv[:i + 1]) - 1 for i in range(pk.ncomp)]]
+                delta = {cid: delta[cid] + float(base[i]) for i, cid in enumerate(pk.cids)}
+                dc_rel = dc_rel_t - base[np.repeat(np.arange(pk.ncomp), [h * v for h, v in pk.hv])]
+            # keep every spliced DC inside the legal range (|DC*q| <= 1024+q): a bad
+            # neighbour estimate must not produce a file decoders reject
+            ok = True
+            col = 0
+            for ci, cid in enumerate(pk.cids):
+                q = pk.qdc[ci]
+                lim = (1024 + q) // q
+                nb_c = pk.hv[ci][0] * pk.hv[ci][1]
+                rel = dc_rel[:, col : col + nb_c]
+                lo_d, hi_d = -lim - int(rel.min()), lim - int(rel.max())
+                if lo_d > hi_d:
+                    ok = False
+                    break
+                delta[cid] = float(min(max(delta[cid], lo_d), hi_d))
+                col += nb_c
+            if not ok:
+                break
+            tails[j] = {
+                "start_bit": int(s_bit),
+                "end_bit": int(end_b * 8 + end_bit),
+                "n": int(n_tail),
+                "first_mcu": int(first_tail),
+                "delta": {int(k): int(round(v)) for k, v in delta.items()},
+                "full": bool(full),
+                "dc_rel": dc_rel.astype(np.int32),
+            }
+            if not full:
+                break
+            # the whole interval came back: its own (damaged) marker sits just before it
+            mpos = start_bit // 8 - 2
+            j -= 1
+        return tails
+
     def detect(self, ctx: Context):
         if ctx.memo.get("tails_done"):
             return None
@@ -205,10 +266,6 @@ class TailRecovery(Recipe):
         ctx.memo["tails_done"] = True
         pk = K.packed_for(ft)
         data = ctx.data
-        dri = ft.restart_interval
-        total = sr.total_mcus
-        tails: dict[int, dict] = {}
-        recovered = 0
         clean = sr.mcu_ok.copy()
         for iv in sr.intervals:
             if not iv.ok:
@@ -216,107 +273,10 @@ class TailRecovery(Recipe):
         thumb = thumbnail_base(data, ft, sr, clean)
         ctx.memo["thumb_base"] = thumb
         refs = References(sr, ft, thumb)
-        for iv, last, marker_pos in self._spans(sr, parse):
-            j = last
-            mpos = marker_pos
-            while j >= iv.index:
-                first_of_j = j * dri if dri else iv.mcu_first
-                count_j = min(dri, total - first_of_j) if dri else total - iv.mcu_first
-                if count_j <= 0:
-                    j -= 1
-                    continue
-                lo = iv.byte_start
-                bad = last_dense_damage(data, lo, mpos)
-                if bad is not None:
-                    lo = bad + 2  # end of a rotted stretch: intact data resumes after it
-                bits, _flows = K.tail_flow(data, lo, mpos, pk, count_j)
-                n = len(bits)
-                if n < MIN_TAIL + DROP_FIRST:
-                    break
-                start_bit = bits[0]
-                full = False
-                if dri and j > iv.index:
-                    # a later interval of the span may be intact from its very start
-                    avg = max(64, (iv.byte_end or mpos) - iv.byte_start) / max(1, last - iv.index + 1)
-                    # the true start may lie a few MCUs inside the found tail (junk head)
-                    hi_s = bits[min(len(bits) - 1, DROP_FIRST + 12)] // 8 + 1
-                    s0 = find_interval_start(data, pk, max(lo, int(mpos - 2.5 * avg)), min(mpos, hi_s),
-                                             mpos, count_j, bits, 0xD0 + ((j - 1) % 8))
-                    if s0 is not None:
-                        full = True
-                        n, start_bit = count_j, s0 * 8
-                        preds = np.zeros(pk.ncomp, dtype=np.int32)
-                        bits = [int(b) for b in K.decode_mcus(data, s0, 0, mpos + 2, pk, preds, count_j)[7]]
-                drop = 0 if full else DROP_FIRST
-                n_tail = n - drop
-                s_bit = bits[drop]
-                first_tail = first_of_j + count_j - n_tail
-                preds = np.zeros(pk.ncomp, dtype=np.int32)
-                dn, err, *_rest, end_b, end_bit, _bs, dc_rel = K.decode_mcus(data, s_bit // 8, s_bit % 8, mpos + 2, pk, preds,
-                                                                             n_tail, check_dc=False)
-                if dn != n_tail or err is not None:
-                    break
-                if full:
-                    delta = {cid: 0.0 for cid in pk.cids}
-                else:
-                    delta = refs.offsets(first_tail, dc_rel)
-                    left = _left_offsets(sr, ft, first_tail, dc_rel)
-                    delta = {cid: (delta[cid] if delta[cid] is not None else (left[cid] if left[cid] is not None else 0.0))
-                             for cid in pk.cids}
-                # trim leading MCUs that clash with their neighbours (junk before convergence)
-                trim = 0
-                if not full:
-                    k = min(TRIM_SCAN, n_tail - MIN_TAIL)
-                    anom = head_anomaly(refs, first_tail, dc_rel, delta, pk)
-                    trim = leading_junk(anom)
-                    # junk decoded inside the damage drifts: a step down in the anomaly
-                    clean_part = anom[n_tail // 2 :]
-                    sig = float(np.nanmedian(clean_part)) if not np.all(np.isnan(clean_part)) else 1.0
-                    onset = junk_onset((anom / max(1.0, sig))[::-1])
-                    if onset is not None:
-                        trim = max(trim, n_tail - onset)
-                    trim = min(k, trim)
-                if trim:
-                    s_bit = bits[drop + trim]
-                    n_tail -= trim
-                    first_tail += trim
-                    dc_rel_t = dc_rel[trim:]
-                    # predictor shifts with the dropped MCUs: relative values restart at 0
-                    base = dc_rel[trim - 1][[sum(h * v for h, v in pk.hv[:i + 1]) - 1 for i in range(pk.ncomp)]]
-                    delta = {cid: delta[cid] + float(base[i]) for i, cid in enumerate(pk.cids)}
-                    dc_rel = dc_rel_t - base[np.repeat(np.arange(pk.ncomp), [h * v for h, v in pk.hv])]
-                # keep every spliced DC inside the legal range (|DC*q| <= 1024+q): a bad
-                # neighbour estimate must not produce a file decoders reject
-                ok = True
-                col = 0
-                for ci, cid in enumerate(pk.cids):
-                    q = pk.qdc[ci]
-                    lim = (1024 + q) // q
-                    nb_c = pk.hv[ci][0] * pk.hv[ci][1]
-                    rel = dc_rel[:, col : col + nb_c]
-                    lo_d, hi_d = -lim - int(rel.min()), lim - int(rel.max())
-                    if lo_d > hi_d:
-                        ok = False
-                        break
-                    delta[cid] = float(min(max(delta[cid], lo_d), hi_d))
-                    col += nb_c
-                if not ok:
-                    break
-                tails[j] = {
-                    "start_bit": int(s_bit),
-                    "end_bit": int(end_b * 8 + end_bit),
-                    "n": int(n_tail),
-                    "first_mcu": int(first_tail),
-                    "delta": {int(k): int(round(v)) for k, v in delta.items()},
-                    "full": bool(full),
-                    "dc_rel": dc_rel.astype(np.int32),
-                }
-                recovered += n_tail
-                if not full:
-                    break
-                # the whole interval came back: its own (damaged) marker sits just before it
-                mpos = start_bit // 8 - 2
-                j -= 1
+        tails: dict[int, dict] = {}
+        for part in parallel.pmap(lambda sp: self._span(data, sr, ft, pk, refs, sp), self._spans(sr, parse)):
+            tails.update(part)
+        recovered = sum(t["n"] for t in tails.values())
         if tails:
             ctx.memo["tails"] = tails
             ctx.note(self, f"recovered {recovered} MCU(s) after damaged stretches in {len(tails)} interval(s)",

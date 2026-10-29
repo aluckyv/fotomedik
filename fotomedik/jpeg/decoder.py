@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import re
+
 import numpy as np
 
 from . import markers as M
-from . import kernel
+from . import fastdec, kernel
+from .. import parallel
 from .bitreader import BitReader
 from .kernel import MissingTables  # noqa: F401  (re-exported)
 from .tables import FrameTables
@@ -203,7 +206,44 @@ def preds_before_mcu(sr: ScanResult, ft: FrameTables, mcu_index: int) -> dict[in
     return out
 
 
-def decode_scan(
+_full_cache: dict = {}
+_RST = re.compile(rb"\xff[\xd0-\xd7]")
+
+
+def _predecode(data, start: int, end: int, pk, dri: int) -> dict:
+    """Decode, in parallel threads, `dri` MCUs from the scan start and after every
+    restart marker (fresh predictors). start offset -> (decode_mcus result, predictors)."""
+    if parallel.threads() <= 1 or not fastdec.available() or not isinstance(data, (bytes, bytearray)):
+        return {}
+    starts = [start] + [m.start() + 2 for m in _RST.finditer(data, start, end)]
+    if len(starts) < 4:
+        return {}
+
+    def one(s0):
+        preds = np.zeros(pk.ncomp, dtype=np.int32)
+        return s0, (kernel.decode_mcus(data, s0, 0, end, pk, preds, dri), preds)
+
+    return dict(parallel.pmap(one, starts))
+
+
+def decode_scan(data, parse: M.ParseResult, ft: FrameTables, *args, **kwargs) -> ScanResult:
+    """Decode the scan (see _decode_scan). Whole-file decodes of immutable bytes are
+    cached: the scanner and several recipes decode the same data. Callers must treat
+    the result as read-only."""
+    if args or kwargs or not isinstance(data, bytes):
+        return _decode_scan(data, parse, ft, *args, **kwargs)
+    key = (data, parse.scan_start, parse.eoi_offset, ft.restart_interval)
+    hit = _full_cache.get(key)
+    if hit is not None:
+        return hit
+    sr = _decode_scan(data, parse, ft)
+    if len(_full_cache) >= 4:
+        _full_cache.pop(next(iter(_full_cache)))
+    _full_cache[key] = sr
+    return sr
+
+
+def _decode_scan(
     data: bytes,
     parse: M.ParseResult,
     ft: FrameTables,
@@ -214,6 +254,7 @@ def decode_scan(
     start_bit: int = 0,
     init_preds: dict[int, int] | None = None,
     resync: bool = True,
+    want_dc: bool = True,
 ) -> ScanResult:
     frame = ft.frame
     if frame.progressive or frame.marker not in (0xC0, 0xC1):
@@ -234,7 +275,8 @@ def decode_scan(
     partial = start_byte is not None or end_byte is not None or max_mcus is not None
     limit = total if max_mcus is None else min(total, first_mcu + max_mcus)
 
-    dc_arrays = {c.cid: np.full((c.blocks_h, c.blocks_w), np.nan) for c in comps}
+    # probes only ask whether data decodes: no image-sized DC arrays for them
+    dc_arrays = {c.cid: np.full((c.blocks_h, c.blocks_w), np.nan) for c in comps} if want_dc else {}
     mcu_ok = np.zeros(total, dtype=bool)
     mcus: list[MCUInfo] = []
     intervals: list[Interval] = []
@@ -242,6 +284,10 @@ def decode_scan(
 
     pk = kernel.packed_for(ft)  # raises MissingTables when the header lacks a table
     geom = [(c.cid, c.h, c.v) for c in comps]
+    # Intervals start after restart markers with fresh predictors, so they can be
+    # decoded ahead of time in parallel; the sequential pass below then only stitches
+    # the results together (and decodes directly wherever damage moved things).
+    pre = _predecode(data, start, end, pk, dri) if (dri and not partial and resync) else {}
 
     br = BitReader(data, start, end)
     if start_bit:
@@ -269,13 +315,17 @@ def decode_scan(
         # The kernel (C or Python reference) decodes the interval's MCUs; this
         # function keeps the structure around it (markers, intervals, resync).
         s_off, s_bit = br.tell()
-        preds_arr = np.array([pred[cid] for cid, _h, _v in geom], dtype=np.int32)
-        n, ename, e_off, e_bit, e_marker, end_off, end_bit, bitstarts, dcv = kernel.decode_mcus(
-            data, s_off, s_bit, end, pk, preds_arr, iv_count
-        )
+        hit = pre.get(s_off) if (s_bit == 0 and iv_count == dri and not any(pred.values())) else None
+        if hit is not None:
+            (n, ename, e_off, e_bit, e_marker, end_off, end_bit, bitstarts, dcv), preds_arr = hit
+        else:
+            preds_arr = np.array([pred[cid] for cid, _h, _v in geom], dtype=np.int32)
+            n, ename, e_off, e_bit, e_marker, end_off, end_bit, bitstarts, dcv = kernel.decode_mcus(
+                data, s_off, s_bit, end, pk, preds_arr, iv_count
+            )
         for i in range(n):
             mcus.append(MCUInfo(mcu + i, int(bitstarts[i])))
-        if n:
+        if n and want_dc:
             idx = np.arange(mcu, mcu + n)
             mrow, mcol = np.divmod(idx, mcus_per_row)
             bi = 0
@@ -284,6 +334,7 @@ def decode_scan(
                     for bx in range(h):
                         dc_arrays[cid][mrow * v + by, mcol * h + bx] = dcv[:, bi]
                         bi += 1
+        if n:
             mcu_ok[mcu : mcu + n] = True
         iv.decoded = n
         mcu += n
@@ -396,7 +447,8 @@ def decode_scan(
                 if probe_len and (cand + 1) * dri < total:
                     # bytes after a real marker decode cleanly for a few MCUs, after a fake one rarely
                     probe = decode_scan(data, parse, ft, start_byte=moff + 2, end_byte=end,
-                                        first_mcu=(cand + 1) * dri, max_mcus=probe_len, resync=False)
+                                        first_mcu=(cand + 1) * dri, max_mcus=probe_len, resync=False,
+                                        want_dc=False)
                     if probe.error is not None and probe.error.reason != "eof":
                         continue
                     if fuzzy and not (probe.intervals and probe.intervals[0].ok

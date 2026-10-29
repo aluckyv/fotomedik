@@ -7,14 +7,44 @@ damaged restart interval can be replaced by bytes every decoder accepts.
 
 from __future__ import annotations
 
+import numpy as np
+
+from . import fastdec
 from .tables import FrameTables, HuffmanTable
 
 
 class BitWriter:
+    """Entropy-coded output with FF00 stuffing. Uses the compiled kernel when present
+    (CBitWriter), the Python reference otherwise."""
+
+    def __new__(cls, *a, **kw):
+        if cls is BitWriter and fastdec.load() is not None:
+            return super().__new__(CBitWriter)
+        return super().__new__(cls)
+
     def __init__(self):
         self._out = bytearray()
         self._acc = 0
         self._n = 0
+
+    def copy_bits(self, data: bytes, start_bit: int, end_bit: int) -> None:
+        """Append entropy-coded bits [start_bit, end_bit) of data (positions in the
+        stuffed stream, as the decoder reports them), unstuffed."""
+        p = start_bit // 8
+        first = True
+        n_data = len(data)
+        while p * 8 < end_bit and p < n_data:
+            b = data[p]
+            lo_bit = start_bit % 8 if first else 0
+            hi_bit = 8 if (p + 1) * 8 <= end_bit else end_bit - p * 8
+            n = hi_bit - lo_bit
+            if n > 0:
+                self.put_bits((b >> (8 - hi_bit)) & ((1 << n) - 1), n)
+            first = False
+            if b == 0xFF and p + 1 < n_data and data[p + 1] == 0x00:
+                p += 2
+            else:
+                p += 1
 
     def put_bits(self, value: int, n: int) -> None:
         if n == 0:
@@ -35,6 +65,45 @@ class BitWriter:
             pad = 8 - self._n
             self.put_bits((1 << pad) - 1, pad)
         return bytes(self._out)
+
+
+class CBitWriter(BitWriter):
+    """BitWriter backed by the C kernel: state lives in a numpy buffer."""
+
+    def __init__(self):
+        self._lib = fastdec.load()
+        self._buf = np.empty(1 << 16, dtype=np.uint8)
+        self._st = np.zeros(3, dtype=np.int64)  # bytes written, accumulator, bits in it
+
+    def _reserve(self, extra: int) -> None:
+        need = int(self._st[0]) + extra + 16
+        if need > len(self._buf):
+            nb = np.empty(max(need, 2 * len(self._buf)), dtype=np.uint8)
+            nb[: int(self._st[0])] = self._buf[: int(self._st[0])]
+            self._buf = nb
+
+    def _call(self, fn, *args) -> int:
+        return fn(self._buf.ctypes.data, len(self._buf), self._st.ctypes.data, *args)
+
+    def put_bits(self, value: int, n: int) -> None:
+        if n == 0:
+            return
+        self._reserve(8)
+        if self._call(self._lib.bw_put, value & ((1 << n) - 1), n):
+            raise RuntimeError("bit writer overflow")
+
+    def copy_bits(self, data: bytes, start_bit: int, end_bit: int) -> None:
+        from .kernel import _data_ptr
+
+        self._reserve(2 * ((end_bit - start_bit) // 8 + 2))
+        arr, ptr = _data_ptr(data)
+        if self._call(self._lib.bw_copy, ptr, len(arr), start_bit, end_bit):
+            raise RuntimeError("bit writer overflow")
+
+    def finish(self) -> bytes:
+        self._reserve(4)
+        self._call(self._lib.bw_finish)
+        return self._buf[: int(self._st[0])].tobytes()
 
 
 def codes_for(t: HuffmanTable) -> dict[int, tuple[int, int]]:
@@ -75,9 +144,14 @@ def encode_flat_mcus(
     so the bytes can be glued after existing data without a restart marker.
     With `writer`, bits are appended to it unpadded (more data may follow) and b"" is returned.
     """
+    w = writer if writer is not None else BitWriter()
+    if isinstance(w, CBitWriter):
+        _encode_flat_c(ft, mcu_count, targets, preds, per_block, w)
+        return b"" if writer is not None else w.finish()
     frame, scan = ft.frame, ft.scan
     interleaved = len(scan.components) > 1
-    w = writer if writer is not None else BitWriter()
+    if per_block:
+        per_block = {cid: [int(x) for x in seq] for cid, seq in per_block.items()}
     comps = []
     for sc in scan.components:
         fc = frame.component(sc.id)
@@ -111,6 +185,39 @@ def encode_flat_mcus(
                 ln, code = eob
                 w.put_bits(code, ln)
     return b"" if writer is not None else w.finish()
+
+
+def _encode_flat_c(ft: FrameTables, mcu_count: int, targets: dict, preds: dict, per_block: dict | None,
+                   w: CBitWriter) -> None:
+    from .kernel import packed_for
+
+    pk = packed_for(ft)
+    dc_len, dc_code, eob_len, eob_code = pk.enc_tables(ft)
+    if (eob_len == 0).any():
+        raise ValueError("AC table has no EOB code")
+    cols = []
+    for cid, (h, v) in zip(pk.cids, pk.hv):
+        nb = h * v
+        need = mcu_count * nb
+        if per_block and cid in per_block:
+            seq = np.asarray(per_block[cid], dtype=np.int32)
+            if len(seq) < need:  # the Python encoder repeats the last value
+                seq = np.concatenate([seq, np.full(need - len(seq), seq[-1] if len(seq) else 0, dtype=np.int32)])
+            seq = seq[:need]
+        else:
+            seq = np.full(need, int(targets.get(cid, 0)), dtype=np.int32)
+        cols.append(seq.reshape(mcu_count, nb))
+    tg = np.ascontiguousarray(np.concatenate(cols, axis=1).reshape(-1), dtype=np.int32)
+    pr = np.array([int(preds[cid]) for cid in pk.cids], dtype=np.int32)
+    w._reserve(len(tg) * 12)
+    rc = w._call(w._lib.encode_dc_fill, pk.c_comps, pk.ncomp, dc_len.ctypes.data, dc_code.ctypes.data,
+                 eob_len.ctypes.data, eob_code.ctypes.data, mcu_count, tg.ctypes.data, pr.ctypes.data)
+    if rc == -2:
+        raise ValueError("DC table has no category-0 code")
+    if rc:
+        raise RuntimeError("bit writer overflow")
+    for i, cid in enumerate(pk.cids):
+        preds[cid] = int(pr[i])
 
 
 def gray_dc(ft: FrameTables, cid: int, sample: int) -> int:

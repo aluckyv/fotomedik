@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).parent
-ABI = 10  # must match FASTDEC_ABI in _fastdec.c
+ABI = 11  # must match FASTDEC_ABI in _fastdec.c
 _LIB = None
 _TRIED = False
 
@@ -66,6 +66,18 @@ def load() -> ctypes.CDLL | None:
             h.restype = _I64
             h.argtypes = [_P, _I64, _I64, _I64, ctypes.POINTER(Comp), _INT,
                           _P, _P, _P, _P, _P, _I64, _I64, _I64, _P, _P]
+            fs = lib.find_interval_start
+            fs.restype = _I64
+            fs.argtypes = [_P, _I64, _I64, _I64, _I64, ctypes.POINTER(Comp), _INT,
+                           _P, _P, _P, _P, _P, _I64, _P, _I64, _INT, _INT]
+            lib.bw_put.restype = _INT
+            lib.bw_put.argtypes = [_P, _I64, _P, ctypes.c_uint32, _INT]
+            lib.bw_finish.restype = _INT
+            lib.bw_finish.argtypes = [_P, _I64, _P]
+            lib.bw_copy.restype = _INT
+            lib.bw_copy.argtypes = [_P, _I64, _P, _P, _I64, _I64, _I64]
+            lib.encode_dc_fill.restype = _INT
+            lib.encode_dc_fill.argtypes = [_P, _I64, _P, ctypes.POINTER(Comp), _INT, _P, _P, _P, _P, _I64, _P, _P]
         except AttributeError:
             continue  # stale library from an older build: fall back to Python
         _LIB = lib

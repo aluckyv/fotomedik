@@ -113,3 +113,64 @@ def test_tail_flow_parity_and_recovery():
     assert k <= 6
     assert n - k >= iv.mcu_count // 3
     assert flows[-1] == max(flows)  # every start flows into the last MCU
+
+
+@needs_c
+def test_encoder_and_bit_copy_parity():
+    """DC-only fill and bit copying give the same bytes in C and Python."""
+    from fotomedik.jpeg.encoder import BitWriter, encode_flat_mcus
+
+    data = make_jpeg(make_image(), restart_rows=1)
+    res, ft, pk = _setup(data)
+    rng = np.random.default_rng(3)
+    count = 37
+    per_block = {cid: rng.integers(-120, 120, count * h * v) for cid, (h, v) in zip(pk.cids, pk.hv)}
+
+    def run():
+        w = BitWriter()
+        w.put_bits(0b101, 3)
+        preds = {cid: 5 for cid in pk.cids}
+        encode_flat_mcus(ft, count, {}, preds, per_block, writer=w)
+        w.copy_bits(data, res.scan_start * 8 + 3, res.scan_start * 8 + 3 + 4000)
+        return w.finish(), preds
+
+    (c_bytes, c_preds), (py_bytes, py_preds) = _both(run)
+    assert c_bytes == py_bytes and c_preds == py_preds
+
+
+@needs_c
+def test_find_interval_start_parity():
+    data = make_jpeg(make_image(512, 256), restart_rows=1)
+    res, ft, pk = _setup(data)
+    ref = D.decode_scan(data, res, ft)
+    iv = ref.intervals[5]
+    known = [m.bit_start for m in ref.mcus if iv.mcu_first + 5 <= m.index < iv.mcu_first + iv.mcu_count]
+
+    def run():
+        return kernel.find_interval_start(data, iv.byte_start - 40, iv.byte_start + 40, iv.byte_end, pk,
+                                          iv.mcu_count, known, 0xD0 + 4)
+
+    c, py = _both(run)
+    assert c == py == iv.byte_start
+
+
+def test_parallel_decode_matches_serial():
+    from fotomedik import parallel
+
+    data = make_jpeg(make_image(512, 256), restart_rows=1)
+    broken = flip_bits(data, len(data) // 2, 0x10)
+    res, ft, _pk = _setup(broken)
+    out = []
+    for t in (1, 4):
+        parallel.set_threads(t)
+        D._full_cache.clear()
+        try:
+            out.append(D.decode_scan(broken, res, ft))
+        finally:
+            parallel.set_threads(None)
+    a, b = out
+    assert [(i.ok, i.decoded, i.byte_start, i.byte_end) for i in a.intervals] == \
+        [(i.ok, i.decoded, i.byte_start, i.byte_end) for i in b.intervals]
+    assert (a.mcu_ok == b.mcu_ok).all()
+    for cid in a.dc:
+        assert np.array_equal(a.dc[cid], b.dc[cid], equal_nan=True)

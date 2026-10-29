@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import csv
+import multiprocessing
 import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import click
 
+from . import parallel
 from . import recipes  # noqa: F401  (registers built-in recipes)
 from .jpeg import markers as M
 from .jpeg.tables import TableError, parse_sof
@@ -101,27 +104,75 @@ def _repair_file(args: tuple[str, str, str, dict, CameraProfile | None]) -> tupl
     return rep, time.perf_counter() - t
 
 
-def _pool_map(fn, items: list, jobs: int, cost=None):
-    """Map in parallel processes, results in input order; in-process for jobs <= 1.
+def _worker_init(counter) -> None:
+    parallel.attach_batch_counter(counter)
 
-    `cost(item)` orders the submission (biggest first) so long files do not end up
-    last on an otherwise idle pool.
-    """
-    if jobs <= 1 or len(items) <= 1:
-        return [fn(it) for it in items]
-    order = sorted(range(len(items)), key=(lambda i: -cost(items[i])) if cost else (lambda i: i))
-    out: list = [None] * len(items)
-    with ProcessPoolExecutor(max_workers=min(jobs, len(items))) as ex:
-        for i, res in zip(order, ex.map(fn, [items[i] for i in order])):
+
+def _counted(fn, item):
+    """Run fn in a batch worker; the shared counter of unfinished files tells every
+    worker how many cores it may use inside its file (see parallel.threads)."""
+    try:
+        return fn(item)
+    finally:
+        counter = parallel._remaining
+        if counter is not None:
+            with counter.get_lock():
+                counter.value -= 1
+
+
+class Workers:
+    """Worker processes shared by all phases of one run (starting them costs time).
+    Every core is used: files run in parallel processes, and inside a file the work
+    spreads over threads as cores free up (see parallel.threads)."""
+
+    def __init__(self, jobs: int, n_items: int):
+        self.ex = None
+        self.counter = None
+        if jobs > 1 and n_items > 1:
+            # workers start from a clean process (forking a process that runs threads can deadlock)
+            mp = multiprocessing.get_context("spawn" if sys.platform == "win32" else "forkserver")
+            self.counter = mp.Value("i", n_items)
+            self.ex = ProcessPoolExecutor(max_workers=min(jobs, n_items), mp_context=mp,
+                                          initializer=_worker_init, initargs=(self.counter,))
+
+    def map(self, fn, items: list, cost=None, counted: bool = False) -> list:
+        """Results in input order. `cost(item)` orders the submission (biggest first) so
+        long files do not end up last on an otherwise idle pool. `counted`: each finished
+        item lowers the count of unfinished files that sets the threads per file."""
+        if self.ex is None or len(items) <= 1:
+            return [fn(it) for it in items]
+        if counted:
+            with self.counter.get_lock():
+                self.counter.value = len(items)
+        order = sorted(range(len(items)), key=(lambda i: -cost(items[i])) if cost else (lambda i: i))
+        out: list = [None] * len(items)
+        task = partial(_counted, fn) if counted else fn
+        for i, res in zip(order, self.ex.map(task, [items[i] for i in order])):
             out[i] = res
-    return out
+        return out
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.ex is not None:
+            self.ex.shutdown()
 
 
-def _learn_candidates(files: list[tuple[Path, Path]], echo, jobs: int = 1) -> list[CameraProfile]:
+def _pool_map(fn, items: list, jobs: int, cost=None):
+    """One-off parallel map (see Workers)."""
+    with Workers(jobs, len(items)) as w:
+        return w.map(fn, items, cost, counted=True)
+
+
+def _learn_candidates(files: list[tuple[Path, Path]], echo, jobs: int = 1, workers: "Workers | None" = None
+                      ) -> list[CameraProfile]:
     """Healthy headers in the set become reference profiles for the damaged ones."""
     profiles: list[CameraProfile] = []
     seen: set[tuple] = set()
-    for prof in _pool_map(_profile_of, [(str(p), str(rel)) for p, rel in files], jobs):
+    items = [(str(p), str(rel)) for p, rel in files]
+    found = workers.map(_profile_of, items) if workers is not None else _pool_map(_profile_of, items, jobs)
+    for prof in found:
         if prof is None:
             continue
         key = (prof.model, prof.width, prof.height, tuple(prof.dqt), tuple(prof.dht), prof.restart_interval)
@@ -162,10 +213,11 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
     options = {"mark_holes": mark_holes, "keep_damaged": keep_damaged, "time_budget": time_budget}
     profile = CameraProfile.from_json(Path(ref).read_text(encoding="utf-8")) if ref else None
     files = [(p, rel) for p, rel in _iter_files(path) if not p.resolve().is_relative_to(out.resolve())]
-    if auto_ref and len(files) > 1:
-        options["ref_candidates"] = _learn_candidates(files, click.echo, jobs)
-    work = [(str(p), str(rel), str(out), options, profile) for p, rel in files]
-    results = _pool_map(_repair_file, work, jobs, cost=lambda it: os.path.getsize(it[0]))
+    with Workers(jobs, len(files)) as workers:
+        if auto_ref and len(files) > 1:
+            options["ref_candidates"] = _learn_candidates(files, click.echo, jobs, workers)
+        work = [(str(p), str(rel), str(out), options, profile) for p, rel in files]
+        results = workers.map(_repair_file, work, cost=lambda it: os.path.getsize(it[0]), counted=True)
     reports: list[FileReport] = []
     for rep, secs in results:
         reports.append(rep)

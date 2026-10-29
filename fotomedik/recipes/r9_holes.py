@@ -116,20 +116,7 @@ def decode_for(ctx: Context) -> tuple[M.ParseResult, FrameTables, D.ScanResult] 
 def _stream_bits(w: BitWriter, data: bytes, start_bit: int, end_bit: int) -> None:
     """Append entropy-coded bits [start_bit, end_bit) of `data` (positions as the
     decoder reports them: byte offsets in the stuffed stream) to w, unstuffed."""
-    p = start_bit // 8
-    first = True
-    while p * 8 < end_bit:
-        b = data[p]
-        lo_bit = start_bit % 8 if first else 0
-        hi_bit = 8 if (p + 1) * 8 <= end_bit else end_bit - p * 8
-        n = hi_bit - lo_bit
-        if n > 0:
-            w.put_bits((b >> (8 - hi_bit)) & ((1 << n) - 1), n)
-        first = False
-        if b == 0xFF and p + 1 < len(data) and data[p + 1] == 0x00:
-            p += 2  # skip stuffing byte
-        else:
-            p += 1
+    w.copy_bits(data, start_bit, end_bit)
 
 
 @register
@@ -304,10 +291,11 @@ class FillHoles(Recipe):
                     for by in range(v):
                         for bx in range(h):
                             cols.append(np.rint(interp[cid][mrow * v + by, mcol * h + bx]).astype(int))
-                    seq = list(np.stack(cols, axis=1).reshape(-1)) if cols else []
-                if last_override is not None and seq:
+                    seq = np.stack(cols, axis=1).reshape(-1) if cols else np.zeros(0, dtype=int)
+                seq = np.asarray(seq, dtype=np.int32)
+                if last_override is not None and len(seq):
                     seq[-1] = int(last_override[cid])
-                per_block[cid] = [int(x) for x in seq]
+                per_block[cid] = seq
             return per_block
 
         def last_block_preds(mi):

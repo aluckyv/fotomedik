@@ -89,6 +89,27 @@ class Packed:
             self.symbols[slot, : len(t.symbols)] = list(t.symbols)
         self.ncomp = len(comps)
         self.c_comps = (fastdec.Comp * len(comps))(*[fastdec.Comp(*c) for c in comps])
+        # raw table pointers, computed once (getting a pointer per call is slow)
+        self.tp = tuple(a.ctypes.data for a in (self.fast, self.maxcode, self.valptr, self.mincode, self.symbols))
+        self._enc = None
+
+    def enc_tables(self, ft: FrameTables):
+        """Huffman codes for the DC-only encoder: dc_len/dc_code int32[ncomp, 16],
+        eob_len/eob_code int32[ncomp] (length 0 = symbol absent)."""
+        if self._enc is None:
+            dc_len = np.zeros((self.ncomp, 16), dtype=np.int32)
+            dc_code = np.zeros((self.ncomp, 16), dtype=np.int32)
+            eob_len = np.zeros(self.ncomp, dtype=np.int32)
+            eob_code = np.zeros(self.ncomp, dtype=np.int32)
+            for i, sc in enumerate(ft.scan.components):
+                for (ln, code), sym in ft.huff[(0, sc.td)].lookup.items():
+                    if sym < 16:
+                        dc_len[i, sym], dc_code[i, sym] = ln, code
+                for (ln, code), sym in ft.huff[(1, sc.ta)].lookup.items():
+                    if sym == 0:
+                        eob_len[i], eob_code[i] = ln, code
+            self._enc = (dc_len, dc_code, eob_len, eob_code)
+        return self._enc
 
 
 _packed_cache: dict[int, tuple[FrameTables, Packed]] = {}
@@ -107,6 +128,25 @@ def packed_for(ft: FrameTables) -> Packed:
 
 def _ptr(a) -> int:
     return a.ctypes.data
+
+
+_data_cache: dict[int, tuple] = {}
+
+
+def _data_ptr(data) -> tuple[np.ndarray, int]:
+    """uint8 array over data and its address; cached for immutable bytes."""
+    if isinstance(data, bytes):
+        hit = _data_cache.get(id(data))
+        if hit is not None and hit[0] is data:
+            return hit[1], hit[2]
+        arr = np.frombuffer(data, dtype=np.uint8)
+        if len(_data_cache) >= 16:
+            _data_cache.clear()
+        ptr = arr.ctypes.data
+        _data_cache[id(data)] = (data, arr, ptr)
+        return arr, ptr
+    arr = as_array(data)
+    return arr, arr.ctypes.data
 
 
 def as_array(data) -> np.ndarray:
@@ -256,14 +296,14 @@ def decode_mcus(data, start_byte: int, start_bit: int, end: int, pk: Packed, pre
     lib = fastdec.load()
     bpm = pk.blocks_per_mcu
     if lib is not None:
-        arr = as_array(data)
+        _arr, dptr = _data_ptr(data)
         cap = max(1, max_mcus)
-        bitstarts = np.zeros(cap, dtype=np.int64)
-        dc_vals = np.zeros(cap * bpm, dtype=np.int32)
+        bitstarts = np.empty(cap, dtype=np.int64)
+        dc_vals = np.empty(cap * bpm, dtype=np.int32)
         out = np.zeros(6, dtype=np.int64)
         n = int(lib.decode_mcus(
-            _ptr(arr), start_byte, start_bit, end, pk.c_comps, pk.ncomp,
-            _ptr(pk.fast), _ptr(pk.maxcode), _ptr(pk.valptr), _ptr(pk.mincode), _ptr(pk.symbols),
+            dptr, start_byte, start_bit, end, pk.c_comps, pk.ncomp,
+            *pk.tp,
             max_mcus, _ptr(preds), _ptr(bitstarts), _ptr(dc_vals), _ptr(out), 1 if check_dc else 0,
         ))
         return (n, ERR_NAMES[int(out[0])], int(out[1]), int(out[2]), int(out[3]), int(out[4]), int(out[5]),
@@ -313,7 +353,7 @@ def eval_flips(buf: np.ndarray, start_byte: int, start_bit: int, end: int, pk: P
         p0 = np.ascontiguousarray(preds0, dtype=np.int32)
         lib.eval_flips(
             _ptr(buf), len(buf), start_byte, start_bit, end, pk.c_comps, pk.ncomp,
-            _ptr(pk.fast), _ptr(pk.maxcode), _ptr(pk.valptr), _ptr(pk.mincode), _ptr(pk.symbols),
+            *pk.tp,
             _ptr(p0), needed, stage1_n, marker_pos, expect_marker, min_gain,
             _ptr(mcu_bits), nknown, _ptr(cur_dc),
             _ptr(offs), _ptr(masks), ncand,
@@ -457,14 +497,75 @@ def tail_flow(data, lo: int, marker_pos: int, pk: Packed, cap: int, step: int | 
     lib = fastdec.load()
     if lib is None:
         return py_tail_flow(_pydata(data), lo, marker_pos, pk, step, TAIL_MAX_NODES, cap)
-    arr = as_array(data)
+    arr, dptr = _data_ptr(data)
     bits = np.zeros(max(1, cap), dtype=np.int64)
     flows = np.zeros(max(1, cap), dtype=np.int32)
+    trials = 2 * ((marker_pos - lo) // step + 1)
+    max_nodes = min(TAIL_MAX_NODES, 16 * trials + 4 * cap + 4096)  # memory sized to the job
     n = int(lib.tail_flow(
-        _ptr(arr), len(arr), lo, marker_pos, pk.c_comps, pk.ncomp,
-        _ptr(pk.fast), _ptr(pk.maxcode), _ptr(pk.valptr), _ptr(pk.mincode), _ptr(pk.symbols),
-        step, TAIL_MAX_NODES, cap, _ptr(bits), _ptr(flows),
+        dptr, len(arr), lo, marker_pos, pk.c_comps, pk.ncomp,
+        *pk.tp,
+        step, max_nodes, cap, _ptr(bits), _ptr(flows),
     ))
     if n < 0:
         raise MemoryError("tail_flow: out of memory")
     return [int(x) for x in bits[:n]], [int(x) for x in flows[:n]]
+
+
+def py_find_interval_start(data, lo: int, hi: int, mpos: int, pk: Packed, count: int, known: list[int],
+                           prev_marker: int, probe: int) -> int:
+    """Reference for the C find_interval_start (see _fastdec.c)."""
+    rem = {b: len(known) - i for i, b in enumerate(known)}
+    best, best_ham = -1, 1 << 20
+    length = len(data)
+    for s in range(lo, hi):
+        p = [0] * pk.ncomp
+        n, err, _eb, _ebit, _mk, end_b, end_bit, bits, _dc = py_run_decode(data, s, 0, mpos + 2, pk, probe, p)
+        total = None
+        for i in range(1, len(bits)):
+            if bits[i] in rem:
+                total = i + rem[bits[i]]
+                break
+        if total is None and err == 0:
+            e = end_b * 8 + end_bit
+            if e in rem:
+                total = n + rem[e]
+        if total != count:
+            continue
+        p = [0] * pk.ncomp
+        n, err, _eb, _ebit, _mk, end_b, end_bit, _bits, _dc = py_run_decode(data, s, 0, mpos + 2, pk, count, p,
+                                                                            want_bits=False)
+        if n != count or err:
+            continue
+        a, pad = py_aligned_end(data, length, end_b, end_bit)
+        if a != mpos or not pad:
+            continue
+        ham = 16
+        if s >= 2 and prev_marker >= 0:
+            ham = bin(data[s - 2] ^ 0xFF).count("1") + bin(data[s - 1] ^ prev_marker).count("1")
+        if ham < best_ham:
+            best, best_ham = s, ham
+    return best
+
+
+def find_interval_start(data, lo: int, hi: int, mpos: int, pk: Packed, count: int, known: list[int],
+                        prev_marker: int | None = None, probe: int = 8) -> int | None:
+    """Byte offset where a whole interval of `count` MCUs ending at the marker at mpos
+    starts, or None. Each candidate offset in [lo, hi) is decoded a few MCUs (fresh
+    predictors) until it lands on the reference parse `known` (MCU start bits of the
+    tail), which fixes its MCU count; those with the right count must then decode in
+    full and end exactly on the marker. Junk starting inside the first true MCU can
+    pass too, so the one preceded by the most marker-like byte pair (the previous
+    interval's damaged RST) wins, then the earliest."""
+    if not known or hi <= lo:
+        return None
+    pm = -1 if prev_marker is None else prev_marker
+    lib = fastdec.load()
+    if lib is None:
+        s = py_find_interval_start(_pydata(data), lo, hi, mpos, pk, count, list(known), pm, probe)
+    else:
+        arr, dptr = _data_ptr(data)
+        kn = np.asarray(known, dtype=np.int64)
+        s = int(lib.find_interval_start(dptr, len(arr), lo, hi, mpos, pk.c_comps, pk.ncomp, *pk.tp,
+                                        count, _ptr(kn), len(kn), pm, probe))
+    return None if s < 0 else s
