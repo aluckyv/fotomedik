@@ -292,7 +292,7 @@ class SegmentPlacement(Recipe):
         for iv in sr.intervals:
             if not iv.ok:
                 clean[iv.mcu_first : iv.mcu_first + iv.mcu_count] = False
-        thumb = ctx.memo["thumb_base"] if "thumb_base" in ctx.memo else thumbnail_base(data, ft, sr, clean)
+        thumb = ctx.memo["thumb_base"] if "thumb_base" in ctx.memo else thumbnail_base(data, ft, sr, clean, ctx.options.get("thumb_refs"))
         ctx.memo["thumb_base"] = thumb
         placer = Placer(ft, sr, thumb, clean)
         jobs = self._jobs(sr, parse, ft, tails)

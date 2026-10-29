@@ -59,6 +59,7 @@ class CameraProfile:
     sos: bytes = b""  # SOS payload
     jfif: bytes | None = None  # APP0 payload, if the camera writes one
     source: str = ""
+    votes: int = 1  # photos of the set that carry exactly this header
 
     @classmethod
     def from_jpeg(cls, data: bytes, source: str = "") -> "CameraProfile":

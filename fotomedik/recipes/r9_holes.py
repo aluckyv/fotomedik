@@ -222,7 +222,7 @@ class FillHoles(Recipe):
                 clean[iv.mcu_first : iv.mcu_first + iv.mcu_count] = False
         thumb = ctx.memo.get("thumb_base")
         if thumb is None and "thumb_base" not in ctx.memo:
-            thumb = thumbnail_base(data, ft, sr, clean)
+            thumb = thumbnail_base(data, ft, sr, clean, ctx.options.get("thumb_refs"))
             ctx.memo["thumb_base"] = thumb
 
         def fields_for(arr_of, mask):

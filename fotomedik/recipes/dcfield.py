@@ -28,6 +28,8 @@ THUMB_MIN_BLOCKS = 200
 UNCAL_MIN_R = 0.5  # agreement needed with whatever decoded when there is too little clean data
 UNCAL_SIGMA = (6.0, 3.0)  # expected error (gray levels, luma/chroma) of an uncalibrated thumbnail
 RESID_DECAY = 4.0  # block rows over which a clean row's correction to the thumbnail fades
+FADE_ROWS = 6.0  # block rows over which a one-sided fill fades to the average colour
+RESCUED_MIN_R = 0.6  # a repaired thumbnail must agree this well with what decoded
 THUMB_DIST = 3.0  # block rows a thumbnail-only reference counts as (for ordering by reliability)
 
 
@@ -81,6 +83,7 @@ class ThumbBase:
     sigma: dict  # cid -> typical |error| of it vs clean blocks, gray levels
     r: float  # luma correlation with the clean blocks
     fit: dict  # cid -> (gain, offset in gray levels) of the calibration
+    rescued: bool = False  # the thumbnail was damaged too and has been repaired first
 
 
 def build_field(arr: np.ndarray, okm: np.ndarray, q: int, base: np.ndarray | None = None,
@@ -88,45 +91,146 @@ def build_field(arr: np.ndarray, okm: np.ndarray, q: int, base: np.ndarray | Non
     sv = vertical_noise(arr, okm, q)
     if base is None:
         val, dist = vertical_reference(arr, okm)
+        # Known on one side only (e.g. everything below the last real row is lost): a
+        # copied row turns into vertical streaks, so fade towards the picture's average
+        # colour with the distance instead.
+        rows = arr.shape[0]
+        ridx = np.arange(rows)[:, None]
+        has_above = np.maximum.accumulate(np.where(okm, ridx, -1), axis=0) >= 0
+        has_below = (np.minimum.accumulate(np.where(okm, ridx, rows)[::-1], axis=0)[::-1]) < rows
+        one_side = ~okm & (has_above ^ has_below)
+        if one_side.any() and okm.any():
+            mean = float(np.mean(arr[okm]))
+            w = np.exp(-np.maximum(0.0, dist - 1.0) / FADE_ROWS)
+            val = np.where(one_side, mean + (val - mean) * w, val)
         sigma = sv * (1.0 + 0.5 * np.maximum(0.0, dist - 1.0))
         return Field(val, dist, np.where(np.isfinite(dist), sigma, np.inf))
-    resid = np.where(okm, arr - base, np.nan)
-    rv, dist = vertical_reference(np.nan_to_num(resid), okm)
+    known = np.isfinite(base)
+    resid = np.where(okm & known, arr - base, np.nan)
+    rv, dist = vertical_reference(np.nan_to_num(resid), okm & known)
     w = np.where(np.isfinite(dist), np.exp(-np.maximum(0.0, dist - 1.0) / RESID_DECAY), 0.0)
     val = base + np.where(np.isfinite(dist), rv, 0.0) * w
     val = np.where(okm, arr, val)
     bs = max(base_sigma or sv, sv)
     sigma = bs + (sv - bs) * w
-    return Field(val, np.minimum(dist, THUMB_DIST), sigma)
+    dist = np.minimum(dist, THUMB_DIST)
+    if not known.all():
+        # where the (rescued) thumbnail has no data, only the clean rows can tell
+        plain = build_field(arr, okm, q)
+        val = np.where(known, val, plain.val)
+        dist = np.where(known, dist, plain.dist)
+        sigma = np.where(known, sigma, plain.sigma)
+    return Field(val, dist, sigma)
 
 
-def _crop_black_bars(img: np.ndarray) -> np.ndarray:
+def _crop_black_bars(img: np.ndarray, mask: np.ndarray | None = None):
     """Letterboxed thumbnails (16:9 photo in a 4:3 preview) carry black bars."""
     y = img[:, :, 0]
     rows = np.where(y.max(axis=1) > 24)[0]
     cols = np.where(y.max(axis=0) > 24)[0]
-    if len(rows) < 8 or len(cols) < 8:
-        return img
-    return img[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
+    if len(rows) < 8 or len(cols) < 8 or mask is not None:
+        return img, mask
+    return img[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1], None
 
 
-def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray) -> ThumbBase | None:
+RESCUE_MIN = 0.25  # share of a damaged thumbnail that must come back to be of use
+
+
+def thumbnail_image(data: bytes, thumb_refs: list | None = None, landscape: bool | None = None):
+    """(YCbCr pixels, mask of real pixels or None when all are) of the embedded
+    thumbnail, or None. A thumbnail that is damaged itself - it sits in the same rotted
+    sectors as the header - is repaired first: its header comes from a healthy
+    thumbnail of the set (thumb_refs), its scan goes through tail recovery and hole
+    filling, and only its real parts count."""
+    from .r8_thumbnail import extract_thumbnail
+
+    blob = extract_thumbnail(data)
+    if blob is not None:
+        try:
+            im = Image.open(io.BytesIO(blob))
+            im.load()
+            return np.asarray(im.convert("YCbCr")), None
+        except Exception:
+            pass
+    if not thumb_refs:
+        return None
+    if landscape is not None:
+        # a thumbnail header of the other orientation would decode the scan sheared
+        thumb_refs = [r for r in thumb_refs if (r.width >= r.height) == landscape] or thumb_refs
+    return _rescue_thumbnail(data, thumb_refs)
+
+
+def _rescue_thumbnail(data: bytes, thumb_refs: list):
+    from ..jpeg import markers as M
+    from .base import Context
+    from .r7_reference import CLOSE_SOS, _POPCOUNT
+    from .r9_holes import FillHoles
+    from .r10_tails import TailRecovery
+    from .registry import run_pipeline
+
+    head = data[: min(len(data), 1 << 16)]
+    arr = np.frombuffer(head, dtype=np.uint8)
+    best = None
+    for ref in thumb_refs[:4]:
+        sos = ref.sos_bytes
+        L = len(sos)
+        if len(arr) <= L:
+            continue
+        dist = np.zeros(len(arr) - L + 1, dtype=np.int32)
+        for j in range(L):
+            dist += _POPCOUNT[np.bitwise_xor(arr[j : len(arr) - L + 1 + j], sos[j])]
+        close = np.flatnonzero(dist <= CLOSE_SOS * 8 * L)
+        if not len(close):
+            continue
+        start = int(close[0]) + L  # the thumbnail's SOS comes first
+        end = head.find(b"\xff\xd9", start)
+        end = end + 2 if end > 0 else len(head)
+        blob = ref.header_bytes(ref.width, ref.height, []) + head[start:end]
+        if not blob.endswith(b"\xff\xd9"):
+            blob += b"\xff\xd9"
+        ctx = Context(data=blob, name="thumbnail", options={"time_budget": 0.5})
+        try:
+            ctx = run_pipeline(ctx, recipes=[TailRecovery(), FillHoles()])
+            im = Image.open(io.BytesIO(ctx.data))
+            im.load()
+        except Exception:
+            continue
+        if ctx.recovered_fraction is not None:
+            frac = ctx.recovered_fraction
+        else:  # nothing needed repair: the scan decodes as it is
+            from ..scan.scanner import scan_bytes
+
+            frac = scan_bytes(ctx.data).recovered_fraction
+        if frac < RESCUE_MIN or (best is not None and frac <= best[0]):
+            continue
+        res = M.parse_segments(ctx.data)
+        from ..jpeg.tables import FrameTables
+
+        frame = FrameTables.from_parse(res).frame
+        mw, mh = frame.mcu_width, frame.mcu_height
+        per_row = -(-frame.width // mw)
+        mask = np.ones((im.size[1], im.size[0]), dtype=bool)
+        for hole in ctx.holes:
+            for mi in range(hole.mcu_first, hole.mcu_first + hole.mcu_count):
+                r, c = divmod(mi, per_row)
+                mask[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw] = False
+        best = (frac, np.asarray(im.convert("YCbCr")), mask)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,
+                   thumb_refs: list | None = None) -> ThumbBase | None:
     """The embedded thumbnail mapped onto each component's block grid as DC values,
     calibrated against the clean blocks (dc = a * thumb + b). None when there is no
     thumbnail, its shape does not match the frame, or it does not agree with the clean
     part of the image."""
-    from .r8_thumbnail import extract_thumbnail
-
-    blob = extract_thumbnail(data)
-    if blob is None:
+    got = thumbnail_image(data, thumb_refs, landscape=ft.frame.width >= ft.frame.height)
+    if got is None:
         return None
-    try:
-        im = Image.open(io.BytesIO(blob))
-        im.load()
-        img = np.asarray(im.convert("YCbCr"))
-    except Exception:
-        return None
-    img = _crop_black_bars(img)
+    img, mask = got
+    img, mask = _crop_black_bars(img, mask)
     frame = ft.frame
     th, tw = img.shape[:2]
     if abs((tw / th) / (frame.width / frame.height) - 1.0) > 0.03:
@@ -155,16 +259,27 @@ def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray) ->
             grid[:, bw:] = grid[:, bw - 1 : bw]
         q = ft.quant[frame.component(c.cid).tq].dc
         tdc = (grid - 128.0) * 8.0 / q
-        okm = block_mask(clean_mcus, arr, c.h, c.v, per_row)
+        if mask is not None:
+            mplane = Image.fromarray((mask * 255).astype(np.uint8))
+            mup = np.asarray(mplane.resize((max(1, bw), max(1, bh)), Image.BILINEAR), dtype=float) / 255.0
+            mgrid = np.zeros((rows, cols))
+            mgrid[: min(rows, bh), : min(cols, bw)] = mup[: min(rows, bh), : min(cols, bw)]
+            if bh < rows:
+                mgrid[bh:, :] = mgrid[bh - 1 : bh, :]
+            if bw < cols:
+                mgrid[:, bw:] = mgrid[:, bw - 1 : bw]
+            tdc = np.where(mgrid > 0.99, tdc, np.nan)  # only where the thumbnail itself is real
+        okm = block_mask(clean_mcus, arr, c.h, c.v, per_row) & np.isfinite(tdc)
         x, y = tdc[okm], arr[okm]
         if len(x) < THUMB_MIN_BLOCKS:
             # too little clean data to calibrate: cameras render the thumbnail from the
             # same picture (measured gain 0.98-1.1, offset < 4 gray levels), so use it as
             # is - unless whatever did decode contradicts it
-            anyok = block_mask(sr.mcu_ok, arr, c.h, c.v, per_row)
+            anyok = block_mask(sr.mcu_ok, arr, c.h, c.v, per_row) & np.isfinite(tdc)
+            need_r = RESCUED_MIN_R if mask is not None else UNCAL_MIN_R
             if ci == 0 and int(anyok.sum()) >= 50:
                 xa, ya = tdc[anyok], arr[anyok]
-                if np.std(xa) > 1e-6 and np.std(ya) > 1e-6 and np.corrcoef(xa, ya)[0, 1] < UNCAL_MIN_R:
+                if np.std(xa) < 1e-6 or np.std(ya) < 1e-6 or np.corrcoef(xa, ya)[0, 1] < need_r:
                     return None
             out[c.cid] = tdc
             sig[c.cid] = UNCAL_SIGMA[min(ci, 1)]
@@ -184,4 +299,4 @@ def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray) ->
         out[c.cid] = a * tdc + b
         fit[c.cid] = (round(a, 3), round(b * q / 8.0, 1))
         sig[c.cid] = max(1.0, float(np.median(np.abs(y - out[c.cid][okm]))) * q / 8.0)
-    return ThumbBase(out, sig, r_luma, fit)
+    return ThumbBase(out, sig, r_luma, fit, mask is not None)

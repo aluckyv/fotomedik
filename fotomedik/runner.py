@@ -59,7 +59,7 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
     with Workers(jobs, len(files)) as workers:
         if len(files) > 1:
             say("Learning from the healthy photos in the set…")
-            options["ref_candidates"] = _learn_candidates(files, say, jobs, workers)
+            options["ref_candidates"], options["thumb_refs"] = _learn_candidates(files, say, jobs, workers)
         work = [(str(p), str(rel), str(out), options, None) for p, rel in files]
         order = sorted(range(len(work)), key=lambda i: -os.path.getsize(work[i][0]))
         say(f"Repairing {len(work)} photo(s)…")

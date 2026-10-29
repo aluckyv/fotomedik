@@ -270,7 +270,7 @@ class TailRecovery(Recipe):
         for iv in sr.intervals:
             if not iv.ok:
                 clean[iv.mcu_first : iv.mcu_first + iv.mcu_count] = False
-        thumb = thumbnail_base(data, ft, sr, clean)
+        thumb = thumbnail_base(data, ft, sr, clean, ctx.options.get("thumb_refs"))
         ctx.memo["thumb_base"] = thumb
         refs = References(sr, ft, thumb)
         tails: dict[int, dict] = {}

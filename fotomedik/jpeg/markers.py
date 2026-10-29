@@ -155,4 +155,10 @@ def parse_segments(data: bytes) -> ParseResult:
         p = seg.end
         if m == SOS:
             res.scan_start = p
+            if res.eoi_offset is not None and res.eoi_offset < p:
+                res.eoi_offset = None  # that FF D9 ends the embedded thumbnail, not the image
+            if res.eoi_offset is None and n - p >= 4:
+                # the last two bytes a few flipped bits away from FF D9: the image's end marker
+                if bin(data[n - 2] ^ 0xFF).count("1") + bin(data[n - 1] ^ EOI).count("1") <= 3:
+                    res.eoi_offset = n - 2
             return res

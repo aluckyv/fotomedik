@@ -78,15 +78,26 @@ def _write_outputs(ctx: Context, rep: FileReport, out_dir: Path, rel: Path) -> P
     return target
 
 
-def _profile_of(args: tuple[str, str]) -> CameraProfile | None:
-    """Worker: a reference profile from a file whose header and most of the scan are healthy."""
+def _profile_of(args: tuple[str, str]) -> tuple[CameraProfile, float, CameraProfile | None] | None:
+    """Worker: the header of a file as a reference profile, with the share of its scan
+    that decodes (a damaged scan does not make the header less useful), and the header
+    of its embedded thumbnail (a reference for rescuing damaged thumbnails)."""
     path, rel = args
     try:
         data = Path(path).read_bytes()
         d = scan_bytes(data, Path(rel).name)
-        if not d.openable or d.recovered_fraction < 0.5:
+        if not d.openable:
             return None
-        return CameraProfile.from_jpeg(data, source=rel)
+        thumb = None
+        try:
+            from .recipes.r8_thumbnail import extract_thumbnail
+
+            blob = extract_thumbnail(data)
+            if blob is not None:
+                thumb = CameraProfile.from_jpeg(blob, source=f"{rel} (thumbnail)")
+        except Exception:
+            thumb = None
+        return CameraProfile.from_jpeg(data, source=rel), d.recovered_fraction, thumb
     except Exception:
         return None
 
@@ -166,23 +177,33 @@ def _pool_map(fn, items: list, jobs: int, cost=None):
 
 
 def _learn_candidates(files: list[tuple[Path, Path]], echo, jobs: int = 1, workers: "Workers | None" = None
-                      ) -> list[CameraProfile]:
+                      ) -> tuple[list[CameraProfile], list[CameraProfile]]:
     """Healthy headers in the set become reference profiles for the damaged ones."""
-    profiles: list[CameraProfile] = []
-    seen: set[tuple] = set()
     items = [(str(p), str(rel)) for p, rel in files]
     found = workers.map(_profile_of, items) if workers is not None else _pool_map(_profile_of, items, jobs)
-    for prof in found:
-        if prof is None:
-            continue
-        key = (prof.model, prof.width, prof.height, tuple(prof.dqt), tuple(prof.dht), prof.restart_interval)
-        if key in seen:
-            continue
-        seen.add(key)
-        profiles.append(prof)
+    # Identical headers are counted: a header shared by many photos of the set is certainly
+    # the camera's, while a lone variant may carry a flipped bit in its tables.
+    def ranked(pairs) -> list[CameraProfile]:
+        groups: dict[tuple, list] = {}
+        for prof, health in pairs:
+            key = (prof.make, prof.model, prof.width, prof.height, tuple(prof.dqt), tuple(prof.dht),
+                   prof.sos, prof.restart_interval)
+            g = groups.setdefault(key, [prof, 0, -1.0])
+            g[1] += 1
+            if health > g[2]:
+                g[0], g[2] = prof, health
+        out = []
+        for prof, votes, _h in sorted(groups.values(), key=lambda g: (g[1], g[2]), reverse=True):
+            prof.votes = votes
+            out.append(prof)
+        return out
+
+    good = [g for g in found if g is not None]
+    profiles = ranked([(g[0], g[1]) for g in good])
+    thumbs = ranked([(g[2], 1.0) for g in good if g[2] is not None])
     if profiles:
-        echo(f"[ref] {len(profiles)} reference profile(s) learned from healthy files in the set")
-    return profiles
+        echo(f"[ref] {len(profiles)} reference header(s) learned from the set")
+    return profiles, thumbs
 
 
 @click.group()
@@ -215,7 +236,7 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
     files = [(p, rel) for p, rel in _iter_files(path) if not p.resolve().is_relative_to(out.resolve())]
     with Workers(jobs, len(files)) as workers:
         if auto_ref and len(files) > 1:
-            options["ref_candidates"] = _learn_candidates(files, click.echo, jobs, workers)
+            options["ref_candidates"], options["thumb_refs"] = _learn_candidates(files, click.echo, jobs, workers)
         work = [(str(p), str(rel), str(out), options, profile) for p, rel in files]
         results = workers.map(_repair_file, work, cost=lambda it: os.path.getsize(it[0]), counted=True)
     reports: list[FileReport] = []
