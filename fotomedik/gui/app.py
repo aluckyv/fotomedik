@@ -323,6 +323,11 @@ class MainWindow(QMainWindow):
                               "shift colours, move the picture or cut junk from a chosen place on.")
         self.handb.setEnabled(False)
         self.handb.clicked.connect(self._fix_by_hand)
+        self.stepsb = QPushButton("Step by step…")
+        self.stepsb.setToolTip("How this photo was recovered: the picture after every repair step")
+        self.stepsb.setEnabled(False)
+        self.stepsb.clicked.connect(self._show_steps)
+        tools.addWidget(self.stepsb)
         tools.addWidget(self.handb)
         tools.addStretch(1)
         rl.addLayout(tools)
@@ -433,22 +438,14 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
         rep = r.report
-        kinds = {f["kind"] for f in rep.findings}
         pct = rep.recovered_pct
-        if r.output is None:
-            res, color = ("No photo in the file" if "overwritten" in kinds else "Not repairable"), "#b3261e"
-        elif rep.fallback == "thumbnail":
-            res, color = "Only the thumbnail", "#b3261e"
-        elif not rep.findings:
-            res, color = "Healthy", "#1e7b34"
-        elif pct is not None and pct >= 90:
-            res, color = "Repaired", "#1e7b34"
-        elif pct is not None and pct >= 30:
-            res, color = "Partly recovered", "#9a6700"
-        else:
-            res, color = "Mostly lost", "#b3261e"
+        res = runner.verdict(rep, r.output is not None)
+        color = {"Healthy": "#1e7b34", "Repaired": "#1e7b34", "Partly recovered": "#9a6700"}.get(res, "#b3261e")
+        enh = "—" if (res in runner.LOST and self.aibox.isVisible()) else ""
         items = [QTableWidgetItem(str(r.source.name)), QTableWidgetItem("—" if pct is None else f"{pct:.0f} %"),
-                 QTableWidgetItem(res), QTableWidgetItem(f"{r.seconds:.1f} s"), QTableWidgetItem("")]
+                 QTableWidgetItem(res), QTableWidgetItem(f"{r.seconds:.1f} s"), QTableWidgetItem(enh)]
+        if enh:
+            items[4].setToolTip("No enhanced copy: too little of this photo survived")
         items[2].setForeground(QColor(color))
         items[0].setToolTip(str(r.source))
         for c, it in enumerate(items):
@@ -489,6 +486,7 @@ class MainWindow(QMainWindow):
         r = self.results[idx]
         self.selected = r
         self.handb.setEnabled(r.output is not None)
+        self.stepsb.setEnabled(True)
         self.before.show_image(load_preview(r.source), "Does not open in a normal viewer")
         self.after.show_image(load_preview(r.output) if r.output else None, "Nothing could be saved")
         if self.aibox.isVisible():
@@ -503,6 +501,16 @@ class MainWindow(QMainWindow):
             for d in r.report.enhanced:
                 text += f"\n  - {d}"
         self.report.setPlainText(text)
+
+    def _show_steps(self) -> None:
+        r = getattr(self, "selected", None)
+        if r is None:
+            return
+        from .steps_dialog import StepsDialog
+
+        dlg = StepsDialog(self, r)
+        self.steps_dlg = dlg
+        dlg.show()
 
     def _fix_by_hand(self) -> None:
         r = getattr(self, "selected", None)
@@ -620,6 +628,23 @@ def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, a
             app.processEvents()
             w.grab().save(str(shot))
             ok = len(w.results) == w.total and (not ai or bool(ai_rows))
+            try:  # the step-by-step window replays the repair
+                from .steps_dialog import StepsDialog
+
+                sd = StepsDialog(w, pick)
+                sd.show()
+                t0 = time.perf_counter()
+                while not sd.steps and time.perf_counter() - t0 < 120:
+                    app.processEvents()
+                    time.sleep(0.05)
+                app.processEvents()
+                sd.grab().save(str(shot.with_name(shot.stem + "_steps.png")))
+                log.write(f"steps window: {len(sd.steps)} step(s): " + " | ".join(x.title for x in sd.steps) + "\n")
+                ok = ok and len(sd.steps) >= 2
+                sd.close()
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                log.write(f"steps window failed: {type(e).__name__}: {e}\n")
             try:  # the manual repair window opens and edits
                 w._fix_by_hand()
                 dlg = getattr(w, "manual", None)

@@ -24,3 +24,19 @@ def load_preview(path: Path, max_side: int = 1200) -> Image.Image | None:
         return None
     finally:
         ImageFile.LOAD_TRUNCATED_IMAGES = False
+
+
+def preview_bytes(data: bytes, max_side: int = 1200) -> Image.Image | None:
+    """Like load_preview, for photo bytes in memory."""
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        im = Image.open(io.BytesIO(data))
+        if im.format == "JPEG":
+            im.draft("RGB", (max_side, max_side))
+        im = im.convert("RGB")
+        im.thumbnail((max_side, max_side))
+        return im
+    except Exception:
+        return None
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = False

@@ -64,6 +64,8 @@ class Context:
     def replace_data(self, new: bytes, recipe: "Recipe | str", message: str, **extra) -> None:
         name = recipe if isinstance(recipe, str) else recipe.name
         self.log.append(LogEntry(name, message, len(self.data), len(new), dict(extra)))
+        if self.options.get("snapshots"):  # the step-by-step view replays a repair
+            self.memo.setdefault("snapshots", []).append((name, message, new))
         self.data = new
         self.cache.clear()
 

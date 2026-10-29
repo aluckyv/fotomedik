@@ -110,8 +110,12 @@ def run_extras(items: list[tuple[FileReport, Path | None]], out: Path, steps, sa
     if not steps:
         return None
     whole_picture = bool({"deblock", "faces"} & set(steps))
+    from ..runner import is_lost
+
+    # lost and mostly lost photos are left as they are: too little is real to build on
     todo = [i for i, (rep, _src) in enumerate(items)
-            if rep.output_name and rep.fallback is None and (rep.holes or (whole_picture and rep.findings))]
+            if rep.output_name and rep.fallback is None and not is_lost(rep)
+            and (rep.holes or (whole_picture and rep.findings))]
     if not todo:
         return None
     if "burst" in steps:

@@ -23,12 +23,103 @@ class Result:
     output: Path | None  # repaired file (None: nothing could be saved)
     report: FileReport
     seconds: float
+    options: dict | None = None  # what the run used (learned references included), for replays
 
     @property
     def ai_output(self) -> Path | None:
         if not self.report.ai_output or self.output is None:
             return None
         return self.output.with_name(Path(self.report.ai_output).name)
+
+
+LOST = ("No photo in the file", "Not repairable", "Only the thumbnail", "Mostly lost")
+MOSTLY_LOST_PCT = 30.0
+
+
+def verdict(rep: FileReport, has_output: bool = True) -> str:
+    """The one-line result shown in the app."""
+    kinds = {f["kind"] for f in rep.findings}
+    pct = rep.recovered_pct
+    if not has_output or not rep.output_name:
+        return "No photo in the file" if "overwritten" in kinds else "Not repairable"
+    if rep.fallback == "thumbnail":
+        return "Only the thumbnail"
+    if not rep.findings:
+        return "Healthy"
+    if pct is not None and pct >= 90:
+        return "Repaired"
+    if pct is not None and pct >= MOSTLY_LOST_PCT:
+        return "Partly recovered"
+    return "Mostly lost"
+
+
+def is_lost(rep: FileReport) -> bool:
+    """Too little of the photo survived for enhancement to be worth it."""
+    return verdict(rep) in LOST
+
+
+@dataclass
+class Step:
+    title: str
+    explanation: str
+    detail: str
+    data: bytes | None  # the photo after this step (None: nothing to show)
+
+
+def replay(r: Result) -> list[Step]:
+    """The repair of one photo again, step by step: the photo after every change."""
+    from .cli import repair_bytes
+    from .report.report import STRINGS
+
+    names = STRINGS["en"]["recipe"]
+    original = r.source.read_bytes()
+    opts = dict(r.options or {})
+    opts["snapshots"] = True
+    opts.pop("write_reports", None)
+    ctx, _rep = repair_bytes(original, r.source.name, opts)
+    steps = [Step("As it came from the card", STEP_HELP["original"], _findings_text(r.report), original)]
+    for name, message, data in ctx.memo.get("snapshots", []):
+        steps.append(Step(names.get(name, name).capitalize(), STEP_HELP.get(name, ""), message, data))
+    notes = [e for e in ctx.log if e.extra.get("note")]
+    if notes:
+        steps.append(Step("Also tried", STEP_HELP["notes"], "\n".join(f"{e.recipe}: {e.message}" for e in notes), None))
+    if r.ai_output is not None and r.ai_output.exists():
+        steps.append(Step("Enhanced copy", STEP_HELP["enhanced"], "\n".join(r.report.enhanced),
+                          r.ai_output.read_bytes()))
+    return steps
+
+
+def _findings_text(rep: FileReport) -> str:
+    from .report.report import STRINGS
+
+    kinds = STRINGS["en"]["kind"]
+    if not rep.findings:
+        return "No damage found."
+    return "Damage found: " + "; ".join(kinds.get(f["kind"], f["kind"]) for f in rep.findings)
+
+
+STEP_HELP = {
+    "original": "The file as a normal viewer shows it. Viewers stop at the first error and paint the rest grey, "
+                "or show garbage after a silent error.",
+    "cardrecovery_xor": "A recovery program (CardRecovery) had scrambled the start of the file with a fixed pattern; "
+                        "it is undone.",
+    "header_repair": "Single flipped bits in the header (markers, lengths, tables) are put right.",
+    "reference_header": "The header was beyond repair. The header of the same camera, learned from the other photos "
+                        "(voted bit by bit), is put in, with this photo's size and orientation.",
+    "garbage_tail": "Data after the end of the picture that belongs to another file is cut off.",
+    "foreign_sectors": "Card sectors inside the picture that cannot be photo data (zeros, text, another file) are "
+                       "blanked, so they count as damage instead of decoding as garbage.",
+    "bitflip_repair": "Where only a few bits are wrong, every candidate flip is tried until the stretch decodes "
+                      "cleanly up to its restart marker.",
+    "fill_holes": "Everything that decodes is kept. After each damaged stretch the data is searched for the point "
+                  "where decoding catches on again; those pieces are put back in place (following the thumbnail) "
+                  "and their colour is matched to the rows around. What is still missing is filled with colours "
+                  "from the embedded thumbnail.",
+    "smooth_holes": "The filled holes get a soft surface instead of flat 8x8 squares. Real data is not touched.",
+    "thumbnail_fallback": "Almost nothing of the picture survived, so the small embedded preview is saved instead.",
+    "notes": "Repairs that were tried but did not apply.",
+    "enhanced": "The separate enhanced copy (similar shots, AI steps). Detail added by AI is invented.",
+}
 
 
 def collect(paths: list[Path], out: Path) -> list[tuple[Path, Path]]:
@@ -82,7 +173,7 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
 
         def done(i, rep, secs):
             output = (out / rep.output_name) if rep.output_name else None
-            r = Result(files[i][0], output, rep, secs)
+            r = Result(files[i][0], output, rep, secs, options)
             results.append(r)
             if on_result:
                 on_result(r)
@@ -122,6 +213,9 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
                     done(i, rep, secs)
     steps = list(options.get("enhance") or (["ai"] if options.get("ai") else []))
     if steps and results and not (stop is not None and stop.is_set()):
+        lost = [r for r in results if is_lost(r.report)]
+        if lost:
+            say(f"{len(lost)} lost or mostly lost photo(s) get no enhanced copy")
         by_rep = {id(r.report): r for r in results}
         from .ai.run import run_extras
 
