@@ -72,39 +72,57 @@ def upsample_weights(n: int) -> np.ndarray:
     return out
 
 
-def surface(mean: np.ndarray, rounds: int = 6) -> np.ndarray:
-    """Smooth pixel plane (8x the block grid) whose 8x8 averages are the block averages.
-
-    A cubic through the block centres averages a little lower than a peak block
-    (and higher than a dip); the difference is fed back a few times, so the surface
-    over each block averages to that block's own DC and blocks meet without steps."""
+def _block_coefficients(mean: np.ndarray, rounds: int = 6) -> np.ndarray:
+    """Coefficients x (block grid) of the surface W_r x W_c^T whose 8x8 averages are
+    `mean`: a cubic through the block centres averages a little lower than a peak block
+    (and higher than a dip), so the difference is fed back a few times. Worked out on
+    the block grid (cheap); pixels are made only where needed."""
     rows, cols = mean.shape
-    wr, wc = upsample_weights(rows), upsample_weights(cols)
+    ar = upsample_weights(rows).reshape(rows, 8, rows).mean(axis=1)
+    ac = upsample_weights(cols).reshape(cols, 8, cols).mean(axis=1)
     target = mean.astype(float)
-    plane = np.zeros((8 * rows, 8 * cols))
+    x = np.zeros_like(target)
     for _ in range(rounds):
-        got = plane.reshape(rows, 8, cols, 8).mean(axis=(1, 3))
-        plane += wr @ (target - got) @ wc.T
-    return plane
+        x += target - ar @ x @ ac.T
+    return x
+
+
+def surface(mean: np.ndarray, rounds: int = 6) -> np.ndarray:
+    """Smooth pixel plane (8x the block grid) whose 8x8 averages are the block averages,
+    so blocks meet without steps."""
+    rows, cols = mean.shape
+    x = _block_coefficients(mean, rounds)
+    return upsample_weights(rows) @ x @ upsample_weights(cols).T
+
+
+def _local(n_side: int = 5) -> np.ndarray:
+    """(8, 5) weights of the pixel rows of one block on the coefficients of blocks
+    -2..+2 around it (interior blocks; edges are handled by clamped indices)."""
+    w = upsample_weights(9)  # block 4 of 9 is far from both edges
+    return w[32:40, 2:7]
 
 
 def hole_coefficients(dc: np.ndarray, holes: np.ndarray, quant: np.ndarray) -> np.ndarray:
     """AC coefficients (zigzag, quantised; DC slot 0) for the hole blocks of one component.
 
     dc: (rows, cols) quantised DC per block; holes: (rows, cols) bool;
-    quant: 64 quantisation values in zigzag order. Returns int32 (rows, cols, 64)."""
+    quant: 64 quantisation values in zigzag order. Returns int16 (rows, cols, 64)."""
     rows, cols = dc.shape
-    out = np.zeros((rows, cols, 64), dtype=np.int32)
+    out = np.zeros((rows, cols, 64), dtype=np.int16)
     if not holes.any():
         return out
-    plane = surface(dc * (quant[0] / 8.0))
+    x = _block_coefficients(dc * (quant[0] / 8.0))
+    k = DCT @ _local()  # (8, 5): DCT of a block's pixels from its 5x5 neighbourhood
     q_nat = np.empty(64)
     q_nat[ZIGZAG] = quant
     by, bx = np.nonzero(holes)
-    blocks = plane.reshape(rows, 8, cols, 8).transpose(0, 2, 1, 3)[by, bx]  # (n, 8, 8)
-    coef = DCT @ blocks @ DCT.T  # (n, 8, 8), [v, u]
+    off = np.arange(-2, 3)
+    ry = np.clip(by[:, None] + off, 0, rows - 1)  # (n, 5)
+    rx = np.clip(bx[:, None] + off, 0, cols - 1)
+    nb = x[ry[:, :, None], rx[:, None, :]]  # (n, 5, 5)
+    coef = k @ nb @ k.T  # (n, 8, 8), [v, u]
     coef = coef.reshape(-1, 64) / q_nat
-    zz = np.rint(coef[:, ZIGZAG]).astype(np.int32)
+    zz = np.rint(coef[:, ZIGZAG]).astype(np.int16)
     zz[:, 0] = 0
     zz[:, KEEP:] = 0
     out[by, bx] = zz
@@ -139,19 +157,26 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray) -> bytes | None:
     if not any(g[1].any() for g in grids.values()):
         return None
 
+    # every hole MCU's blocks in scan order, built once
+    hole_idx = np.flatnonzero(hole_mcus)
+    slot = np.full(total, -1, dtype=np.int64)
+    slot[hole_idx] = np.arange(len(hole_idx))
+    r_all, c_all = hole_idx // per_row, hole_idx % per_row
+    parts = []
+    for c in comps:
+        dcg, acg = grids[c.cid]
+        for yy in range(c.v):
+            for xx in range(c.h):
+                ry, rx = r_all * c.v + yy, c_all * c.h + xx
+                blk = acg[ry, rx].astype(np.int32)
+                blk[:, 0] = dcg[ry, rx]
+                parts.append(blk)
+    table = np.stack(parts, axis=1)  # (n_holes, bpm, 64)
+
     def mcu_coefs(first: int, count: int) -> np.ndarray:
-        """int32 [count, blocks_per_mcu, 64] for MCUs first..first+count in scan order."""
-        m = np.arange(first, first + count)
-        r, col = m // per_row, m % per_row
-        parts = []
-        for c in comps:
-            dcg, acg = grids[c.cid]
-            for yy in range(c.v):
-                for xx in range(c.h):
-                    blk = acg[r * c.v + yy, col * c.h + xx].copy()
-                    blk[:, 0] = dcg[r * c.v + yy, col * c.h + xx]
-                    parts.append(blk)
-        return np.stack(parts, axis=1)
+        """int32 [count, blocks_per_mcu, 64] for hole MCUs first..first+count in scan order."""
+        i = slot[first]
+        return table[i : i + count]
 
     def preds_before(m: int, first: int) -> dict[int, int]:
         if m <= first:

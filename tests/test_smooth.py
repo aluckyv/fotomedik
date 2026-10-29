@@ -57,3 +57,18 @@ def test_pipeline_smooths_filled_holes(healthy_jpeg_rst):
         Image.open(io.BytesIO(ctx.data)).load()
     ctx2, _ = repair_bytes(broken, "x.jpg", {"time_budget": 2.0, "mark_holes": True})
     assert "smooth_holes" not in ctx2.applied
+
+
+def test_block_local_coefficients_match_the_full_surface():
+    from fotomedik.recipes.r12_smooth import DCT, KEEP, ZIGZAG, hole_coefficients
+
+    rng = np.random.default_rng(1)
+    dc = rng.normal(0, 20, (12, 15))
+    q = np.full(64, 2.0)
+    a = hole_coefficients(dc, np.ones_like(dc, bool), q)
+    plane = surface(dc * (q[0] / 8))
+    b = (DCT @ plane.reshape(12, 8, 15, 8).transpose(0, 2, 1, 3) @ DCT.T).reshape(12, 15, 64) / 2
+    b = np.rint(b[..., ZIGZAG])
+    b[..., 0] = 0
+    b[..., KEEP:] = 0
+    assert np.abs(a - b).max() <= 1

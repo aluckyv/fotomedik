@@ -438,6 +438,23 @@ def repair_interval(
     return False, chosen, "unrepaired"
 
 
+DENSE_SHARE = 0.05  # broken FF00 pairs above this: rot everywhere, single flips are not the problem
+
+
+def broken_stuffing_share(data: bytes, start: int | None) -> float:
+    """Share of FF bytes in the scan not followed by 00, a restart marker or more FF.
+    Clean entropy-coded data has none; a card that rots everywhere has many."""
+    a = np.frombuffer(data, dtype=np.uint8)[(start or 0) :]
+    if len(a) < 2:
+        return 0.0
+    i = np.flatnonzero(a[:-1] == 0xFF)
+    if len(i) < 50:
+        return 0.0
+    nx = a[i + 1]
+    ok = (nx == 0) | ((nx >= 0xD0) & (nx <= 0xD7)) | (nx == 0xFF) | (nx == 0xD9)
+    return float((~ok).mean())
+
+
 @register
 class BitFlipRepair(Recipe):
     name = "bitflip_repair"
@@ -489,6 +506,15 @@ class BitFlipRepair(Recipe):
             return None
         attempted = ctx.memo.setdefault("bitflip_attempted", set())
         thorough = float(ctx.options.get("time_budget", DEFAULT_TIME_BUDGET)) >= 30
+        if not thorough and not ctx.memo.get("dense_checked"):
+            ctx.memo["dense_checked"] = True
+            share = broken_stuffing_share(ctx.data, got[0].scan_start)
+            if share > DENSE_SHARE:
+                ctx.memo["dense_damage"] = share
+                ctx.note(self, f"dense damage ({share:.0%} of FF00 pairs broken): flipped bits are too many "
+                               "to search for, bit-flip search skipped")
+        if ctx.memo.get("dense_damage") and not thorough:
+            return None
         return got if self._candidates(got[2], attempted, ctx.data, None, ctx.memo.get("tails"), thorough) else None
 
     def fix(self, ctx: Context, got) -> None:
