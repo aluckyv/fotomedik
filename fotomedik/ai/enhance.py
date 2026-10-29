@@ -138,6 +138,8 @@ class Engine:
         if "diffusion" in steps:
             from .diffusion import Diffusion
 
+            if eng.inpaint_s is None:
+                eng.inpaint_s = session(models.INPAINT)
             eng.sd = Diffusion(session(models.SD_UNET), session(models.SD_VAE_ENC), session(models.SD_VAE_DEC),
                                session(models.SD_TEXT))
         eng.device = {"DmlExecutionProvider": "GPU (DirectML)", "CUDAExecutionProvider": "GPU (CUDA)"}.get(used["v"], "CPU")
@@ -175,8 +177,9 @@ def inpaint_unknown(arr: np.ndarray, unknown: np.ndarray, engine: Engine) -> np.
     m = np.asarray(Image.fromarray((grown * 255).astype(np.uint8)).resize((LAMA, LAMA), Image.BILINEAR)) > 20
     filled = engine.fill(small, m)
     up = np.asarray(Image.fromarray(filled).resize((w, h), Image.BICUBIC), dtype=np.float32)
-    a = _soft(unknown, FEATHER)[..., None]
-    return np.clip(arr * (1 - a) + up * a, 0, 255).astype(np.uint8)
+    # nothing inside an unknown hole is worth keeping: the fill replaces it entirely
+    # (blending with the placeholder would leave a frame around it)
+    return np.where(unknown[..., None], np.clip(np.rint(up), 0, 255), arr).astype(np.uint8)
 
 
 def sharpen_holes(arr: np.ndarray, holes: np.ndarray, engine: Engine, progress=None) -> np.ndarray:
@@ -268,6 +271,8 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         if "diffusion" in steps and engine.sd is not None:
             from .diffusion import diffusion_fill
 
+            if unknown.any() and engine.inpaint_s is not None:  # a start for holes the thumbnail left blank
+                arr = inpaint_unknown(arr, unknown, engine)
             arr = diffusion_fill(arr, holes, unknown, engine.sd, progress)
             arr = keep_block_means(arr, before, holes, holes & ~unknown)
             done.append("holes repainted (Stable Diffusion, follows the thumbnail)")

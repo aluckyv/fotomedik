@@ -120,7 +120,7 @@ jobs:
           FOTOMEDIK_MODELS: ${{ github.workspace }}\models
         run: |
           $p = Start-Process -FilePath dist\FotoMedik.exe -ArgumentList "--smoke-ai","demo","demo_out_ai","shot_ai.png" -PassThru -Wait
-          if (Test-Path shot_ai.txt) { Get-Content shot_ai.txt | ForEach-Object { Write-Host "::notice title=smoke (AI)::$_" } }
+          if (Test-Path shot_ai.txt) { Get-Content shot_ai.txt | Where-Object { $_ -notmatch '^Downloading .*%$' } | Select-Object -Last 9 | ForEach-Object { Write-Host "::notice title=smoke (AI)::$_" } }
           Write-Host "exit code $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { exit 1 }
           if (!(Get-ChildItem demo_out_ai -Filter *_ai.jpg)) { exit 1 }

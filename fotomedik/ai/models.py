@@ -41,7 +41,7 @@ DEBLOCK = Model(
     "FBCNN (JPEG artifact removal)",
     "fbcnn-color.onnx",
     ("https://huggingface.co/Hawkynt/photomanager-models/resolve/main/fbcnn-color.onnx",),
-    None,
+    "b4fd55e0c260957955ae194cb85ea01b1dacae4f897936355920e61bd8c3ba16",
     288,
     "Apache-2.0 (FBCNN, Jiang, Zhang, Timofte)",
 )
@@ -51,7 +51,7 @@ FACE_DET = Model(
     ("https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",
      "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/"
      "face_detection_yunet_2023mar.onnx"),
-    None,
+    "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
     1,
     "MIT (OpenCV Zoo, YuNet)",
 )
@@ -59,7 +59,7 @@ FACE = Model(
     "GFPGAN 1.4 (face restoration)",
     "gfpgan_1.4.onnx",
     ("https://huggingface.co/facefusion/models-3.0.0/resolve/main/gfpgan_1.4.onnx",),
-    None,
+    "accc4757b26bdb89b32b4d3500d4f79c9dff97c1dd7c7104bf9dcb95e3311385",
     340,
     "Apache-2.0 (GFPGAN, Tencent ARC)",
 )
@@ -67,19 +67,19 @@ _SD = "https://huggingface.co/RanaLLC/stable-diffusion-v1-5-inpainting-onnx-fp16
 _SD_LICENSE = "CreativeML OpenRAIL-M (Stable Diffusion 1.5 inpainting, Runway/Stability AI)"
 SD_UNET = Model("Stable Diffusion inpainting (UNet)", "sd15inp_unet.onnx",
                 (_SD + "unet/model.onnx", "https://huggingface.co/sona-forge/sd15-inpainting-fp16/resolve/main/unet/model.onnx"),
-                None, 1720, _SD_LICENSE)
+                "a3726e1944ec2fbc9596096cd001520aea789367f329360ee34eb520c751de16", 1720, _SD_LICENSE)
 SD_VAE_ENC = Model("Stable Diffusion (image encoder)", "sd15inp_vae_encoder.onnx", (_SD + "vae_encoder/model.onnx",),
-                   None, 68, _SD_LICENSE)
+                   "f0da9070d007def0d6a4e7c10a21462bb6172e460ef2587c3fe91191397b4cea", 68, _SD_LICENSE)
 SD_VAE_DEC = Model("Stable Diffusion (image decoder)", "sd15inp_vae_decoder.onnx", (_SD + "vae_decoder/model.onnx",),
-                   None, 99, _SD_LICENSE)
+                   "ce0ffca3fcfd0a2729a88d8d90dabf35c66d237404997e0461d52e46ac7a91bc", 99, _SD_LICENSE)
 SD_TEXT = Model("Stable Diffusion (text encoder)", "sd15inp_text_encoder.onnx", (_SD + "text_encoder/model.onnx",),
-                None, 246, _SD_LICENSE)
+                "8af516fb184866f8caed192ca3bf0636ef9d40d4f7799c05600cae431d18d8d1", 246, _SD_LICENSE)
 
 STEP_MODELS = {
     "ai": (SR, INPAINT),
     "deblock": (DEBLOCK,),
     "faces": (FACE_DET, FACE),
-    "diffusion": (SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT),
+    "diffusion": (INPAINT, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT),
 }
 ALL = tuple(m for ms in STEP_MODELS.values() for m in ms)
 
