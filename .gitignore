@@ -1,0 +1,12 @@
+# private sample photos — never commit
+samples/
+out/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
