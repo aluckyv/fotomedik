@@ -21,6 +21,7 @@ from .registry import register
 SEARCH_LIMIT = 512 * 1024
 MAX_SOS_MISMATCH = 0.25  # fraction of bits allowed to differ when locating the SOS by pattern
 MIN_GAIN = 0.02
+MIN_MATCH = 3  # profile.matches(): 10 = same Exif model, 3 = same dimensions
 
 _POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.int32)
 
@@ -92,8 +93,16 @@ class ReferenceHeader(Recipe):
             needs = cur < 0.05 or any(_tables_near(d, p) for p in profiles)
         if not needs:
             return None
-        profiles.sort(key=lambda p: p.matches(d), reverse=True)
-        return profiles[0]
+        # An explicit --ref is trusted; auto-learned candidates must look like the same
+        # camera (Exif model or identical dimensions), otherwise a foreign header would
+        # turn the scan into coloured noise that still "decodes".
+        if ctx.ref is not None:
+            return ctx.ref
+        scored = sorted(((p.matches(d), p) for p in profiles), key=lambda t: t[0], reverse=True)
+        if not scored or scored[0][0] < MIN_MATCH:
+            ctx.memo["reference_tried"] = True
+            return None
+        return scored[0][1]
 
     def fix(self, ctx: Context, prof: CameraProfile) -> None:
         ctx.memo["reference_tried"] = True

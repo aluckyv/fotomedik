@@ -199,27 +199,35 @@ def repair_interval(
         lo = max(spec.start, hint - W_BACK)
         if hi <= lo:
             return (False, progress, float("inf"), list(flips))
-        # Resume point: last MCU that starts before the window (its predictors are known)
+        # Resume point: last MCU that starts before the window (its predictors are known).
+        # Recomputed whenever the window widens, so the kernel restarts early enough.
         m0 = spec.first
-        for m in cur.mcus:
-            if m.bit_start // 8 < lo:
-                m0 = m.index
+        start_off, start_bit, preds0 = spec.start, 0, None
+        stage1_n = 1
+
+        def set_resume(window_lo: int) -> None:
+            nonlocal m0, start_off, start_bit, preds0, stage1_n
+            m0 = spec.first
+            for m in cur.mcus:
+                if m.bit_start // 8 < window_lo:
+                    m0 = m.index
+                else:
+                    break
+            if m0 > spec.first:
+                start_off, start_bit = divmod(cur.mcus[m0 - spec.first].bit_start, 8)
+                preds0 = D.preds_before_mcu(cur, ft, m0)
             else:
-                break
-        if m0 > spec.first:
-            start_off, start_bit = divmod(cur.mcus[m0 - spec.first].bit_start, 8)
-            preds0 = D.preds_before_mcu(cur, ft, m0)
-        else:
-            start_off, start_bit, preds0 = spec.start, 0, None
+                start_off, start_bit, preds0 = spec.start, 0, None
+            err_mcu = cur.error.mcu_index if cur.error is not None else spec.first + spec.count
+            stage1_n = max(1, err_mcu - m0 + MIN_GAIN + 1)
+
+        set_resume(lo)
 
         partials: dict[tuple[int, float], list[tuple[int, int, int]]] = {}  # (dec, rough) -> [(dir, off, mask)]
         complete: list[tuple[float, int, int, int]] = []  # (roughness, direction_penalty, off, mask)
 
         # Stage 1 decodes only a little past the detection point (cheap, kills most
         # candidates); stage 2 decodes to the marker for the survivors.
-        err_mcu = cur.error.mcu_index if cur.error is not None else spec.first + spec.count
-        stage1_n = max(1, err_mcu - m0 + MIN_GAIN + 1)
-
         def consider(off: int, mask: int) -> None:
             was_zero = not (buf[off] & mask)
             buf[off] ^= mask
@@ -257,6 +265,7 @@ def repair_interval(
         for si, span in enumerate((W_BACK, 3 * W_BACK, 8 * W_BACK)):
             new_lo = max(spec.start, hint - span)
             new_hi = hi if si == 0 else min(hi, hint + span)  # first window always reaches the detection point
+            set_resume(new_lo)
             offs = sorted((o for o in range(new_lo, new_hi) if o not in scanned), key=lambda o: abs(o - hint))
             for off in offs:
                 scanned.add(off)

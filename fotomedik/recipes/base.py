@@ -69,12 +69,17 @@ class Context:
 
     def note(self, recipe: "Recipe | str", message: str, **extra) -> None:
         name = recipe if isinstance(recipe, str) else recipe.name
-        self.log.append(LogEntry(name, message, len(self.data), len(self.data), dict(extra)))
+        extra = dict(extra)
+        extra["note"] = True
+        self.log.append(LogEntry(name, message, len(self.data), len(self.data), extra))
 
     @property
     def applied(self) -> list[str]:
+        """Recipes that actually changed the file (notes about attempts are not 'applied')."""
         seen: list[str] = []
         for e in self.log:
+            if e.extra.get("note"):
+                continue
             if e.recipe not in seen:
                 seen.append(e.recipe)
         return seen
