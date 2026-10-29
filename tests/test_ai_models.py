@@ -63,10 +63,9 @@ def test_real_models_all_steps():
     t = time.perf_counter()
     eng = Engine.load(progress=lambda d, n, m: None, steps=("deblock", "faces", "diffusion"))
     print(f"\nloaded on {eng.device} in {time.perf_counter() - t:.1f} s")
-    for m in models.ALL:
-        p = models.model_dir() / m.file
-        if p.exists():
-            print(f"::notice title=model sha256::{m.file} {models.sha256_of(p)}")
+    hashes = [f"{m.file} {models.sha256_of(models.model_dir() / m.file)[:16]}…" for m in models.ALL
+              if (models.model_dir() / m.file).exists()]
+    print("::notice title=model sha256::" + "; ".join(hashes))  # one line: ten notices per step at most
     for s in (eng.deblock_s, eng.face_s, eng.sd.unet, eng.sd.vae_enc, eng.sd.vae_dec, eng.sd.text):
         print([(i.name, i.shape, i.type) for i in s.get_inputs()], [(o.name, o.shape) for o in s.get_outputs()])
 

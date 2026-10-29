@@ -148,6 +148,11 @@ class Engine:
 
         from . import models
 
+        if hasattr(ort, "preload_dlls"):  # a CUDA build finds its CUDA/cuDNN libraries (pip packages)
+            try:
+                ort.preload_dlls()
+            except Exception:
+                pass
         avail = ort.get_available_providers()
         gpu = [p for p in GPU_PROVIDERS if p in avail]
         providers = gpu + ["CPUExecutionProvider"]

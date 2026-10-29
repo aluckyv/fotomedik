@@ -307,6 +307,7 @@ class MainWindow(QMainWindow):
         outer.addLayout(prog)
         self.aistat = QLabel("")  # the enhanced copies run beside the repairs: their own line
         self.aistat.setObjectName("hint")
+        self.aistat.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)  # long text is cut, never widens the window
         self.aistat.hide()
         outer.addWidget(self.aistat)
 
