@@ -116,8 +116,7 @@ def test_fp16_copies_of_the_real_networks(tmp_path):
     from fotomedik.ai.enhance import Engine
 
     eng = Engine.load(progress=lambda d, n, m: None, steps=("ai",), half=False)
-    print(f"::notice title=Real-ESRGAN input::{[(i.name, i.shape) for i in eng.sr.get_inputs()]} "
-          f"batch in one call: {eng.sr_batch}")
+    shape = " x ".join(str(d) for d in eng.sr.get_inputs()[0].shape)
     for model in (models.SR,):
         path = models.model_dir() / model.file
         out = tmp_path / half.half_path(path).name
@@ -136,5 +135,6 @@ def test_fp16_copies_of_the_real_networks(tmp_path):
             continue
         ref = half._picture_output(full, x)
         mean, worst = half.compare(ref, got)
-        print(f"::notice title=fp16 {model.name}::mean difference {mean:.5f}, largest {worst:.4f} of the range")
+        print(f"::notice title=fp16 {model.name}::mean difference {mean:.5f}, largest {worst:.4f} of the range; "
+              f"input {shape}")
         assert mean <= half.TOL_MEAN and worst <= half.TOL_MAX
