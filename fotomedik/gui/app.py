@@ -108,6 +108,7 @@ class RepairWorker(QObject):
     """Runs the repair in a background thread and reports each finished photo."""
 
     result = Signal(object)
+    ai_done = Signal(object)
     status = Signal(str)
     finished = Signal(float, str)
 
@@ -121,7 +122,7 @@ class RepairWorker(QObject):
         err = ""
         try:
             runner.run(self.paths, self.out, self.options, on_result=self.result.emit,
-                       on_status=self.status.emit, stop=self.stop)
+                       on_status=self.status.emit, stop=self.stop, on_ai=self.ai_done.emit)
         except Exception as e:  # shown to the user, the app keeps running
             err = f"{type(e).__name__}: {e}"
         self.finished.emit(time.perf_counter() - t, err)
@@ -242,6 +243,12 @@ class MainWindow(QMainWindow):
         self.reports = QCheckBox("Save a report file for each photo")
         self.reports.setToolTip("Writes <photo>.report.json next to every repaired copy")
         act.addWidget(self.reports)
+        self.ai = QCheckBox("AI copy")
+        self.ai.setToolTip("Also save <photo>_ai.jpg: areas rebuilt from the thumbnail are sharpened (Real-ESRGAN)\n"
+                           "and holes nothing is known about are filled (LaMa). The added detail is invented by\n"
+                           "the AI, so it is a separate copy. Uses the graphics card when it can.\n"
+                           "The first time it downloads the models (about 275 MB).")
+        act.addWidget(self.ai)
         act.addStretch(1)
         self.openb = QPushButton("Open results folder")
         self.openb.setEnabled(False)
@@ -262,15 +269,15 @@ class MainWindow(QMainWindow):
 
         # ---- results: list | before/after + report
         split = QSplitter(Qt.Orientation.Horizontal)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Photo", "Real data", "Result", "Time"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Photo", "Real data", "Result", "Time", "AI"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for c in (1, 2, 3):
+        for c in (1, 2, 3, 4):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         self.table.itemSelectionChanged.connect(self._show_selected)
         split.addWidget(self.table)
@@ -281,8 +288,11 @@ class MainWindow(QMainWindow):
         pics = QHBoxLayout()
         self.before = ImageBox("Before — as a normal viewer shows it")
         self.after = ImageBox("After — repaired copy")
+        self.aibox = ImageBox("AI copy — invented detail in the holes")
         pics.addWidget(self.before, 1)
         pics.addWidget(self.after, 1)
+        pics.addWidget(self.aibox, 1)
+        self.aibox.hide()
         rl.addLayout(pics, 3)
         self.report = QPlainTextEdit()
         self.report.setReadOnly(True)
@@ -364,12 +374,16 @@ class MainWindow(QMainWindow):
         self.openb.setEnabled(True)
         self.out_dir = out
 
-        options = {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked()}
+        options = {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked(),
+                   "ai": self.ai.isChecked()}
+        self.aibox.setVisible(self.ai.isChecked())
+        self.aibox.show_image(None)
         self.thread = QThread(self)
         self.worker = RepairWorker(paths, out, options)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.result.connect(self._on_result)
+        self.worker.ai_done.connect(self._on_ai)
         self.worker.status.connect(self.stat.setText)
         self.worker.finished.connect(self._on_finished)
         self.worker.finished.connect(self.thread.quit)
@@ -401,7 +415,7 @@ class MainWindow(QMainWindow):
         else:
             res, color = "Mostly lost", "#b3261e"
         items = [QTableWidgetItem(str(r.source.name)), QTableWidgetItem("—" if pct is None else f"{pct:.0f} %"),
-                 QTableWidgetItem(res), QTableWidgetItem(f"{r.seconds:.1f} s")]
+                 QTableWidgetItem(res), QTableWidgetItem(f"{r.seconds:.1f} s"), QTableWidgetItem("")]
         items[2].setForeground(QColor(color))
         items[0].setToolTip(str(r.source))
         for c, it in enumerate(items):
@@ -411,6 +425,18 @@ class MainWindow(QMainWindow):
         self.stat.setText(f"{len(self.results)} / {self.total} photos")
         if len(self.results) == 1:
             self.table.selectRow(0)
+
+    def _on_ai(self, r: runner.Result) -> None:
+        for row in range(self.table.rowCount()):
+            idx = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            if self.results[idx] is r:
+                it = QTableWidgetItem("✓")
+                it.setData(Qt.ItemDataRole.UserRole, idx)
+                it.setToolTip(str(r.ai_output))
+                self.table.setItem(row, 4, it)
+                if self.table.selectionModel().isRowSelected(row):
+                    self._show_selected()
+                break
 
     def _on_finished(self, secs: float, err: str) -> None:
         self.go.setEnabled(True)
@@ -430,9 +456,15 @@ class MainWindow(QMainWindow):
         r = self.results[idx]
         self.before.show_image(load_preview(r.source), "Does not open in a normal viewer")
         self.after.show_image(load_preview(r.output) if r.output else None, "Nothing could be saved")
+        if self.aibox.isVisible():
+            ai = r.ai_output
+            self.aibox.show_image(load_preview(ai) if ai and ai.exists() else None,
+                                  "No holes to enhance" if not r.report.holes else "Not made yet")
         text = r.report.format_text("en")
         if r.output:
             text += f"\nSaved as: {r.output}"
+        if r.ai_output:
+            text += f"\nAI copy: {r.ai_output}  (detail in the holes is invented)"
         self.report.setPlainText(text)
 
     def _open_output(self) -> None:
@@ -498,35 +530,45 @@ def main(argv: list[str] | None = None) -> int:
     app.setStyleSheet(STYLE)
     w = MainWindow()
     args = (sys.argv if argv is None else argv)[1:]
-    if args and args[0] == "--smoke":
-        return _smoke(app, w, Path(args[1]), Path(args[2]), Path(args[3]))
+    if args and args[0] in ("--smoke", "--smoke-ai"):
+        return _smoke(app, w, Path(args[1]), Path(args[2]), Path(args[3]), ai=args[0] == "--smoke-ai")
     if args:
         w._set_inputs([Path(a) for a in args])
     w.show()
     return app.exec()
 
 
-def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path) -> int:
+def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, ai: bool = False) -> int:
     """Self-test for CI: repair `src` into `out` through the window, save a screenshot,
-    exit 0 when every photo came back with a result."""
+    exit 0 when every photo came back with a result (with `ai`: and an AI copy was made).
+    Status lines go to <shot>.txt (a windowed exe has no console)."""
     from PySide6.QtCore import QTimer
 
+    log = open(shot.with_suffix(".txt"), "w", encoding="utf-8")  # noqa: SIM115
+    w.ai.setChecked(ai)
     w._set_inputs([src])
     w.outp.setText(str(out))
     w.outp.setModified(True)
     w.show()
     w._start()
+    w.worker.status.connect(lambda s: (log.write(s + "\n"), log.flush()))
     started = time.perf_counter()
     code = {"v": 2}
 
     def poll():
         if w.go.isEnabled() and w.results:
-            w.table.selectRow(0)
+            ai_rows = [r for r in w.results if r.ai_output]
+            if ai_rows:
+                w.table.selectRow(w.results.index(ai_rows[0]))
+            else:
+                w.table.selectRow(0)
             app.processEvents()
             w.grab().save(str(shot))
-            code["v"] = 0 if len(w.results) == w.total else 1
+            ok = len(w.results) == w.total and (not ai or bool(ai_rows))
+            code["v"] = 0 if ok else 1
+            log.write(f"smoke: {len(w.results)}/{w.total} photos, {len(ai_rows)} AI copies\n")
             app.quit()
-        elif time.perf_counter() - started > 300:
+        elif time.perf_counter() - started > (1500 if ai else 300):
             app.quit()
 
     t = QTimer()

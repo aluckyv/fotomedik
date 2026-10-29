@@ -24,6 +24,12 @@ class Result:
     report: FileReport
     seconds: float
 
+    @property
+    def ai_output(self) -> Path | None:
+        if not self.report.ai_output or self.output is None:
+            return None
+        return self.output.with_name(Path(self.report.ai_output).name)
+
 
 def collect(paths: list[Path], out: Path) -> list[tuple[Path, Path]]:
     """(file, relative output path) for every photo in the given files/folders."""
@@ -42,9 +48,10 @@ def collect(paths: list[Path], out: Path) -> list[tuple[Path, Path]]:
 
 
 def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0,
-        on_result=None, on_status=None, stop: threading.Event | None = None) -> list[Result]:
+        on_result=None, on_status=None, stop: threading.Event | None = None, on_ai=None) -> list[Result]:
     """Repair everything under `paths` into `out`. Originals are never written.
-    on_result(Result) is called as each photo finishes; on_status(str) for phases."""
+    on_result(Result) is called as each photo finishes; on_status(str) for phases.
+    With options["ai"], an "_ai" copy of every photo with holes follows (on_ai(Result))."""
     out.mkdir(parents=True, exist_ok=True)
     for p in paths:
         if p.is_dir() and p.resolve() == out.resolve():
@@ -112,4 +119,10 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
                     except Exception as e:  # one bad file must not stop the batch
                         rep, secs = failed(i, e)
                     done(i, rep, secs)
+    if options.get("ai") and results and not (stop is not None and stop.is_set()):
+        by_rep = {id(r.report): r for r in results}
+        from .ai.run import run_ai
+
+        run_ai([r.report for r in results], out, say, stop,
+               on_done=(lambda rep: on_ai(by_rep[id(rep)])) if on_ai else None)
     return results

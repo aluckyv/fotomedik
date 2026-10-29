@@ -19,6 +19,30 @@ jobs:
       - name: tests also pass with the pure-Python decoder
         run: FOTOMEDIK_PURE=1 pytest -q
 
+  ai-models:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,ai]"
+      - run: python build_fastdec.py
+      - uses: actions/cache@v4
+        with:
+          path: models
+          key: ai-models-v1
+      - name: real Real-ESRGAN and LaMa models
+        env:
+          FOTOMEDIK_AI_MODELS: "1"
+          FOTOMEDIK_MODELS: models
+        run: pytest -q -s tests/test_ai_models.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ai-check
+          path: ai_check/
+
   dll-windows:
     runs-on: windows-latest
     steps:
@@ -44,7 +68,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e . pyside6 pyinstaller
+      - run: pip install -e . pyside6 pyinstaller onnxruntime-directml
       - name: build _fastdec.dll
         run: python build_fastdec.py
       - name: demo photos
@@ -62,6 +86,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --onefile --windowed --name FotoMedik
           --add-binary "fotomedik/jpeg/_fastdec.dll;fotomedik/jpeg"
+          --hidden-import onnxruntime --collect-binaries onnxruntime
           --exclude-module tkinter --exclude-module pytest
           fotomedik_app.py
       - name: smoke test of the packaged app
@@ -73,6 +98,21 @@ jobs:
           Write-Host "exit code $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { exit 1 }
           if (!(Test-Path demo_out_exe\healthy.jpg)) { exit 1 }
+      - uses: actions/cache@v4
+        with:
+          path: models
+          key: ai-models-v1
+      - name: AI smoke test of the packaged app (real models)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          FOTOMEDIK_MODELS: ${{ github.workspace }}\models
+        run: |
+          $p = Start-Process -FilePath dist\FotoMedik.exe -ArgumentList "--smoke-ai","demo","demo_out_ai","shot_ai.png" -PassThru -Wait
+          if (Test-Path shot_ai.txt) { Get-Content shot_ai.txt }
+          Write-Host "exit code $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+          if (!(Get-ChildItem demo_out_ai -Filter *_ai.jpg)) { exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: FotoMedik-windows
@@ -94,4 +134,7 @@ jobs:
         if: always()
         with:
           name: app-screenshots
-          path: shot_*.png
+          path: |
+            shot_*.png
+            shot_*.txt
+            demo_out_ai/*_ai.jpg

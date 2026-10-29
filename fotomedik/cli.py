@@ -55,6 +55,7 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
     run_pipeline(ctx)
     w, h = _dims(ctx.data)
     rep = FileReport.from_context(ctx, findings_before=[f.to_dict() for f in diag.findings], width=w, height=h)
+    rep.unknown = _unknown_holes(ctx)
     if rep.recovered_pct is None:
         if ctx.data != data:  # repaired (e.g. a new header) and nothing left to fill: measure the result
             after = scan_bytes(ctx.data, name)
@@ -62,6 +63,46 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
         else:
             rep.recovered_pct = round(100 * diag.recovered_fraction, 1) if not diag.findings or diag.openable else None
     return ctx, rep
+
+
+def _unknown_holes(ctx: Context) -> list[tuple[int, int]]:
+    """MCU ranges of holes the thumbnail says nothing about (all holes without one)."""
+    if not ctx.holes or ctx.fallback is not None:
+        return []
+    ranges = [(h.mcu_first, h.mcu_count) for h in ctx.holes]
+    thumb = ctx.memo.get("thumb_base")
+    if thumb is None:
+        return ranges
+    try:
+        import numpy as np
+
+        from .jpeg import decoder as D
+        from .jpeg import markers as M
+        from .jpeg.tables import FrameTables
+
+        ft = FrameTables.from_parse(M.parse_segments(ctx.data))
+        comps, per_row, _rows = D._scan_components(ft)
+        c = comps[0]
+        dc = thumb.dc[c.cid]
+        rows_m = dc.shape[0] // c.v
+        nan = np.isnan(dc[: rows_m * c.v, : per_row * c.h]).reshape(rows_m, c.v, per_row, c.h).any(axis=(1, 3))
+        unknown = nan.reshape(-1)
+    except Exception:
+        return []
+    out: list[tuple[int, int]] = []
+    for first, count in ranges:
+        seg = unknown[first : first + count]
+        i = 0
+        while i < len(seg):
+            if seg[i]:
+                j = i
+                while j < len(seg) and seg[j]:
+                    j += 1
+                out.append((first + i, j - i))
+                i = j
+            else:
+                i += 1
+    return out
 
 
 def _nothing_to_save(ctx: Context, rep: FileReport) -> bool:
@@ -269,7 +310,7 @@ def scan(path: Path, lang: str):
 
 
 def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
-                jobs: int = 0, reports: bool = False):
+                jobs: int = 0, reports: bool = False, ai: bool = False):
     if path.is_dir() and out.resolve() == path.resolve():
         raise click.ClickException("output folder must differ from the input folder (originals are never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
@@ -284,6 +325,19 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
             options["ref_candidates"], options["thumb_refs"] = _learn_candidates(files, click.echo, jobs, workers)
         work = [(str(p), str(rel), str(out), options, profile) for p, rel in files]
         results = workers.map(_repair_file, work, cost=lambda it: os.path.getsize(it[0]), counted=True)
+    if ai:
+        from .ai.run import run_ai
+
+        def ai_done(rep: FileReport) -> None:
+            if reports_wanted:  # the report was written before the AI copy existed
+                rp = out / Path(rep.output_name).with_suffix(".report.json")
+                if rp.exists():
+                    rp.write_text(rep.to_json(), encoding="utf-8")
+
+        reports_wanted = reports
+        device = run_ai([rep for rep, _s in results], out, click.echo, on_done=ai_done)
+        if device:
+            click.echo(f"[ai] copies made on {device}")
     reports: list[FileReport] = []
     for rep, secs in results:
         reports.append(rep)
@@ -304,11 +358,12 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 @click.option("--thorough", is_flag=True, help="search much longer for flipped bits (60 s per file)")
 @click.option("--jobs", default=0, show_default="all CPU cores", help="files repaired in parallel")
 @click.option("--reports", is_flag=True, help="also write a .report.json next to every repaired photo")
+@click.option("--ai", is_flag=True, help="also make an AI copy (_ai.jpg): holes sharpened and filled (invented detail)")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, lang):
+def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, lang):
     """Repair a file or folder into OUT (--reports: a .report.json per file too)."""
     _fix_common(path, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
-                auto_ref=False, jobs=jobs, reports=reports)
+                auto_ref=False, jobs=jobs, reports=reports, ai=ai)
 
 
 @main.command()
@@ -334,11 +389,12 @@ def learn(good: Path, out: Path):
 @click.option("--thorough", is_flag=True, help="search much longer for flipped bits (60 s per file)")
 @click.option("--jobs", default=0, show_default="all CPU cores", help="files repaired in parallel")
 @click.option("--reports", is_flag=True, help="also write a .report.json next to every repaired photo")
+@click.option("--ai", is_flag=True, help="also make an AI copy (_ai.jpg): holes sharpened and filled (invented detail)")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
-def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, lang):
+def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
     reps = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
-                       auto_ref=True, jobs=jobs, reports=reports)
+                       auto_ref=True, jobs=jobs, reports=reports, ai=ai)
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])
