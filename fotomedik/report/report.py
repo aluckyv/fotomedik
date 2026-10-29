@@ -45,6 +45,7 @@ STRINGS = {
             "thumbnail_fallback": "iskorišćen ugrađeni thumbnail",
             "smooth_holes": "rupe izglađene (bez kockica)",
             "foreign_sectors": "izbačeni sektori koji nisu deo slike (nule, tekst, drugi fajlovi)",
+            "orientation": "vraćena orijentacija (uspravna slika)",
         },
     },
     "en": {
@@ -84,6 +85,7 @@ STRINGS = {
             "thumbnail_fallback": "embedded thumbnail used",
             "smooth_holes": "holes smoothed (no squares)",
             "foreign_sectors": "foreign sectors blanked (zeros, text, other files)",
+            "orientation": "orientation restored (photo shows upright)",
         },
     },
 }

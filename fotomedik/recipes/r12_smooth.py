@@ -129,6 +129,75 @@ def hole_coefficients(dc: np.ndarray, holes: np.ndarray, quant: np.ndarray) -> n
     return out
 
 
+BRIDGE_MAX = 40  # pixels: gaps up to this tall are bridged from the real pixels above and below
+
+
+def component_planes(data: bytes, ft, comps) -> dict | None:
+    """Decoded pixels per component at its own resolution (block grid size), level-shifted."""
+    import io
+
+    from PIL import Image, ImageFile
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.draft("YCbCr", im.size)
+        im = im.convert("YCbCr") if im.mode not in ("YCbCr", "L") else im
+        arr = np.asarray(im, dtype=np.float32)
+    except Exception:
+        return None
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = False
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    fr = ft.frame
+    out = {}
+    for i, c in enumerate(comps):
+        ch = arr[:, :, min(i, arr.shape[2] - 1)] - 128.0
+        fc = fr.component(c.cid)
+        sy, sx = fr.vmax // fc.v, fr.hmax // fc.h
+        if sy > 1 or sx > 1:
+            hh, ww = ch.shape[0] // sy * sy, ch.shape[1] // sx * sx
+            ch = ch[:hh, :ww].reshape(hh // sy, sy, ww // sx, sx).mean(axis=(1, 3))
+        H, W = c.blocks_h * 8, c.blocks_w * 8
+        ch = np.pad(ch, ((0, max(0, H - ch.shape[0])), (0, max(0, W - ch.shape[1]))), mode="edge")[:H, :W]
+        out[c.cid] = ch
+    return out
+
+
+def bridge_coefficients(plane: np.ndarray, holes: np.ndarray, quant: np.ndarray, max_gap: int = BRIDGE_MAX):
+    """For hole blocks inside a short vertical gap: AC coefficients (zigzag, quantised,
+    DC slot 0) of a linear blend, pixel column by pixel column, between the last real
+    pixel above and the first real pixel below - edges and texture run through the gap
+    instead of stopping at it. Returns (coefficients (rows, cols, 64), bridged mask)."""
+    rows, cols = holes.shape
+    hp = np.repeat(np.repeat(holes, 8, 0), 8, 1)
+    known = ~hp
+    H = rows * 8
+    ridx = np.arange(H)[:, None].repeat(hp.shape[1], 1)
+    above = np.maximum.accumulate(np.where(known, ridx, -1), axis=0)
+    below = np.minimum.accumulate(np.where(known, ridx, H)[::-1], axis=0)[::-1]
+    ok = (above >= 0) & (below < H) & (below - above <= max_gap + 1)
+    colidx = np.arange(hp.shape[1])[None, :].repeat(H, 0)
+    va = plane[np.clip(above, 0, H - 1), colidx]
+    vb = plane[np.clip(below, 0, H - 1), colidx]
+    t = (ridx - above) / np.maximum(below - above, 1)
+    target = va + (vb - va) * t
+    good = ok.reshape(rows, 8, cols, 8).all(axis=(1, 3)) & holes
+    out = np.zeros((rows, cols, 64), dtype=np.int16)
+    if not good.any():
+        return out, good
+    q_nat = np.empty(64)
+    q_nat[ZIGZAG] = quant
+    by, bx = np.nonzero(good)
+    blocks = target.reshape(rows, 8, cols, 8).transpose(0, 2, 1, 3)[by, bx]
+    coef = (DCT @ blocks @ DCT.T).reshape(-1, 64) / q_nat
+    zz = np.clip(np.rint(coef[:, ZIGZAG]), -1023, 1023).astype(np.int16)
+    zz[:, 0] = 0
+    out[by, bx] = zz
+    return out, good
+
+
 def smooth_holes(data: bytes, hole_mcus: np.ndarray) -> bytes | None:
     """`data` with the given MCUs rewritten as smooth blocks, or None when the scan
     does not decode cleanly or nothing would change."""
@@ -147,13 +216,18 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray) -> bytes | None:
     pk = K.packed_for(ft)
     # the AC coefficients of every hole block, per component
     grids = {}
+    planes = component_planes(data, ft, comps)
     for c in comps:
         arr = sr.dc[c.cid]
         if np.isnan(arr).any():
             return None
         quant = np.asarray(ft.quant[ft.frame.component(c.cid).tq].values, dtype=float)
         holes = block_mask(hole_mcus, arr, c.h, c.v, per_row)
-        grids[c.cid] = (np.rint(arr).astype(np.int32), hole_coefficients(arr, holes, quant))
+        ac = hole_coefficients(arr, holes, quant)
+        if planes is not None and planes[c.cid].shape == (arr.shape[0] * 8, arr.shape[1] * 8):
+            bridged, good = bridge_coefficients(planes[c.cid], holes, quant)
+            ac = np.where(good[..., None], bridged, ac)
+        grids[c.cid] = (np.rint(arr).astype(np.int32), ac)
     if not any(g[1].any() for g in grids.values()):
         return None
 

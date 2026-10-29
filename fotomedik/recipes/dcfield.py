@@ -61,6 +61,32 @@ def vertical_reference(arr: np.ndarray, okm: np.ndarray) -> tuple[np.ndarray, np
     return val, dist
 
 
+def pull_push(arr: np.ndarray, known: np.ndarray) -> np.ndarray:
+    """`arr` with the unknown blocks filled smoothly from all known ones around them,
+    in every direction (a pyramid: averages are pulled down to coarse levels, then
+    pushed back up with bilinear interpolation). Unlike interpolating each column
+    between the rows above and below, it leaves no vertical streaks."""
+    v = np.where(known, arr, 0.0).astype(float)
+    w = known.astype(float)
+    levels = [(v, w)]
+    while min(v.shape) > 2:
+        h, wd = v.shape
+        ph, pw = h % 2, wd % 2
+        v2 = np.pad(v, ((0, ph), (0, pw)), mode="constant")
+        w2 = np.pad(w, ((0, ph), (0, pw)), mode="constant")
+        v = v2.reshape(v2.shape[0] // 2, 2, v2.shape[1] // 2, 2).sum(axis=(1, 3))
+        w = w2.reshape(w2.shape[0] // 2, 2, w2.shape[1] // 2, 2).sum(axis=(1, 3))
+        levels.append((v, w))
+    v, w = levels[-1]
+    filled = np.where(w > 0, v / np.maximum(w, 1e-9), float(np.mean(arr[known])) if known.any() else 0.0)
+    for v, w in reversed(levels[:-1]):
+        h, wd = v.shape
+        up = np.asarray(Image.fromarray(filled.astype(np.float32), mode="F").resize((wd, h), Image.BILINEAR))
+        a = np.clip(w, 0.0, 1.0)  # fully trusted where this level has data
+        filled = np.where(w > 0, (v / np.maximum(w, 1e-9)) * a + up * (1 - a), up)
+    return np.where(known, arr, filled)
+
+
 def vertical_noise(arr: np.ndarray, okm: np.ndarray, q: int) -> float:
     """Typical gray-level error of predicting a clean block from the blocks above and below."""
     m = okm[1:-1] & okm[:-2] & okm[2:]

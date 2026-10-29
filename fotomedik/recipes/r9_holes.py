@@ -28,7 +28,7 @@ from ..jpeg.encoder import BitWriter, encode_flat_mcus, gray_dc
 from ..jpeg.tables import FrameTables, TableError
 from ..jpeg.writer import assemble, rst_marker
 from .base import Context, Hole, Recipe
-from .dcfield import block_mask, build_field, thumbnail_base, vertical_reference  # noqa: F401
+from .dcfield import block_mask, build_field, pull_push, thumbnail_base, vertical_reference  # noqa: F401
 from .registry import register
 
 BACKOFF_MCUS = 3  # MCUs dropped before a detected error (silent desync margin)
@@ -121,6 +121,83 @@ def _retarget(part: dict, head: int, n_new: int, data: bytes, pk: K.Packed) -> d
     else:
         new["dc_rel"] = rel[:n_new]
     return new
+
+
+JUNK_CHROMA = 22.0  # gray levels a piece's colour may stand out from rows above and below that agree
+JUNK_LUMA = 70.0
+AGREE = 8.0  # rows above and below this close count as agreeing
+MIN_PIECE = 4  # MCUs: shorter remains of a cut part are dropped
+
+
+def junk_mcus(first: int, n: int, work_dc: dict, trusted: np.ndarray, comps, qdc: dict, per_row: int) -> np.ndarray:
+    """Per MCU of a piece: True when it is a thin line of garbage - its colour or
+    brightness jumps away from the real rows directly above and below, which agree
+    with each other (a desync that still decoded, or a piece placed wrongly)."""
+    out = np.zeros(n, dtype=bool)
+    m = np.arange(first, first + n)
+    mrow, mcol = m // per_row, m % per_row
+    for ci, (cid, h, v) in enumerate(comps):
+        arr = work_dc[cid]
+        rows = arr.shape[0]
+        g = qdc[cid] / 8.0
+        okb = block_mask(trusted, arr, h, v, per_row)
+        mine = np.stack([arr[mrow * v + yy, mcol * h + xx] for yy in range(v) for xx in range(h)], 1).mean(1)
+        ra, rb = mrow * v - 1, mrow * v + v
+        va = np.full(n, np.nan)
+        vb = np.full(n, np.nan)
+        ia, ib = ra >= 0, rb < rows
+        for xx in range(h):
+            cc = mcol * h + xx
+            a = np.where(ia, arr[np.clip(ra, 0, rows - 1), cc], np.nan)
+            b = np.where(ib, arr[np.clip(rb, 0, rows - 1), cc], np.nan)
+            a = np.where(ia & okb[np.clip(ra, 0, rows - 1), cc], a, np.nan)
+            b = np.where(ib & okb[np.clip(rb, 0, rows - 1), cc], b, np.nan)
+            va = np.where(np.isnan(va), a, (va + a) / 2) if xx else a
+            vb = np.where(np.isnan(vb), b, (vb + b) / 2) if xx else b
+        both = ~np.isnan(va) & ~np.isnan(vb)
+        agree = both & (np.abs(va - vb) * g < AGREE * (2.0 if ci == 0 else 1.0))
+        dev = np.abs(mine - (va + vb) / 2) * g
+        lim = JUNK_LUMA if ci == 0 else JUNK_CHROMA
+        out |= agree & (dev > lim)
+    return out
+
+
+def drop_junk_lines(plan: dict, work_dc: dict, trusted: np.ndarray, comps, qdc: dict, per_row: int,
+                    data: bytes, pk: K.Packed) -> int:
+    """Cut thin lines of garbage out of the spliced parts (they become filled holes)."""
+    dropped = 0
+    for pl in plan.values():
+        new_parts = []
+        for part in pl["parts"]:
+            if part.get("full"):
+                new_parts.append(part)
+                continue
+            f, n = part["first_mcu"], part["n"]
+            bad = junk_mcus(f, n, work_dc, trusted, comps, qdc, per_row)
+            if not bad.any():
+                new_parts.append(part)
+                continue
+            trusted[f : f + n][bad] = False
+            dropped += int(bad.sum())
+            i = 0
+            while i < n:
+                if bad[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < n and not bad[j]:
+                    j += 1
+                if j - i >= MIN_PIECE:
+                    sub = _retarget(part, i, j - i, data, pk) if (i or j < n) else part
+                    if sub is not None:
+                        new_parts.append(sub)
+                    else:
+                        trusted[f + i : f + j] = False
+                else:
+                    trusted[f + i : f + j] = False
+                i = j
+        pl["parts"] = new_parts
+    return dropped
 
 
 def arrange_parts(iv, keep: int, pieces: list, tail: dict | None, data: bytes, pk: K.Packed) -> list[dict]:
@@ -330,15 +407,54 @@ class FillHoles(Recipe):
                     work_dc[cid][br, bc] = rel[:, col : col + h * v] + tail["delta"][cid]
                     col += h * v
             pending = later
+        if pending:
+            # parts with no clean row anywhere near: their colour from everything real
+            # around them, in all directions (rather than the guess they came with)
+            pp = {cid: pull_push(np.nan_to_num(work_dc[cid]), block_mask(trusted, work_dc[cid], h, v, mcus_per_row))
+                  for cid, h, v in comps}
+            for pl, tail in pending:
+                f, n, rel = tail["first_mcu"], tail["n"], tail["dc_rel"]
+                if tail["full"]:
+                    continue
+                col = 0
+                deltas = {}
+                for cid, h, v in comps:
+                    br, bc = tail_blocks(f, n, h, v, mcus_per_row)
+                    r = rel[:, col : col + h * v]
+                    d = float(np.median(pp[cid][br, bc] - r))
+                    d = legal_offset(r, qdc[cid], d)
+                    deltas[cid] = d if d is not None else float(tail["delta"][cid])
+                    col += h * v
+                tail["delta"] = {cid: int(round(d)) for cid, d in deltas.items()}
+                col = 0
+                for cid, h, v in comps:
+                    br, bc = tail_blocks(f, n, h, v, mcus_per_row)
+                    work_dc[cid][br, bc] = rel[:, col : col + h * v] + tail["delta"][cid]
+                    col += h * v
+                trusted[f : f + n] = True
+        drop_junk_lines(plan, work_dc, trusted, comps, qdc, mcus_per_row, data, pk)
         covered = max((iv.mcu_first + iv.mcu_count for iv in sr.intervals), default=0)
         if covered < total:
             trusted[covered:] = False
 
         # ---------------------------------------------------------------- interpolation sources
         interp = {}
-        for cid, f in fields_for(work_dc, trusted).items():
+        for (cid, f), (_c, h, v) in zip(fields_for(work_dc, trusted).items(), comps):
             lim = (1024 + qdc[cid]) // qdc[cid] - 1  # stay inside the legal DC range
-            interp[cid] = np.clip(np.nan_to_num(f.val, nan=0.0), -lim, lim)
+            val = f.val
+            # where the thumbnail says nothing, fill from all sides (no vertical streaks)
+            guide = thumb.dc[cid] if thumb is not None else None
+            unguided = ~np.isfinite(guide) if guide is not None else np.ones_like(val, dtype=bool)
+            if unguided.any():
+                known = block_mask(trusted, work_dc[cid], h, v, mcus_per_row)
+                if known.any():
+                    # thin gaps (a row or two missing) are best bridged from the rows above
+                    # and below; the taller the gap, the more the all-sides fill takes over
+                    pp = pull_push(np.nan_to_num(work_dc[cid]), known)
+                    wv = np.where(np.isfinite(f.dist), np.exp(-np.maximum(0.0, f.dist - 2.0) / 2.0), 0.0)
+                    mixed = np.where(np.isfinite(val), wv * val + (1 - wv) * pp, pp)
+                    val = np.where(unguided & ~known, mixed, val)
+            interp[cid] = np.clip(np.nan_to_num(val, nan=0.0), -lim, lim)
 
         def fill_targets(first, count, last_override=None):
             per_block: dict[int, list[int]] = {}
