@@ -33,6 +33,7 @@ BLOCK = 32  # MCUs placed together
 MIN_SEG = 512  # bytes: shorter intact stretches are not worth it
 PROBE = 256  # bytes searched for a converged start at the beginning of a stretch
 ACCEPT = 3.0  # mean squared misfit per component (in units of the reference's expected error)
+ACCEPT_ROW = 12.0  # inside one restart interval (a short search) a clearly best place may fit worse
 DISTINCT = 0.6  # a first placement must beat every other position (more than 3 MCUs away) by this factor
 FIRST_WINDOW = 0.25  # search +-25 % of the MCU distance to the nearest anchor (at least MIN_WINDOW)
 MIN_WINDOW = 48
@@ -183,7 +184,7 @@ def _blocks(n: int, min_len: int) -> list[tuple[int, int]]:
 
 
 def place_chain(placer: Placer, rel: np.ndarray, byte_of: np.ndarray, anchors: Anchors,
-                m_lo: int, m_hi: int, min_len: int = BLOCK) -> list[tuple[int, int, int]]:
+                m_lo: int, m_hi: int, min_len: int = BLOCK, accept: float = ACCEPT) -> list[tuple[int, int, int]]:
     """Blocks of the chain that fit: (chain index, MCU index, count), in chain order."""
     out: list[tuple[int, int, int]] = []
     n = len(rel)
@@ -196,7 +197,7 @@ def place_chain(placer: Placer, rel: np.ndarray, byte_of: np.ndarray, anchors: A
             if len(cs):
                 i = int(np.argmin(cs))
                 m = base + i
-                if cs[i] <= ACCEPT and m >= floor:
+                if cs[i] <= accept and m >= floor:
                     out.append((k, m, bl))
                     prev_end, floor = m + bl, m + bl
                     continue
@@ -208,7 +209,7 @@ def place_chain(placer: Placer, rel: np.ndarray, byte_of: np.ndarray, anchors: A
         i = int(np.argmin(cs))
         far = np.abs(np.arange(len(cs)) - i) > 3
         second = float(cs[far].min()) if far.any() else np.inf
-        if cs[i] <= ACCEPT and cs[i] <= DISTINCT * second:
+        if cs[i] <= accept and cs[i] <= DISTINCT * second:
             m = base + i
             out.append((k, m, bl))
             anchors.add(float(byte_of[k]), m)
@@ -295,7 +296,8 @@ class SegmentPlacement(Recipe):
                 s = int(bits[0])
                 dn, _err, *_r, dc = K.decode_mcus(data, s // 8, s % 8, c, pk, preds, len(bits), check_dc=False)
                 rel = dc[:dn].astype(float) * placer.q[None, :]
-                blocks = place_chain(placer, rel, bits[:dn] / 8.0, anchors, floor, job["m_hi"], min_len)
+                blocks = place_chain(placer, rel, bits[:dn] / 8.0, anchors, floor, job["m_hi"], min_len,
+                                     ACCEPT_ROW if job["dri"] else ACCEPT)
                 for k, m, n in merge_blocks(blocks):
                     pieces.append({"chain_bits": bits, "k": k, "m": m, "n": n, "end": c})
                     floor = max(floor, m + n)
