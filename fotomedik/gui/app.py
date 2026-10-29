@@ -317,6 +317,15 @@ class MainWindow(QMainWindow):
         pics.addWidget(self.aibox, 1)
         self.aibox.hide()
         rl.addLayout(pics, 3)
+        tools = QHBoxLayout()
+        self.handb = QPushButton("Fix by hand…")
+        self.handb.setToolTip("Open the selected photo in the manual repair window:\n"
+                              "shift colours, move the picture or cut junk from a chosen place on.")
+        self.handb.setEnabled(False)
+        self.handb.clicked.connect(self._fix_by_hand)
+        tools.addWidget(self.handb)
+        tools.addStretch(1)
+        rl.addLayout(tools)
         self.report = QPlainTextEdit()
         self.report.setReadOnly(True)
         self.report.setPlaceholderText("Select a photo to see what was found and repaired.")
@@ -478,6 +487,8 @@ class MainWindow(QMainWindow):
             return
         idx = self.table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
         r = self.results[idx]
+        self.selected = r
+        self.handb.setEnabled(r.output is not None)
         self.before.show_image(load_preview(r.source), "Does not open in a normal viewer")
         self.after.show_image(load_preview(r.output) if r.output else None, "Nothing could be saved")
         if self.aibox.isVisible():
@@ -492,6 +503,20 @@ class MainWindow(QMainWindow):
             for d in r.report.enhanced:
                 text += f"\n  - {d}"
         self.report.setPlainText(text)
+
+    def _fix_by_hand(self) -> None:
+        r = getattr(self, "selected", None)
+        if r is None or r.output is None:
+            return
+        from .manual_dialog import ManualDialog
+
+        try:
+            dlg = ManualDialog(self, r.output, r.source, r.output.parent)
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, f"This photo cannot be edited by hand: {e}")
+            return
+        self.manual = dlg
+        dlg.show()
 
     def _open_output(self) -> None:
         d = getattr(self, "out_dir", None)
@@ -588,13 +613,26 @@ def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, a
     def poll():
         if w.go.isEnabled() and w.results:
             ai_rows = [r for r in w.results if r.ai_output]
-            if ai_rows:
-                w.table.selectRow(w.results.index(ai_rows[0]))
-            else:
-                w.table.selectRow(0)
+            with_output = [r for r in w.results if r.output is not None and r.report.holes] or \
+                [r for r in w.results if r.output is not None] or w.results
+            pick = ai_rows[0] if ai_rows else with_output[0]
+            w.table.selectRow(w.results.index(pick))
             app.processEvents()
             w.grab().save(str(shot))
             ok = len(w.results) == w.total and (not ai or bool(ai_rows))
+            try:  # the manual repair window opens and edits
+                w._fix_by_hand()
+                dlg = getattr(w, "manual", None)
+                if dlg is not None:
+                    dlg.sliders["dy"].setValue(20)
+                    dlg._colour()
+                    app.processEvents()
+                    dlg.grab().save(str(shot.with_name(shot.stem + "_manual.png")))
+                    dlg.close()
+                    log.write(f"manual window: {len(dlg.editor.history)} edit(s)\n")
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                log.write(f"manual window failed: {type(e).__name__}: {e}\n")
             code["v"] = 0 if ok else 1
             log.write(f"smoke: {len(w.results)}/{w.total} photos, {len(ai_rows)} AI copies\n")
             app.quit()
