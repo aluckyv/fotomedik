@@ -9,8 +9,10 @@ from ..report.report import FileReport
 
 
 def ai_name(output_name: str) -> str:
-    p = Path(output_name)
-    return str(p.with_name(p.stem + "_ai.jpg"))
+    """'sub/x.jpg' -> 'sub/x_ai.jpg' (separators kept as given)."""
+    import os
+
+    return os.path.splitext(output_name)[0] + "_ai.jpg"
 
 
 def run_ai(reports: list[FileReport], out: Path, say=None, stop=None, on_done=None, engine=None) -> str | None:
