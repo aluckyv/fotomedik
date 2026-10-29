@@ -79,6 +79,13 @@ class ScanResult:
         return self.decoded_mcus / self.total_mcus if self.total_mcus else 0.0
 
     @property
+    def clean_fraction(self) -> float:
+        """Share of MCUs lying in intervals that decoded cleanly end to end."""
+        if not self.total_mcus:
+            return 0.0
+        return sum(iv.mcu_count for iv in self.intervals if iv.ok) / self.total_mcus
+
+    @property
     def errors(self) -> list[DecodeError]:
         return [iv.error for iv in self.intervals if iv.error is not None]
 

@@ -75,7 +75,7 @@ def scan_bytes(data: bytes, name: str = "") -> Diagnosis:
     d.openable = True
     d.total_mcus = sr.total_mcus
     d.total_intervals = len(sr.intervals)
-    d.recovered_fraction = sr.recovered_fraction
+    d.recovered_fraction = sr.clean_fraction
     bad = [iv for iv in sr.intervals if not iv.ok]
     d.bad_intervals = len(bad)
 
