@@ -438,6 +438,51 @@ def repair_interval(
     return False, chosen, "unrepaired"
 
 
+THUMB_CHECK_K = 4.0  # a fix whose blocks stray this many times the thumbnail's usual error ...
+THUMB_CHECK_FLOOR = (12.0, 8.0)  # ... and more than this (gray levels, luma/chroma) is rejected
+THUMB_CHECK_MIN = 24  # blocks after the damage needed to judge
+
+
+def thumbnail_rejects(data: bytes, before: D.ScanResult, after: D.ScanResult, ft: FrameTables,
+                      m_from: int, m_to: int, thumb_refs=None) -> str | None:
+    """Why the decode `after` a fix cannot be right in MCUs [m_from, m_to), or None.
+
+    A flip that lets the interval decode to its end is not always the true one: where
+    another photo's sectors or a rotted stretch sit in the data, some flip can make the
+    garbage decode "cleanly" - and every block after it then has the wrong colour. The
+    thumbnail knows each block's colour; the fixed blocks must agree with it about as
+    well as the clean blocks before the damage do."""
+    from .dcfield import block_mask, thumbnail_base
+
+    clean = before.mcu_ok.copy()
+    clean[m_from:] = False
+    try:
+        thumb = thumbnail_base(data, ft, before, clean, thumb_refs)
+    except Exception:  # noqa: BLE001 - no verdict without a usable thumbnail
+        return None
+    if thumb is None or thumb.twin:
+        return None
+    comps_d, per_row, _rows = D._scan_components(ft)
+    comps = [(c.cid, c.h, c.v) for c in comps_d]
+    span = np.zeros_like(after.mcu_ok)
+    span[m_from:m_to] = True
+    span &= after.mcu_ok
+    for ci, (cid, h, v) in enumerate(comps[:3]):
+        if cid not in thumb.dc:
+            continue
+        arr = after.dc[cid]
+        m = block_mask(span, arr, h, v, per_row) & np.isfinite(thumb.dc[cid])
+        if int(m.sum()) < THUMB_CHECK_MIN:
+            continue
+        q = ft.quant[ft.frame.component(cid).tq].dc
+        err = float(np.median(np.abs(arr[m] - thumb.dc[cid][m]))) * q / 8.0
+        limit = max(THUMB_CHECK_K * float(thumb.sigma[cid]), THUMB_CHECK_FLOOR[min(ci, 1)])
+        if err > limit:
+            what = "brightness" if ci == 0 else "colour"
+            return f"{what} off by {err:.0f} gray levels from the thumbnail (usual {thumb.sigma[cid]:.0f})"
+    return None
+
+
 DENSE_SHARE = 0.05  # broken FF00 pairs above this: rot everywhere, single flips are not the problem
 
 
@@ -548,6 +593,16 @@ class BitFlipRepair(Recipe):
                 attempted.add(iv.index)
                 iv_deadline = min(deadline, time.monotonic() + per_interval)
                 ok, flips, note = repair_interval(buf, parse, ft, sr, iv, iv_deadline, baseline, stats)
+                if flips:
+                    after = D.decode_scan(bytes(buf), parse, ft)
+                    m_from = iv.mcu_first + (iv.decoded or 0)
+                    why = thumbnail_rejects(bytes(buf), sr, after, ft, m_from, iv.mcu_first + iv.mcu_count,
+                                            ctx.options.get("thumb_refs"))
+                    if why:  # the decode completes but is not the photo: undo, leave it to the other recipes
+                        for o, m in flips:
+                            buf[o] ^= m
+                        ok, flips, note = False, [], "rejected by the thumbnail"
+                        ctx.memo.setdefault("bitflip_rejected", []).append(why)
                 all_flips += [[o, m] for o, m in flips]
                 if ok:
                     repaired += 1
