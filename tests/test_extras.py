@@ -80,7 +80,10 @@ def test_steps_report_what_they_did():
     out, done = enhance_steps(arr, holes, unknown, eng, ["burst", "deblock", "ai"], burst)
     assert done[0].startswith("similar shots") and "JPEG" in done[1]
     assert any("healed" in d and "LaMa" in d for d in done)
-    assert np.array_equal(out[~holes], arr[~holes])  # identity clean-up: real pixels as they were
+    from fotomedik.ai.enhance import JUNK_NEAR, _grow
+
+    far = ~_grow(holes, JUNK_NEAR + 8)  # next to a hole a wrongly coloured stripe may be healed too
+    assert np.array_equal(out[far], arr[far])  # identity clean-up: real pixels as they were
 
 
 def test_healing_fills_every_hole_window_by_window():
@@ -164,3 +167,22 @@ def test_diffusion_fill_keeps_real_pixels():
     out = diffusion_fill(arr, holes, np.zeros_like(holes), sd, size=64, steps=3)
     assert out.shape == arr.shape
     assert np.array_equal(out[~holes], arr[~holes])
+
+
+def test_wrongly_coloured_stripes_next_to_holes_are_healed_too():
+    from fotomedik.ai.enhance import JUNK_TOL, _grow, colour_stripes
+
+    arr = np.full((256, 256, 3), 128, np.uint8)
+    arr[:, :, 0] = np.linspace(100, 160, 256).astype(np.uint8)[None, :]  # a gentle real picture
+    holes = np.zeros((256, 256), bool)
+    holes[96:128, :] = True
+    arr[128:144, 40:200] = (255, 60, 170)  # a pink line of rotted data right under the hole
+    arr[200:216, 20:60] = (200, 40, 40)  # a red object far from any hole stays
+    j = colour_stripes(arr, _grow(holes, 16) & ~holes, JUNK_TOL)
+    assert j[128:144, 60:180].mean() > 0.9
+    assert not j[200:216, 20:60].any() and not j[:96].any()
+
+    out, done = enhance_steps(arr, holes, holes.copy(), Engine(None, FakeLama()), ["ai"])
+    assert "stripes" in done[0]
+    assert np.abs(out[136, 100].astype(int) - (255, 60, 170)).sum() > 100  # the pink is gone
+    assert np.array_equal(out[200:216, 20:60], arr[200:216, 20:60])

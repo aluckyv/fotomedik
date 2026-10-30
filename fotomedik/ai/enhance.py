@@ -426,6 +426,51 @@ def sharpen_holes(arr: np.ndarray, holes: np.ndarray, engine: Engine, progress=N
     return np.clip(np.rint(arr * (1 - a) + hi * a), 0, 255).astype(np.uint8)
 
 
+STRIPE_WIN = (11, 3)  # blocks (tall, wide): the neighbourhood a block average is compared with
+STRIPE_TOL = (40.0, 12.0)  # gray levels (luma, chroma) a block may differ from that neighbourhood
+STRIPE_RUN = 3  # blocks side by side that make a stripe
+JUNK_TOL = (50.0, 18.0)  # the same for decoded blocks next to a hole (the end of a rotted stretch)
+JUNK_NEAR = 16  # pixels from a hole within which decoded blocks are checked
+
+
+def colour_stripes(ref: np.ndarray, known: np.ndarray, tol=STRIPE_TOL) -> np.ndarray:
+    """Blocks (8x8 grid) of `known` whose average colour in `ref` is a thin horizontal
+    stripe at odds with the rows above and below it - a pink, green or violet line left by
+    rotted data in a hole's colours. The thumbnail cannot hold detail that thin, so such a
+    stripe is never what it says; the healing decides those blocks instead."""
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    h, w = known.shape
+    bh, bw = -(-h // 8), -(-w // 8)
+    pad = ((0, bh * 8 - h), (0, bw * 8 - w), (0, 0))
+    r = np.pad(ref.astype(np.float32), pad, mode="edge").reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    ycc = np.stack([0.299 * r[..., 0] + 0.587 * r[..., 1] + 0.114 * r[..., 2],
+                    -0.169 * r[..., 0] - 0.331 * r[..., 1] + 0.5 * r[..., 2],
+                    0.5 * r[..., 0] - 0.419 * r[..., 1] - 0.081 * r[..., 2]], axis=-1)
+    ty, tx = STRIPE_WIN
+    off = np.zeros((bh, bw), dtype=bool)
+    for c in range(3):
+        padded = np.pad(ycc[..., c], ((ty // 2, ty // 2), (tx // 2, tx // 2)), mode="edge")
+        med = np.median(sliding_window_view(padded, (ty, tx)).reshape(bh, bw, -1), axis=-1)
+        off |= np.abs(ycc[..., c] - med) > tol[min(c, 1)]
+    k = np.pad(known, pad[:2], mode="edge").reshape(bh, 8, bw, 8).any(axis=(1, 3))
+    off &= k
+    # only runs of STRIPE_RUN or more blocks side by side
+    keep = np.zeros_like(off)
+    for i in range(STRIPE_RUN):
+        win = np.ones_like(off)
+        for j in range(STRIPE_RUN):
+            sh = np.zeros_like(off)
+            d = j - i
+            if d >= 0:
+                sh[:, : bw - d] = off[:, d:]
+            else:
+                sh[:, -d:] = off[:, : bw + d]
+            win &= sh
+        keep |= win
+    return np.repeat(np.repeat(keep, 8, 0), 8, 1)[:h, :w]
+
+
 def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray) -> np.ndarray:
     """Give every 8x8 block of `out` the average it has in `ref` where `known`, through
     a smooth correction (no steps between blocks). Only pixels inside holes move."""
@@ -525,9 +570,20 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             # healing: every hole filled from the real pixels around it at full size; where
             # the thumbnail knows a hole's block averages, they are given back afterwards
             t0, st = time.perf_counter(), {}
+            known = holes & ~unknown
+            stripes = colour_stripes(before, known)
+            # decoded stripes of wrong colour at the edge of a hole: rotted data the repair kept
+            junk = colour_stripes(before, _grow(holes, JUNK_NEAR) & ~holes, JUNK_TOL)
+            if junk.any():  # and the rows right above and below, where a stripe's edge bleeds
+                edge = junk.copy()
+                edge[:-8] |= junk[8:]
+                edge[8:] |= junk[:-8]
+                junk = edge & ~holes
+            holes = holes | junk
             arr = heal_holes(arr, holes, engine, report("LaMa window"), stop, st)
-            arr = keep_block_means(arr, before, holes, holes & ~unknown)
-            done.append(f"holes healed from the picture around them (LaMa, {st.get('tiles', 0)} windows, {_took(t0)})")
+            arr = keep_block_means(arr, before, holes, known & ~stripes)
+            done.append(f"holes healed from the picture around them (LaMa, {st.get('tiles', 0)} windows, {_took(t0)})"
+                        + (f"; {int(junk.sum()) // 64} block(s) of wrongly coloured stripes healed too" if junk.any() else ""))
         elif "ai" in steps and engine.sr is not None:
             if engine.sr is not None:
                 t0, st = time.perf_counter(), {}
