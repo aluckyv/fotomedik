@@ -88,7 +88,7 @@ def test_run_ai_writes_copy_next_to_repair(tmp_path, healthy_jpeg_rst):
     dev = run_ai([rep], tmp_path, on_done=seen.append, engine=Engine(FakeSR(), FakeLama(), "CPU"))
     assert dev == "CPU" and seen == [rep]
     assert rep.ai_output == ai_name("sub/x.jpg") == "sub/x_enhanced.jpg"
-    assert rep.enhanced and "sharpened" in rep.enhanced[-1]
+    assert rep.enhanced and "healed" in rep.enhanced[-1]
     Image.open(tmp_path / "sub" / "x_enhanced.jpg").load()
 
 
