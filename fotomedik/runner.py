@@ -138,6 +138,32 @@ def collect(paths: list[Path], out: Path) -> list[tuple[Path, Path]]:
     return files
 
 
+def plan(files: list[tuple[Path, Path]], options: dict) -> list[tuple[Path, Path, dict]]:
+    """The repairs to run: (file, relative output path, options) per output.
+
+    options["reference"] (a picture of the same scene, see fotomedik.reference): every
+    file is repaired guided by it, into <stem>_ref<suffix> - meant for one photo.
+    options["reference_dir"] (a folder of such pictures): each photo it holds a picture
+    for gets a guided repair into <stem>_ref<suffix> besides the plain one."""
+    from .reference import REFERENCE_SUFFIX, pair
+
+    def guided(rel: Path, ref: Path) -> tuple[Path, dict]:
+        opts = dict(options)
+        opts.pop("reference_dir", None)
+        opts["reference"] = str(ref)
+        return rel.with_name(rel.stem + REFERENCE_SUFFIX + rel.suffix), opts
+
+    if options.get("reference"):
+        return [(p, *guided(rel, Path(options["reference"]))) for p, rel in files]
+    plain = dict(options)
+    plain.pop("reference_dir", None)
+    items = [(p, rel, plain) for p, rel in files]
+    if options.get("reference_dir"):
+        refs = pair([p for p, _rel in files], Path(options["reference_dir"]))
+        items += [(p, *guided(rel, refs[p])) for p, rel in files if p in refs]
+    return items
+
+
 def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0,
         on_result=None, on_status=None, stop: threading.Event | None = None, on_ai=None,
         on_ai_status=None) -> list[Result]:
@@ -159,6 +185,7 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
     if not files:
         return results
     say = on_status or (lambda s: None)
+    items = plan(files, options)
     steps = list(options.get("enhance") or (["ai"] if options.get("ai") else []))
     enhancer = None
     by_rep: dict[int, Result] = {}
@@ -174,19 +201,22 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
             if on_ai:
                 on_ai(by_rep[id(rep)])
 
-        enhancer = Enhancer([p for p, _rel in files], out, steps, on_ai_status or say, stop,
+        enhancer = Enhancer([p for p, _rel, _o in items], out, steps, on_ai_status or say, stop,
                             on_done=copy_made, quality=options.get("quality"), prompt=options.get("prompt"))
         enhancer.start()
-    with Workers(jobs, len(files)) as workers:
+    with Workers(jobs, len(items)) as workers:
         if len(files) > 1:
             say("Learning from the healthy photos in the set…")
-            options["ref_candidates"], options["thumb_refs"] = _learn_candidates(files, say, jobs, workers)
-        work = [(str(p), str(rel), str(out), options, None) for p, rel in files]
+            learned = _learn_candidates(files, say, jobs, workers)
+            for _p, _rel, opts in items:
+                opts["ref_candidates"], opts["thumb_refs"] = learned
+        work = [(str(p), str(rel), str(out), opts, None) for p, rel, opts in items]
         order = list(range(len(work)))  # in list order: shots of one scene finish close together
-        say(f"Repairing {len(work)} photo(s)…")
+        guided = sum(1 for _p, _rel, o in items if o.get("reference"))
+        say(f"Repairing {len(files)} photo(s)…" + (f" ({guided} guided by a reference picture)" if guided else ""))
 
         def failed(i, err: Exception) -> tuple[FileReport, float]:
-            src = files[i][0]
+            src = items[i][0]
             rep = FileReport(src.name, None, src.stat().st_size, 0, None,
                              findings=[{"kind": "internal_error", "severity": "high", "offset": None,
                                         "detail": f"{type(err).__name__}: {err}"}])
@@ -194,7 +224,7 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
 
         def done(i, rep, secs):
             output = (out / rep.output_name) if rep.output_name else None
-            r = Result(files[i][0], output, rep, secs, options)
+            r = Result(items[i][0], output, rep, secs, items[i][2])
             results.append(r)
             by_rep[id(rep)] = r
             if on_result:

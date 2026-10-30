@@ -56,6 +56,8 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
     w, h = _dims(ctx.data)
     rep = FileReport.from_context(ctx, findings_before=[f.to_dict() for f in diag.findings], width=w, height=h)
     rep.unknown = _unknown_holes(ctx)
+    if ctx.memo.get("reference_used") and options.get("reference"):
+        rep.reference = Path(str(options["reference"])).name
     if rep.recovered_pct is None:
         if ctx.data != data:  # repaired (e.g. a new header) and nothing left to fill: measure the result
             after = scan_bytes(ctx.data, name)
@@ -334,7 +336,7 @@ def scan(path: Path, lang: str):
 
 def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
                 jobs: int = 0, reports: bool = False, enhance: str = "", quality: str | None = None,
-                prompt: str | None = None):
+                prompt: str | None = None, reference: Path | None = None):
     if path.is_dir() and out.resolve() == path.resolve():
         raise click.ClickException("output folder must differ from the input folder (originals are never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
@@ -342,12 +344,19 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
     t0 = time.perf_counter()
     options = {"mark_holes": mark_holes, "keep_damaged": keep_damaged, "time_budget": time_budget,
                "write_reports": reports}
+    if reference is not None:
+        options["reference_dir" if reference.is_dir() else "reference"] = str(reference)
     profile = CameraProfile.from_json(Path(ref).read_text(encoding="utf-8")) if ref else None
     files = [(p, rel) for p, rel in _iter_files(path) if not p.resolve().is_relative_to(out.resolve())]
-    with Workers(jobs, len(files)) as workers:
+    from .runner import plan
+
+    items = plan(files, options)
+    with Workers(jobs, len(items)) as workers:
         if auto_ref and len(files) > 1:
-            options["ref_candidates"], options["thumb_refs"] = _learn_candidates(files, click.echo, jobs, workers)
-        work = [(str(p), str(rel), str(out), options, profile) for p, rel in files]
+            learned = _learn_candidates(files, click.echo, jobs, workers)
+            for _p, _rel, opts in items:
+                opts["ref_candidates"], opts["thumb_refs"] = learned
+        work = [(str(p), str(rel), str(out), opts, profile) for p, rel, opts in items]
         results = workers.map(_repair_file, work, cost=lambda it: os.path.getsize(it[0]), counted=True)
     steps = [x.strip() for x in enhance.split(",") if x.strip()]
     if steps:
@@ -360,7 +369,7 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
                     rp.write_text(rep.to_json(), encoding="utf-8")
 
         reports_wanted = reports
-        device = run_extras([(rep, files[i][0]) for i, (rep, _s) in enumerate(results)], out, steps, click.echo,
+        device = run_extras([(rep, items[i][0]) for i, (rep, _s) in enumerate(results)], out, steps, click.echo,
                             on_done=ai_done, quality=quality, prompt=prompt)
         if device:
             click.echo(f"[enhance] networks ran on {device}")
@@ -391,13 +400,16 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 @click.option("--quality", default="balanced", show_default=True, type=click.Choice(["fast", "balanced", "full"]),
               help="diffusion preset: the photo is repainted at quarter, half or full size")
 @click.option("--scene", default="", help="what the photos show, for the diffusion (e.g. 'people on a square')")
+@click.option("--reference", type=click.Path(exists=True, path_type=Path),
+              help="a picture of the same scene (an AI-restored copy, a scan) that guides the repair into "
+                   "<name>_ref; a folder of such pictures is paired with the photos by name or content")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
 def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality, scene,
-        lang):
+        reference, lang):
     """Repair a file or folder into OUT (--reports: a .report.json per file too)."""
     _fix_common(path, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
                 auto_ref=False, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""),
-                quality=quality, prompt=scene or None)
+                quality=quality, prompt=scene or None, reference=reference)
 
 
 @main.command()
@@ -430,13 +442,16 @@ def learn(good: Path, out: Path):
 @click.option("--quality", default="balanced", show_default=True, type=click.Choice(["fast", "balanced", "full"]),
               help="diffusion preset: the photo is repainted at quarter, half or full size")
 @click.option("--scene", default="", help="what the photos show, for the diffusion (e.g. 'people on a square')")
+@click.option("--reference", type=click.Path(exists=True, path_type=Path),
+              help="a picture of the same scene (an AI-restored copy, a scan) that guides the repair into "
+                   "<name>_ref; a folder of such pictures is paired with the photos by name or content")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
 def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality,
-          scene, lang):
+          scene, reference, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
     reps = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
                        auto_ref=True, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""),
-                       quality=quality, prompt=scene or None)
+                       quality=quality, prompt=scene or None, reference=reference)
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])

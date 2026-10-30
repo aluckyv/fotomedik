@@ -29,6 +29,7 @@ from ..jpeg import kernel as K
 from ..scan.garbage import last_dense_damage
 from .base import Context, Recipe
 from .dcfield import block_mask, build_field, thumbnail_base
+from ..reference import for_context as reference_for
 from .r9_holes import decode_for, junk_onset, tail_blocks
 from .registry import register
 
@@ -270,7 +271,7 @@ class TailRecovery(Recipe):
         for iv in sr.intervals:
             if not iv.ok:
                 clean[iv.mcu_first : iv.mcu_first + iv.mcu_count] = False
-        thumb = thumbnail_base(data, ft, sr, clean, ctx.options.get("thumb_refs"))
+        thumb = thumbnail_base(data, ft, sr, clean, ctx.options.get("thumb_refs"), reference_for(ctx, ft))
         ctx.memo["thumb_base"] = thumb
         refs = References(sr, ft, thumb)
         tails: dict[int, dict] = {}

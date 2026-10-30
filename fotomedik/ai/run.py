@@ -122,7 +122,7 @@ class _Photos:
             return
         path = self.out / rep.output_name
         when = (taken_at(src) if src is not None else None) or taken_at(path)
-        self.items[i] = (rep, path, when)
+        self.items[i] = (rep, path, when, src)
 
     def shot(self, i: int):
         from .burst import Shot
@@ -131,7 +131,7 @@ class _Photos:
         if i in self.cache:
             self.cache.move_to_end(i)
             return self.cache[i]
-        rep, path, when = self.items[i]
+        rep, path, when, _src = self.items[i]
         data = path.read_bytes()
         rgb = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
         holes, unknown = photo_masks(data, rep.holes, rep.unknown)
@@ -147,11 +147,12 @@ class _Photos:
 
         if i not in self.items:
             return None
-        _rep, _path, when = self.items[i]
+        _rep, _path, when, src = self.items[i]
         if when is None:
             return None
-        near = [j for j, (_r, _p, w) in self.items.items()
-                if j != i and w is not None and abs((w - when).total_seconds()) <= MAX_GAP_S]
+        near = [j for j, (_r, _p, w, s) in self.items.items()
+                if j != i and w is not None and abs((w - when).total_seconds()) <= MAX_GAP_S
+                and not (src is not None and s == src)]  # not the same photo repaired another way
         if not near:
             return None
 

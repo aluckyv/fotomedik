@@ -300,16 +300,32 @@ def _rescue_from(head: bytes, start: int, ref):
 
 
 def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,
-                   thumb_refs: list | None = None) -> ThumbBase | None:
+                   thumb_refs: list | None = None, reference: list | None = None) -> ThumbBase | None:
     """The embedded thumbnail mapped onto each component's block grid as DC values,
     calibrated against the clean blocks (dc = a * thumb + b). None when there is no
     thumbnail, its shape does not match the frame, or it does not agree with the clean
-    part of the image."""
+    part of the image.
+
+    reference: full-size pictures of the same scene (YCbCr arrays, see fotomedik.reference)
+    that stand in for the thumbnail; of several (the two turns of a copy lying the other
+    way round) the one agreeing best with the clean blocks is used."""
+    if reference:
+        bases = [_base_from(img, None, ft, sr, clean_mcus, GAIN_WIDE) for img in reference]
+        bases = [b for b in bases if b is not None]
+        return max(bases, key=lambda b: b.r) if bases else None
     got = thumbnail_image(data, thumb_refs, landscape=ft.frame.width >= ft.frame.height)
     if got is None:
         return None
     img, mask = got
     img, mask = _crop_black_bars(img, mask)
+    return _base_from(img, mask, ft, sr, clean_mcus, GAIN_THUMB)
+
+
+GAIN_THUMB = (0.7, 1.4)  # calibration gain allowed for a camera thumbnail
+GAIN_WIDE = (0.5, 2.0)  # for a reference picture (edited copies are brightened or darkened)
+
+
+def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarray, gain_range) -> ThumbBase | None:
     frame = ft.frame
     th, tw = img.shape[:2]
     if abs((tw / th) / (frame.width / frame.height) - 1.0) > 0.03:
@@ -367,7 +383,7 @@ def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,
         sx = float(np.std(x))
         if sx > 1e-6 and float(np.std(y)) > 1e-6:
             r = float(np.corrcoef(x, y)[0, 1])
-            a = float(np.clip(np.cov(x, y)[0, 1] / (sx * sx), 0.7, 1.4))
+            a = float(np.clip(np.cov(x, y)[0, 1] / (sx * sx), *gain_range))
         else:
             r, a = 0.0, 1.0
         if ci == 0:

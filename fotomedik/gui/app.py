@@ -229,6 +229,20 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self._pick_output)
         row2.addWidget(b)
         dl.addLayout(row2)
+        row3 = QHBoxLayout()
+        lab = QLabel("References:")
+        lab.setToolTip("Optional: a folder of pictures of the same scenes (AI-restored copies, scans, copies\n"
+                       "from an album). Each is paired with its photo by name or by content and guides that\n"
+                       "photo's repair: pieces are placed and holes filled after it, into <name>_ref.jpg,\n"
+                       "next to the plain repair. Decoded data stays original either way.")
+        row3.addWidget(lab)
+        self.refp = QLineEdit()
+        self.refp.setPlaceholderText("Folder with pictures of the same scenes (optional)")
+        row3.addWidget(self.refp, 1)
+        b = QPushButton("Browse…")
+        b.clicked.connect(self._pick_references)
+        row3.addWidget(b)
+        dl.addLayout(row3)
         outer.addWidget(drop)
 
         # ---- actions
@@ -360,6 +374,13 @@ class MainWindow(QMainWindow):
         self.stepsb.setToolTip("How this photo was recovered: the picture after every repair step")
         self.stepsb.setEnabled(False)
         self.stepsb.clicked.connect(self._show_steps)
+        self.refb = QPushButton("Reference photo…")
+        self.refb.setToolTip("Repair this photo again, guided by a picture of the same scene (an AI-restored\n"
+                             "copy, a scan, another shot): pieces are placed and holes filled after it; decoded\n"
+                             "data stays original. The result is saved as <name>_ref.jpg next to this one.")
+        self.refb.setEnabled(False)
+        self.refb.clicked.connect(self._with_reference)
+        tools.addWidget(self.refb)
         self.cmpb = QPushButton("Compare with the original…")
         self.cmpb.setToolTip("Have an intact copy of this photo (another backup, an edited copy)?\n"
                              "Measures the repair against it: which decoded parts are right, how far the\n"
@@ -408,6 +429,11 @@ class MainWindow(QMainWindow):
         if files:
             self._set_inputs([Path(f) for f in files])
 
+    def _pick_references(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Folder with pictures of the same scenes")
+        if d:
+            self.refp.setText(d)
+
     def _pick_output(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Save repaired copies to")
         if d:
@@ -435,26 +461,40 @@ class MainWindow(QMainWindow):
         if any(p.is_dir() and p.resolve() == out.resolve() for p in paths):
             QMessageBox.warning(self, APP_NAME, "Save the repaired copies to a different folder than the originals.")
             return
-        self.total = len(runner.collect(paths, out))
-        if not self.total:
+        files = runner.collect(paths, out)
+        if not files:
             QMessageBox.information(self, APP_NAME, "No JPEG photos found there.")
             return
+        options = self._options()
+        refs = self.refp.text().strip()
+        if refs:
+            if not Path(refs).is_dir():
+                QMessageBox.warning(self, APP_NAME, "The references folder does not exist.")
+                return
+            options["reference_dir"] = refs
         self.results.clear()
         self.table.setRowCount(0)
         self.before.show_image(None)
         self.after.show_image(None)
         self.report.clear()
+        self._launch(paths, out, options, len(runner.plan(files, options)))
+
+    def _options(self) -> dict:
+        steps = [k for k, cb in self.steps.items() if cb.isChecked()]
+        return {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked(),
+                "enhance": steps, "quality": self.quality.currentData(),
+                "prompt": self.scene.text().strip() or None}
+
+    def _launch(self, paths: list[Path], out: Path, options: dict, total: int) -> None:
+        """Run a repair in the background; results come in through _on_result."""
+        self.total = total
         self.bar.setRange(0, self.total)
-        self.bar.setValue(0)
+        self.bar.setValue(len(self.results))
         self.go.setEnabled(False)
         self.stopb.setEnabled(True)
         self.openb.setEnabled(True)
         self.out_dir = out
-
-        steps = [k for k, cb in self.steps.items() if cb.isChecked()]
-        options = {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked(),
-                   "enhance": steps, "quality": self.quality.currentData(),
-                   "prompt": self.scene.text().strip() or None}
+        steps = options.get("enhance") or []
         self.aibox.setVisible(bool(steps))
         self.aibox.show_image(None)
         self.aistat.setVisible(bool(steps))
@@ -497,6 +537,8 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, c, it)
         self.bar.setValue(len(self.results))
         self.stat.setText(f"{len(self.results)} / {self.total} photos")
+        if rep.reference:
+            items[0].setText(f"{r.source.name}  (ref: {rep.reference})")
         if len(self.results) == 1:
             self.table.selectRow(0)
 
@@ -515,6 +557,8 @@ class MainWindow(QMainWindow):
     def _on_finished(self, secs: float, err: str) -> None:
         self.go.setEnabled(True)
         self.stopb.setEnabled(False)
+        sel = getattr(self, "selected", None)
+        self.refb.setEnabled(sel is not None and not sel.report.reference)
         n = len(self.results)
         if err:
             self.stat.setText("Stopped by an error.")
@@ -531,6 +575,7 @@ class MainWindow(QMainWindow):
         self.selected = r
         self.handb.setEnabled(r.output is not None)
         self.cmpb.setEnabled(r.output is not None)
+        self.refb.setEnabled(self.go.isEnabled() and not r.report.reference)
         self.stepsb.setEnabled(True)
         self.before.show_image(load_preview(r.source), "Does not open in a normal viewer")
         self.after.show_image(load_preview(r.output) if r.output else None, "Nothing could be saved")
@@ -570,6 +615,22 @@ class MainWindow(QMainWindow):
             return
         self.manual = dlg
         dlg.show()
+
+    def _with_reference(self) -> None:
+        r = getattr(self, "selected", None)
+        if r is None or not self.go.isEnabled():
+            return
+        f, _ = QFileDialog.getOpenFileName(self, f"Picture of the same scene as {r.source.name}",
+                                           str(r.source.parent), "Pictures (*.jpg *.jpeg *.png *.tif *.tiff *.webp);;All files (*)")
+        if not f:
+            return
+        options = dict(r.options)
+        options.pop("reference_dir", None)
+        options["reference"] = f
+        for k in ("ref_candidates", "thumb_refs"):  # learned from the set: keep for the guided run
+            if k in r.options:
+                options[k] = r.options[k]
+        self._launch([r.source], r.output.parent if r.output else self.out_dir, options, len(self.results) + 1)
 
     def _compare(self) -> None:
         r = getattr(self, "selected", None)

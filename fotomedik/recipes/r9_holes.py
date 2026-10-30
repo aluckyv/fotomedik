@@ -29,6 +29,7 @@ from ..jpeg.tables import FrameTables, TableError
 from ..jpeg.writer import assemble, rst_marker
 from .base import Context, Hole, Recipe
 from .dcfield import block_mask, build_field, pull_push, thumbnail_base, vertical_reference  # noqa: F401
+from ..reference import for_context as reference_for
 from .registry import register
 
 BACKOFF_MCUS = 3  # MCUs dropped before a detected error (silent desync margin)
@@ -299,7 +300,7 @@ class FillHoles(Recipe):
                 clean[iv.mcu_first : iv.mcu_first + iv.mcu_count] = False
         thumb = ctx.memo.get("thumb_base")
         if thumb is None and "thumb_base" not in ctx.memo:
-            thumb = thumbnail_base(data, ft, sr, clean, ctx.options.get("thumb_refs"))
+            thumb = thumbnail_base(data, ft, sr, clean, ctx.options.get("thumb_refs"), reference_for(ctx, ft))
             ctx.memo["thumb_base"] = thumb
 
         def fields_for(arr_of, mask):

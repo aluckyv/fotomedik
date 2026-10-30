@@ -198,9 +198,34 @@ def bridge_coefficients(plane: np.ndarray, holes: np.ndarray, quant: np.ndarray,
     return out, good
 
 
-def smooth_holes(data: bytes, hole_mcus: np.ndarray) -> bytes | None:
+def reference_coefficients(plane: np.ndarray, holes: np.ndarray, quant: np.ndarray):
+    """Quantised coefficients (zigzag, DC in slot 0) of the reference picture's own
+    pixels for every hole block: (coefficients (rows, cols, 64) int16, DC (rows, cols) int32)."""
+    rows, cols = holes.shape
+    q_nat = np.empty(64)
+    q_nat[ZIGZAG] = quant
+    out = np.zeros((rows, cols, 64), dtype=np.int16)
+    dc = np.zeros((rows, cols), dtype=np.int32)
+    by, bx = np.nonzero(holes)
+    if len(by) == 0:
+        return out, dc
+    blocks = plane.reshape(rows, 8, cols, 8).transpose(0, 2, 1, 3)[by, bx]
+    coef = (DCT @ blocks @ DCT.T).reshape(-1, 64) / q_nat
+    zz = np.clip(np.rint(coef[:, ZIGZAG]), -1023, 1023).astype(np.int16)
+    lim = 1024 // max(1, int(quant[0]))
+    dc[by, bx] = np.clip(zz[:, 0], -lim, lim)
+    zz[:, 0] = 0
+    out[by, bx] = zz
+    return out, dc
+
+
+def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None) -> bytes | None:
     """`data` with the given MCUs rewritten as smooth blocks, or None when the scan
-    does not decode cleanly or nothing would change."""
+    does not decode cleanly or nothing would change.
+
+    reference: YCbCr picture(s) of the same scene (fotomedik.reference): the hole blocks
+    then carry its pixels (aligned and calibrated against the decoded ones) instead of
+    the smooth surface; decoded MCUs are copied bit for bit either way."""
     parse = M.parse_segments(data)
     try:
         ft = FrameTables.from_parse(parse)
@@ -217,17 +242,39 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray) -> bytes | None:
     # the AC coefficients of every hole block, per component
     grids = {}
     planes = component_planes(data, ft, comps)
+    hole_blocks = {}
     for c in comps:
         arr = sr.dc[c.cid]
         if np.isnan(arr).any():
             return None
+        hole_blocks[c.cid] = block_mask(hole_mcus, arr, c.h, c.v, per_row)
+    planes_ok = planes is not None and all(
+        planes[c.cid].shape == (sr.dc[c.cid].shape[0] * 8, sr.dc[c.cid].shape[1] * 8) for c in comps)
+    ref_planes = None
+    if reference is not None and planes_ok:
+        from ..reference import aligned_planes, best_candidate
+
+        cands = reference if isinstance(reference, list) else [reference]
+        y0 = planes[comps[0].cid]
+        trusted = ~np.repeat(np.repeat(hole_blocks[comps[0].cid], 8, 0), 8, 1)[: y0.shape[0], : y0.shape[1]]
+        try:
+            ref_planes = aligned_planes(best_candidate(cands, y0, trusted), planes, comps, ft.frame, hole_blocks)
+        except Exception:
+            ref_planes = None
+    for c in comps:
+        arr = sr.dc[c.cid]
         quant = np.asarray(ft.quant[ft.frame.component(c.cid).tq].values, dtype=float)
-        holes = block_mask(hole_mcus, arr, c.h, c.v, per_row)
-        ac = hole_coefficients(arr, holes, quant)
-        if planes is not None and planes[c.cid].shape == (arr.shape[0] * 8, arr.shape[1] * 8):
-            bridged, good = bridge_coefficients(planes[c.cid], holes, quant)
-            ac = np.where(good[..., None], bridged, ac)
-        grids[c.cid] = (np.rint(arr).astype(np.int32), ac)
+        holes = hole_blocks[c.cid]
+        dcg = np.rint(arr).astype(np.int32)
+        if ref_planes is not None:
+            ac, dc_ref = reference_coefficients(ref_planes[c.cid], holes, quant)
+            dcg = np.where(holes, dc_ref, dcg)
+        else:
+            ac = hole_coefficients(arr, holes, quant)
+            if planes_ok:
+                bridged, good = bridge_coefficients(planes[c.cid], holes, quant)
+                ac = np.where(good[..., None], bridged, ac)
+        grids[c.cid] = (dcg, ac, np.rint(arr).astype(np.int32))
     if not any(g[1].any() for g in grids.values()):
         return None
 
@@ -236,14 +283,24 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray) -> bytes | None:
     slot = np.full(total, -1, dtype=np.int64)
     slot[hole_idx] = np.arange(len(hole_idx))
     r_all, c_all = hole_idx // per_row, hole_idx % per_row
+    # a hole MCU followed by a real one in the same interval must end on the DC the real
+    # MCU's bits were coded against (its decoded DC); elsewhere a hole's DC is free
+    iv_end = np.zeros(total + 1, dtype=bool)
+    for iv in sr.intervals:
+        iv_end[iv.mcu_first + iv.mcu_count] = True
+    nxt = hole_idx + 1
+    keep_dc = (nxt < total) & ~iv_end[nxt] & ~hole_mcus[np.minimum(nxt, total - 1)]
     parts = []
     for c in comps:
-        dcg, acg = grids[c.cid]
+        dcg, acg, decoded = grids[c.cid]
         for yy in range(c.v):
             for xx in range(c.h):
                 ry, rx = r_all * c.v + yy, c_all * c.h + xx
                 blk = acg[ry, rx].astype(np.int32)
-                blk[:, 0] = dcg[ry, rx]
+                dcs = dcg[ry, rx]
+                if yy == c.v - 1 and xx == c.h - 1:  # the component's last block of the MCU
+                    dcs = np.where(keep_dc, decoded[ry, rx], dcs)
+                blk[:, 0] = dcs
                 parts.append(blk)
     table = np.stack(parts, axis=1)  # (n_holes, bpm, 64)
 
@@ -294,7 +351,8 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray) -> bytes | None:
     if sr2.error is not None or not all(iv.ok for iv in sr2.intervals):
         return None
     for c in comps:
-        if not np.array_equal(sr2.dc[c.cid], sr.dc[c.cid]):
+        real = ~hole_blocks[c.cid]
+        if not np.array_equal(sr2.dc[c.cid][real], sr.dc[c.cid][real]):
             return None
     return new
 
@@ -323,9 +381,17 @@ class SmoothHoles(Recipe):
         mask = np.zeros(total, dtype=bool)
         for h in ctx.holes:
             mask[h.mcu_first : h.mcu_first + h.mcu_count] = True
-        new = smooth_holes(ctx.data, mask)
+        from ..reference import for_context
+
+        reference = for_context(ctx, ft)
+        new = smooth_holes(ctx.data, mask, reference)
         if new is None:
             ctx.note(self, "holes left flat (scan did not re-encode cleanly)")
             return
         n = int(mask.sum())
-        ctx.replace_data(new, self, f"smoothed {n} filled MCU(s) (soft surface instead of flat squares)", mcus=n)
+        if reference:
+            ctx.memo["reference_used"] = True
+            ctx.replace_data(new, self, f"{n} filled MCU(s) carry the reference picture's pixels", mcus=n,
+                             reference=str(ctx.options.get("reference")))
+        else:
+            ctx.replace_data(new, self, f"smoothed {n} filled MCU(s) (soft surface instead of flat squares)", mcus=n)
