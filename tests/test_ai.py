@@ -1,9 +1,9 @@
-import pytest
 """AI copy with stand-in networks (the real models are tested in CI, see test_ai_models)."""
 
 import io
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from fotomedik.ai.enhance import Engine, enhance, enhance_file, mcu_geometry, mcu_mask
