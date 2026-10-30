@@ -251,6 +251,39 @@ def junk_mask(f: dict, trusted: np.ndarray) -> tuple[np.ndarray, dict]:
     return junk, thr
 
 
+THUMB_FAR_K = 4.0  # a block this many times the thumbnail's usual error away from it is far off ...
+THUMB_FAR_FLOOR = (24.0, 16.0)  # ... and at least this far (gray levels, luma/chroma)
+THUMB_FAR_DENSE = 0.6  # share of far-off MCUs over one MCU row that makes a stretch junk
+
+
+def thumbnail_far(sr, thumb, ft: FrameTables, comps, per_row: int, rows: int, trusted: np.ndarray) -> np.ndarray:
+    """MCUs (rows, per_row) in long stretches that do not look like the photo at all.
+
+    Another photo's sectors in the stream - same camera, same tables - decode into
+    perfectly normal blocks: right spectrum, plausible colours, only of another scene.
+    The thumbnail is the one witness: a whole stretch of blocks far from it, row after
+    row, is not this photo. Single blocks at edges stray too (the thumbnail is small),
+    so only dense stretches count."""
+    far = np.zeros(rows * per_row, dtype=bool)
+    for ci, c in enumerate(comps[:3]):
+        if c.cid not in thumb.dc:
+            continue
+        arr, tdc = sr.dc[c.cid], thumb.dc[c.cid]
+        q = ft.quant[ft.frame.component(c.cid).tq].dc
+        lim = max(THUMB_FAR_K * float(thumb.sigma[c.cid]), THUMB_FAR_FLOOR[min(ci, 1)]) * 8.0 / q
+        br, bc = (arr.shape[0] // c.v) * c.v, per_row * c.h
+        d = np.abs(arr[:br, :bc] - tdc[:br, :bc])
+        d = np.where(np.isfinite(d), d, 0.0).reshape(br // c.v, c.v, per_row, c.h)
+        m = (np.median(d.transpose(0, 2, 1, 3).reshape(br // c.v, per_row, -1), axis=-1) > lim).ravel()
+        far[: len(m)] |= m
+    far = far.reshape(rows, per_row) & trusted
+    flat = far.ravel().astype(float)
+    dense = np.convolve(flat, np.ones(per_row) / per_row, mode="same") > THUMB_FAR_DENSE
+    # the whole stretch: dense windows and the far MCUs touching them
+    grown = np.convolve(dense.astype(float), np.ones(per_row), mode="same") > 0
+    return (grown & far.ravel()).reshape(rows, per_row) | dense.reshape(rows, per_row) & trusted
+
+
 @register
 class JunkBlocks(Recipe):
     name = "junk_blocks"
@@ -287,6 +320,12 @@ class JunkBlocks(Recipe):
             junk, thr = junk_mask(features(planes, comps, rows, per_row), trusted)
         except (ValueError, MemoryError):
             return
+        thumb = ctx.memo.get("thumb_base")
+        far = 0
+        if thumb is not None and not getattr(thumb, "twin", False):
+            alien = thumbnail_far(sr, thumb, ft, comps, per_row, rows, trusted) & ~junk
+            far = int(alien.sum())
+            junk = junk | alien
         n = int(junk.sum())
         thr_text = ", ".join(f"{k} {v:.2f}" for k, v in thr.items())
         if n == 0:
@@ -310,8 +349,9 @@ class JunkBlocks(Recipe):
         ctx.memo["hole_dc"] = self.hole_colours(ctx, ft, sr, comps, per_row, trusted.reshape(-1)[:total] & ~junk_flat)
         if ctx.recovered_fraction is not None:
             ctx.recovered_fraction = max(0.0, ctx.recovered_fraction - n / total)
-        ctx.note(self, f"{n} decoded MCU(s) in {len(ranges)} run(s) are junk (thresholds: {thr_text}): "
-                       "they become holes", mcus=n, runs=len(ranges), thresholds={k: round(v, 2) for k, v in thr.items()})
+        ctx.note(self, f"{n} decoded MCU(s) in {len(ranges)} run(s) are junk (thresholds: {thr_text})"
+                       + (f", {far} of them far from the thumbnail (another photo's data)" if far else "")
+                       + ": they become holes", mcus=n, runs=len(ranges), thresholds={k: round(v, 2) for k, v in thr.items()})
 
     @staticmethod
     def hole_colours(ctx: Context, ft: FrameTables, sr, comps, per_row: int, trusted: np.ndarray) -> dict | None:

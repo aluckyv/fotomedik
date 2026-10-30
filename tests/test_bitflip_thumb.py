@@ -51,3 +51,22 @@ def test_agreeing_mcus_drops_garbage_before_the_error():
     got = agreeing_mcus(tdc, arr, ok, 1, 1, per_row, q=8.0)
     assert got[: 11 * per_row].all()
     assert not got[13 * per_row : 24 * per_row].any()
+
+
+def test_thumbnail_far_finds_another_photos_stretch():
+    from types import SimpleNamespace
+
+    from fotomedik.recipes.r14_junk import thumbnail_far
+
+    rng = np.random.default_rng(1)
+    per_row, rows = 40, 30
+    tdc = rng.normal(0, 30, (rows, per_row))
+    dc = tdc + rng.normal(0, 1, tdc.shape)
+    dc[10:14] = rng.normal(0, 30, (4, per_row))  # four rows of another scene
+    dc[20, 5] += 200  # one stray block (an edge the small thumbnail blurs)
+    comps = [SimpleNamespace(cid=1, h=1, v=1)]
+    ft = SimpleNamespace(quant={0: SimpleNamespace(dc=8)}, frame=SimpleNamespace(component=lambda cid: SimpleNamespace(tq=0)))
+    thumb = SimpleNamespace(dc={1: tdc}, sigma={1: 1.0})
+    far = thumbnail_far(SimpleNamespace(dc={1: dc}), thumb, ft, comps, per_row, rows, np.ones((rows, per_row), bool))
+    assert far[10:14].mean() > 0.6
+    assert not far[:9].any() and not far[16:].any()
