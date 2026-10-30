@@ -32,11 +32,12 @@ FADE_ROWS = 6.0  # block rows over which a one-sided fill fades to the average c
 RESCUED_MIN_R = 0.6  # a repaired thumbnail must agree this well with what decoded
 THUMB_DIST = 3.0  # block rows a thumbnail-only reference counts as (for ordering by reliability)
 TWIN_MIN_R = 0.5  # luma agreement a neighbouring shot needs (people move between shots)
-TWIN_TILE_PX = 128  # the twin is checked against the decoded blocks per tile of this size
+TWIN_TILE_PX = 64  # the twin is checked against the decoded blocks per tile of this size
 TWIN_TILE_K = 2.0  # a tile whose error exceeds this many times the typical one is dropped
 TWIN_TILE_FLOOR = (6.0, 4.0)  # gray levels (luma, chroma) below which a tile always counts as agreeing
 TWIN_TILE_MIN = 12  # decoded blocks a tile needs to be judged
 TWIN_MAX_BAD = 0.5  # share of judged tiles that may disagree before the twin is not used at all
+TWIN_NEAR = 4.0  # block rows: holes this close to real rows follow those rows, not the twin
 TWIN_ECC = 0.6  # correlation the aligned block pictures must reach for the alignment to be used
 
 
@@ -206,6 +207,13 @@ def interpolation_sources(work_dc: dict, trusted: np.ndarray, comps, qdc: dict, 
         arr = work_dc[cid]
         known = block_mask(trusted, arr, h, v, per_row)
         f = build_field(arr, known, qdc[cid], thumb.dc[cid] if thumb else None, thumb.sigma[cid] if thumb else None)
+        if thumb is not None and thumb.twin:
+            # thin holes between real rows are told best by those rows; a neighbouring shot
+            # (another moment, another framing) only for what lies far from any
+            plain = build_field(arr, known, qdc[cid])
+            near = plain.dist <= TWIN_NEAR
+            f = Field(np.where(near, plain.val, f.val), np.where(near, plain.dist, f.dist),
+                      np.where(near, plain.sigma, f.sigma))
         lim = (1024 + qdc[cid]) // qdc[cid] - 1
         val = f.val
         guide = thumb.dc[cid] if thumb is not None else None
@@ -490,9 +498,10 @@ def _guard_twin(base: ThumbBase, ft, sr: D.ScanResult, clean_mcus: np.ndarray) -
                 bad[k] = True
     if judged.any() and bad[judged].mean() > TWIN_MAX_BAD:
         return None
-    if bad.any():
-        for cid, tid in ids.items():
-            base.dc[cid] = np.where(bad[tid], np.nan, base.dc[cid])
+    if not judged.any():
+        return None
+    for cid, tid in ids.items():
+        base.dc[cid] = np.where(bad[tid], np.nan, base.dc[cid])
     return base
 
 

@@ -451,6 +451,37 @@ def twin_loader(ctx, ft):
     return load
 
 
+def _thumbnail_real(data: bytes, shape) -> np.ndarray | None:
+    """Mask of the thumbnail's pixels that come from data decoding cleanly: a thumbnail
+    that sat in rotted sectors still opens, its lower part noise in bright colours."""
+    from .jpeg import decoder as D
+    from .jpeg import markers as M
+    from .jpeg.tables import FrameTables
+    from .recipes.r8_thumbnail import extract_thumbnail
+
+    blob = extract_thumbnail(data)
+    if blob is None:
+        return None
+    try:
+        res = M.parse_segments(blob)
+        ft = FrameTables.from_parse(res)
+        sr = D.decode_scan(blob, res, ft)
+    except Exception:
+        return None
+    _comps, per_row, _rows = D._scan_components(ft)
+    ok = sr.mcu_ok.copy()
+    for iv in sr.intervals:
+        if not iv.ok:  # the rows just before a decoding error are already suspect
+            end = iv.mcu_first + iv.mcu_count
+            ok[max(iv.mcu_first, end - 2 * per_row) : end] = False
+    mw, mh = 8 * ft.frame.hmax, 8 * ft.frame.vmax
+    real = np.zeros(shape, dtype=np.float32)
+    for m in np.flatnonzero(ok):
+        y, x = divmod(int(m), per_row)
+        real[y * mh : (y + 1) * mh, x * mw : (x + 1) * mw] = 1.0
+    return real
+
+
 def _twin_picture(ctx, path: Path, width: int, height: int):
     from .jpeg import decoder as D
     from .jpeg import markers as M
@@ -467,8 +498,10 @@ def _twin_picture(ctx, path: Path, width: int, height: int):
         return None
     got = thumbnail_image(data)
     if got is not None and got[1] is None and (got[0].shape[1] >= got[0].shape[0]) == (width >= height):
-        ctx.memo["twin_name"] = path.name
-        return got[0], np.ones(got[0].shape[:2], dtype=np.float32)
+        real = _thumbnail_real(data, got[0].shape[:2])
+        if real is not None and real.mean() >= 0.5:
+            ctx.memo["twin_name"] = path.name
+            return got[0], real
     opts = {k: v for k, v in ctx.options.items() if k not in ("twin", "reference", "reference_dir", "mark_holes")}
     try:
         tctx = Context(data=data, name=path.name, ref=ctx.ref, options=opts)
