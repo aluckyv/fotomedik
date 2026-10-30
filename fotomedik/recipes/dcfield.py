@@ -248,6 +248,15 @@ def thumbnail_image(data: bytes, thumb_refs: list | None = None, landscape: bool
     return _rescue_thumbnail(data, thumb_refs)
 
 
+class RescuedMask(np.ndarray):
+    """The mask of a repaired thumbnail whose colours cannot be trusted: nothing of its
+    scan decoded before the damage, so the colour level of every repaired part is a
+    guess (a whole picture can come out green). Its brightness still counts."""
+
+    def __new__(cls, mask):
+        return np.asarray(mask).view(cls)
+
+
 def _rescue_thumbnail(data: bytes, thumb_refs: list):
     from .r7_reference import CLOSE_SOS, _POPCOUNT
 
@@ -278,12 +287,16 @@ def _rescue_thumbnail(data: bytes, thumb_refs: list):
                 best = cand
     if best is None:
         return None
-    return best[1], best[2]
+    img, mask, colour_ok = best[1], best[2], best[3]
+    if not colour_ok:
+        mask = RescuedMask(mask)
+    return img, mask
 
 
 def _rescue_from(head: bytes, start: int, ref):
-    """(real share, YCbCr pixels, mask of real pixels) of the thumbnail whose scan starts
-    at `start`, decoded with the reference thumbnail header; None when too little is real."""
+    """(real share, YCbCr pixels, mask of real pixels, colours known) of the thumbnail whose
+    scan starts at `start`, decoded with the reference thumbnail header; None when too
+    little is real."""
     from ..jpeg import markers as M
     from .base import Context
     from .r9_holes import FillHoles
@@ -322,7 +335,10 @@ def _rescue_from(head: bytes, start: int, ref):
             for mi in range(hole.mcu_first, hole.mcu_first + hole.mcu_count):
                 r, c = divmod(mi, per_row)
                 mask[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw] = False
-        return frac, np.asarray(im.convert("YCbCr")), mask
+        # the repaired parts take their colour level from the rows decoded before the damage;
+        # with none of those (the scan rotted from its first row) every level is a guess
+        first_hole = min((h.mcu_first for h in ctx.holes), default=per_row)
+        return frac, np.asarray(im.convert("YCbCr")), mask, first_hole >= per_row
 
 
 def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,
@@ -402,6 +418,10 @@ def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarr
                 xa, ya = tdc[anyok], arr[anyok]
                 if np.std(xa) < 1e-6 or np.std(ya) < 1e-6 or np.corrcoef(xa, ya)[0, 1] < need_r:
                     return None
+            if ci > 0 and isinstance(mask, RescuedMask):
+                # a repaired thumbnail with no clean rows: its colours are guesses and nothing here
+                # can check them, so they say nothing; the picture's own rows give the colour
+                tdc = np.full_like(tdc, np.nan)
             out[c.cid] = tdc
             sig[c.cid] = UNCAL_SIGMA[min(ci, 1)]
             fit[c.cid] = (1.0, 0.0)
