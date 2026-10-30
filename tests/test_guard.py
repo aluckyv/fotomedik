@@ -92,3 +92,15 @@ def test_outside_only():
     out = outside_only(m, faces)
     assert not out[16:24, 16:32].any()
     assert out[48:56].all() and out[32:40].all()
+
+
+def test_stripe_the_thumbnail_shows_is_picture():
+    from fotomedik.ai.enhance import colour_stripes
+
+    ref = np.full((160, 160, 3), 120, np.uint8)
+    ref[80:88, 16:144] = (250, 40, 200)  # a thin pink line across
+    known = np.ones((160, 160), bool)
+    assert colour_stripes(ref, known)[84, 80]
+    assert not colour_stripes(ref, known, thumb=ref.copy())[84, 80]  # the thumbnail has it too
+    plain = np.full_like(ref, 120)
+    assert colour_stripes(ref, known, thumb=plain)[84, 80]  # the thumbnail does not

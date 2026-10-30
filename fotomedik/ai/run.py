@@ -351,7 +351,7 @@ class Enhancer:
         return True
 
     def _enhance(self, i: int, engine, steps, photos: _Photos) -> None:
-        from .enhance import Stopped, enhance_steps, photo_masks, save_jpeg
+        from .enhance import Stopped, enhance_steps, photo_masks, save_jpeg, thumbnail_picture
 
         rep = self.repaired[i]
         name = Path(rep.output_name).name
@@ -374,7 +374,7 @@ class Enhancer:
             holes, unknown = photo_masks(data, rep.holes, rep.unknown)
             burst = photos.burst_for(i, self.say) if "burst" in steps else None
             new, done = enhance_steps(arr, holes, unknown, engine, steps, burst, progress, self.quality, self.stop,
-                                      self.prompt)
+                                      self.prompt, thumbnail_picture(data, arr.shape))
         except Stopped:
             return
         except Exception as e:  # one photo must not stop the rest

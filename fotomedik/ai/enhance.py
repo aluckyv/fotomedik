@@ -441,7 +441,38 @@ JUNK_TOL = (50.0, 18.0)  # the same for decoded blocks next to a hole (the end o
 JUNK_NEAR = 16  # pixels from a hole within which decoded blocks are checked
 
 
-def colour_stripes(ref: np.ndarray, known: np.ndarray, tol=STRIPE_TOL) -> np.ndarray:
+THUMB_AGREE = (30.0, 14.0)  # block average this close (luma, chroma) to the thumbnail's: no stripe
+
+
+def thumbnail_picture(data: bytes, shape) -> np.ndarray | None:
+    """The photo's embedded thumbnail (RGB) brought to `shape` (h, w), or None. It only
+    says where colours are: a stripe the thumbnail shows too is part of the picture."""
+    try:
+        from ..recipes.dcfield import _crop_black_bars, thumbnail_image
+
+        got = thumbnail_image(data)
+        if got is None:
+            return None
+        img, _mask = _crop_black_bars(got[0], None)
+        h, w = shape[:2]
+        if abs((img.shape[1] / img.shape[0]) / (w / h) - 1.0) > 0.03:
+            return None
+        rgb = Image.fromarray(np.ascontiguousarray(img), "YCbCr").convert("RGB")
+        return np.asarray(rgb.resize((w, h), Image.BICUBIC))
+    except Exception:  # noqa: BLE001 - without it the stripe check just trusts the colours less
+        return None
+
+
+def _block_ycc(a: np.ndarray, bh: int, bw: int) -> np.ndarray:
+    h, w = a.shape[:2]
+    pad = ((0, bh * 8 - h), (0, bw * 8 - w), (0, 0))
+    r = np.pad(a.astype(np.float32), pad, mode="edge").reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    return np.stack([0.299 * r[..., 0] + 0.587 * r[..., 1] + 0.114 * r[..., 2],
+                     -0.169 * r[..., 0] - 0.331 * r[..., 1] + 0.5 * r[..., 2],
+                     0.5 * r[..., 0] - 0.419 * r[..., 1] - 0.081 * r[..., 2]], axis=-1)
+
+
+def colour_stripes(ref: np.ndarray, known: np.ndarray, tol=STRIPE_TOL, thumb: np.ndarray | None = None) -> np.ndarray:
     """Blocks (8x8 grid) of `known` whose average colour in `ref` is a thin horizontal
     stripe at odds with the rows above and below it - a pink, green or violet line left by
     rotted data in a hole's colours. The thumbnail cannot hold detail that thin, so such a
@@ -451,10 +482,7 @@ def colour_stripes(ref: np.ndarray, known: np.ndarray, tol=STRIPE_TOL) -> np.nda
     h, w = known.shape
     bh, bw = -(-h // 8), -(-w // 8)
     pad = ((0, bh * 8 - h), (0, bw * 8 - w), (0, 0))
-    r = np.pad(ref.astype(np.float32), pad, mode="edge").reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
-    ycc = np.stack([0.299 * r[..., 0] + 0.587 * r[..., 1] + 0.114 * r[..., 2],
-                    -0.169 * r[..., 0] - 0.331 * r[..., 1] + 0.5 * r[..., 2],
-                    0.5 * r[..., 0] - 0.419 * r[..., 1] - 0.081 * r[..., 2]], axis=-1)
+    ycc = _block_ycc(ref, bh, bw)
     ty, tx = STRIPE_WIN
     off = np.zeros((bh, bw), dtype=bool)
     for c in range(3):
@@ -463,6 +491,10 @@ def colour_stripes(ref: np.ndarray, known: np.ndarray, tol=STRIPE_TOL) -> np.nda
         off |= np.abs(ycc[..., c] - med) > tol[min(c, 1)]
     k = np.pad(known, pad[:2], mode="edge").reshape(bh, 8, bw, 8).any(axis=(1, 3))
     off &= k
+    if thumb is not None:  # the thumbnail shows the same: a sunflower, a striped shirt
+        t = _block_ycc(thumb, bh, bw)
+        d = np.abs(ycc - t)
+        off &= (d[..., 0] > THUMB_AGREE[0]) | (d[..., 1:].max(axis=-1) > THUMB_AGREE[1])
     # only runs of STRIPE_RUN or more blocks side by side
     keep = np.zeros_like(off)
     for i in range(STRIPE_RUN):
@@ -533,13 +565,14 @@ def _took(t0: float) -> str:
 
 def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
                   burst=None, progress=None, quality: str | None = None, stop=None,
-                  prompt: str | None = None) -> tuple[np.ndarray, list[str]]:
+                  prompt: str | None = None, thumb: np.ndarray | None = None) -> tuple[np.ndarray, list[str]]:
     """The enhanced copy, step by step. Returns (rgb, what was done, with the time it took).
 
     burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots.
     progress(done, total, what) reports the tiles or windows of the slow steps.
     quality: diffusion preset (see diffusion.PRESETS); prompt: what the scene shows, for
-    the diffusion (None: a generic prompt). Raises Stopped when `stop` is set."""
+    the diffusion (None: a generic prompt); thumb: the photo's thumbnail at full size (see
+    thumbnail_picture) - stripes it shows too are picture. Raises Stopped when `stop` is set."""
     steps = set(steps)
     done: list[str] = []
     real = arr.copy()
@@ -585,9 +618,9 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             # faces: eyes, brows and mouths are not rotted stripes
             faces = face_mask(before, engine.face_det) & ~stamp
             known = holes & ~unknown
-            stripes = outside_only(colour_stripes(before, known), faces)
+            stripes = outside_only(colour_stripes(before, known, thumb=thumb), faces)
             # decoded stripes of wrong colour at the edge of a hole: rotted data the repair kept
-            junk = colour_stripes(before, _grow(holes, JUNK_NEAR) & ~holes, JUNK_TOL)
+            junk = colour_stripes(before, _grow(holes, JUNK_NEAR) & ~holes, JUNK_TOL, thumb)
             if junk.any():  # and the rows right above and below, where a stripe's edge bleeds
                 edge = junk.copy()
                 edge[:-8] |= junk[8:]

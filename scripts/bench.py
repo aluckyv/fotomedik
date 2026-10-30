@@ -15,6 +15,8 @@ folder) and scores the result against the good photo:
   good     share of the damaged area that came out within 24 gray levels of the truth
   stripes  share of the damaged area's 8x8 blocks whose colour is off by more than 40
            (the coloured dashes and bands one notices first; lower is better)
+  ssim     structural similarity in the damaged area: edges and detail in the right
+           places (a blur scores low, invented wrong detail too)
   faces    the same `good` inside faces the detector finds in the good photo
 
 Nothing of the photos goes into the repository: the bench folder lives outside it.
@@ -194,17 +196,36 @@ def _block_err(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return d.reshape(h8 // 8, 8, w8 // 8, 8, 3).mean(axis=(1, 3)).max(axis=-1)
 
 
+def ssim_map(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Structural similarity of the luma (Wang et al. 2004, Gaussian window 1.5): detail and
+    edges where they belong count, a plain blur does not pass for them."""
+    import cv2
+
+    def y(x):
+        x = x.astype(np.float64)
+        return 0.299 * x[..., 0] + 0.587 * x[..., 1] + 0.114 * x[..., 2]
+
+    a, b = y(a), y(b)
+    g = lambda x: cv2.GaussianBlur(x, (0, 0), 1.5)  # noqa: E731
+    ma, mb = g(a), g(b)
+    va, vb, cov = g(a * a) - ma * ma, g(b * b) - mb * mb, g(a * b) - ma * mb
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    return ((2 * ma * mb + c1) * (2 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
+
+
 def score(truth: np.ndarray, got: np.ndarray | None, area: np.ndarray, faces: np.ndarray) -> dict:
     if got is None or got.shape != truth.shape:
-        return {"psnr": 0.0, "good": 0.0, "stripes": 1.0, "faces": 0.0 if faces.any() else None}
+        return {"psnr": 0.0, "good": 0.0, "stripes": 1.0, "ssim": 0.0, "faces": 0.0 if faces.any() else None}
     err = np.abs(got.astype(np.int16) - truth.astype(np.int16)).max(axis=-1)
     mse = float(((got.astype(np.float32) - truth) ** 2).mean())
     ok = err <= TOL
     blocks = _block_err(got, truth) > STRIPE
     h8, w8 = truth.shape[0] // 8 * 8, truth.shape[1] // 8 * 8
     area_b = area[:h8, :w8].reshape(h8 // 8, 8, w8 // 8, 8).any(axis=(1, 3))
+    ss = ssim_map(truth, got)
     return {
         "psnr": round(10 * np.log10(255.0**2 / max(mse, 1e-6)), 2),
+        "ssim": round(float(ss[area].mean()), 4) if area.any() else 1.0,
         "good": round(float(ok[area].mean()), 4) if area.any() else 1.0,
         "stripes": round(float(blocks[area_b].mean()), 4) if area_b.any() else 0.0,
         "faces": round(float(ok[area & faces].mean()), 4) if (area & faces).any() else None,
@@ -240,6 +261,9 @@ def _repair_one(args) -> dict:
 def run(args) -> None:
     bench = Path(args.bench)
     manifest = json.loads((bench / "manifest.json").read_text(encoding="utf-8"))
+    if args.cases:
+        want = {c.strip() for c in args.cases.split(",")}
+        manifest = [m for m in manifest if m["case"] in want or Path(m["case"]).stem in want]
     if args.only:
         manifest = manifest[: args.only]
     models = Path(args.ai) if args.ai else None
@@ -271,11 +295,12 @@ def run(args) -> None:
         row = {"case": r["case"], "damage": r["damage"], "area": round(float(area.mean()), 4), "secs": r["secs"],
                "error": r["error"], "naive": score(truth, naive, area, faces), "repair": score(truth, got, area, faces)}
         if engine is not None and got is not None and got.shape == truth.shape and r["holes"]:
-            from fotomedik.ai.enhance import enhance_steps, photo_masks
+            from fotomedik.ai.enhance import enhance_steps, photo_masks, thumbnail_picture
 
             holes, unknown = photo_masks(r["repaired"], r["holes"], r["unknown"])
             t1 = time.perf_counter()
-            healed, _done = enhance_steps(got, holes, unknown, engine, ["ai"])
+            healed, _done = enhance_steps(got, holes, unknown, engine, ["ai"],
+                                          thumb=thumbnail_picture(r["repaired"], got.shape))
             row["ai"] = score(truth, healed, area, faces)
             row["ai_secs"] = round(time.perf_counter() - t1, 1)
             if args.keep:
@@ -304,18 +329,19 @@ def summary(rows: list[dict]) -> dict:
         out[stage] = {"n": len(rs), "psnr": round(float(np.mean([r["psnr"] for r in rs])), 2),
                       "good": round(float(np.mean([r["good"] for r in rs])), 4),
                       "stripes": round(float(np.mean([r["stripes"] for r in rs])), 4),
+                      "ssim": round(float(np.mean([r.get("ssim", 0.0) for r in rs])), 4),
                       "faces": round(float(np.mean(fs)), 4) if fs else None}
     out["errors"] = sum(1 for r in rows if r.get("error"))
     return out
 
 
 def print_summary(s: dict) -> None:
-    print(f"\n{'':8}{'psnr':>8}{'good':>8}{'stripes':>9}{'faces':>8}")
+    print(f"\n{'':8}{'psnr':>8}{'good':>8}{'stripes':>9}{'ssim':>8}{'faces':>8}")
     for stage in ("naive", "repair", "ai"):
         if stage in s:
             v = s[stage]
             f = "-" if v["faces"] is None else f"{v['faces']:.3f}"
-            print(f"{stage:8}{v['psnr']:8.2f}{v['good']:8.3f}{v['stripes']:9.3f}{f:>8}")
+            print(f"{stage:8}{v['psnr']:8.2f}{v['good']:8.3f}{v['stripes']:9.3f}{v.get('ssim', 0):8.3f}{f:>8}")
     print(f"errors: {s['errors']}")
 
 
@@ -347,6 +373,7 @@ def main() -> None:
     r.add_argument("--ai", help="folder with lama_fp32.onnx (and the YuNet face model)")
     r.add_argument("--faces", help="YuNet face model, to score faces without --ai")
     r.add_argument("--only", type=int, default=0)
+    r.add_argument("--cases", help="comma separated case names (default: all)")
     r.add_argument("--jobs", type=int, default=0)
     r.add_argument("--keep", help="folder to save the repaired and healed pictures in")
     c = sub.add_parser("compare")
