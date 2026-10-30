@@ -155,6 +155,15 @@ class Engine:
             except Exception:
                 pass
         avail = ort.get_available_providers()
+        if "CUDAExecutionProvider" in avail:  # the CUDA build: its NVIDIA libraries first
+            from . import cuda
+
+            def cuda_progress(done, total, pkg):
+                if progress:
+                    progress(done, total, type("M", (), {"name": pkg})())
+
+            if not cuda.prepare(say, cuda_progress, stop):
+                avail = [p for p in avail if p not in ("CUDAExecutionProvider", "TensorrtExecutionProvider")]
         gpu = [p for p in GPU_PROVIDERS if p in avail]
         providers = gpu + ["CPUExecutionProvider"]
 

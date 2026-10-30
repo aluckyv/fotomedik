@@ -2,3 +2,4 @@
 
 BUILD = 0
 COMMIT = ""
+FLAVOR = ""  # "cuda": the build for NVIDIA graphics cards (FotoMedik-CUDA.exe)

@@ -1,7 +1,9 @@
 """Self-update of the packaged app from the GitHub release "app".
 
-CI publishes FotoMedik.exe and version.json ({"build": N, "commit": ...}) on every
-push to main. The app compares N with its own build stamp; updating downloads the
+CI publishes FotoMedik.exe, FotoMedik-CUDA.exe (for NVIDIA graphics cards) and
+version.json ({"build": N, "commit": ...}) on every push to main. On a computer with
+an NVIDIA card the update brings the CUDA build (even at the same build number, once),
+elsewhere the plain one. The app compares N with its own build stamp; updating downloads the
 new exe next to the running one, swaps the files (Windows allows renaming a running
 exe, not overwriting it) and starts the new version.
 """
@@ -16,7 +18,11 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import _build
 from .._build import BUILD, COMMIT
+
+EXE = {"": "FotoMedik.exe", "cuda": "FotoMedik-CUDA.exe"}
+VERSION = {"": "version.json", "cuda": "version-cuda.json"}  # each exe has its own build stamp
 
 REPO = "aluckyv/fotomedik"
 TAG = "app"
@@ -50,17 +56,32 @@ def _get(url: str, accept: str = "application/vnd.github+json") -> bytes:
         return r.read()
 
 
+def wanted_flavor() -> str:
+    """"cuda" on a computer with an NVIDIA graphics card, else "" (DirectML or processor)."""
+    from ..ai.cuda import nvidia_present
+
+    try:
+        return "cuda" if nvidia_present() else ""
+    except Exception:
+        return ""
+
+
 def check() -> Update | None:
-    """The newer build on GitHub, or None (up to date, offline, or not reachable)."""
+    """The newer build on GitHub, or None (up to date, offline, or not reachable).
+    The build made for this computer's graphics card counts as newer than another kind."""
     rel = json.loads(_get(API))
     assets = {a["name"]: a for a in rel.get("assets", [])}
-    if "version.json" not in assets or "FotoMedik.exe" not in assets:
+    flavor = wanted_flavor()
+    name, vname = EXE.get(flavor, EXE[""]), VERSION.get(flavor, VERSION[""])
+    if name not in assets or vname not in assets:
+        flavor, name, vname = "", EXE[""], VERSION[""]
+    if vname not in assets or name not in assets:
         return None
-    info = json.loads(_get(assets["version.json"]["url"], "application/octet-stream"))
+    info = json.loads(_get(assets[vname]["url"], "application/octet-stream"))
     build = int(info.get("build", 0))
-    if build <= BUILD:
+    if build < BUILD or (build == BUILD and flavor == getattr(_build, "FLAVOR", "")):
         return None
-    exe = assets["FotoMedik.exe"]
+    exe = assets[name]
     return Update(build, str(info.get("commit", "")), exe["url"], int(exe.get("size", 0)))
 
 

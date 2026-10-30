@@ -161,3 +161,55 @@ jobs:
             shot_*.png
             shot_*.txt
             demo_out_ai/*_enhanced.jpg
+
+  app-windows-cuda:
+    # the same app for NVIDIA graphics cards: ONNX Runtime's CUDA build; the CUDA
+    # libraries are found on the user's computer or downloaded there (fotomedik.ai.cuda)
+    runs-on: windows-latest
+    needs: app-windows  # its release exists; and no CUDA exe of a build whose tests failed
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . pyside6 pyinstaller "onnxruntime-gpu==1.22.0" onnx packaging opencv-python-headless
+      - name: the CUDA build of ONNX Runtime is in place
+        run: python -c "import onnxruntime as o; print(o.__version__, o.get_available_providers()); assert 'CUDAExecutionProvider' in o.get_available_providers()"
+      - name: build _fastdec.dll
+        run: python build_fastdec.py
+      - name: demo photos
+        run: python scripts/make_demo_photos.py demo
+      - name: stamp the build number
+        shell: pwsh
+        run: |
+          "BUILD = ${{ github.run_number }}`nCOMMIT = `"${{ github.sha }}`"`nFLAVOR = `"cuda`"`n" | Set-Content -Encoding utf8 fotomedik/_build.py
+          "{`"build`": ${{ github.run_number }}, `"commit`": `"${{ github.sha }}`"}" | Set-Content -Encoding utf8 version-cuda.json
+      - name: package FotoMedik-CUDA.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name FotoMedik-CUDA
+          --add-binary "fotomedik/jpeg/_fastdec.dll;fotomedik/jpeg"
+          --hidden-import onnxruntime --collect-binaries onnxruntime
+          --hidden-import onnxruntime.transformers.float16 --hidden-import onnx
+          --exclude-module tkinter --exclude-module pytest
+          fotomedik_app.py
+      - name: smoke test of the packaged app (no graphics card here, the processor takes over)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process -FilePath dist\FotoMedik-CUDA.exe -ArgumentList "--smoke","demo","demo_out_exe","shot_cuda.png" -PassThru -Wait
+          Write-Host "exit code $($p.ExitCode)"
+          if (Test-Path shot_cuda.txt) { Get-Content shot_cuda.txt | ForEach-Object { Write-Host "::notice title=smoke (CUDA exe)::$_" } }
+          if ($p.ExitCode -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FotoMedik-CUDA-windows
+          path: dist/FotoMedik-CUDA.exe
+      - name: publish in the "app" release
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload app dist/FotoMedik-CUDA.exe version-cuda.json --clobber
