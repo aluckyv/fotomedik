@@ -20,6 +20,7 @@ STRINGS = {
         "fallback_thumb": "Glavna slika nije spasiva — sačuvan je ugrađeni thumbnail.",
         "thumb_guided": "Rupe su popunjene prema ugrađenoj sličici (thumbnail): tačne boje i grubi oblici, bez sitnih detalja.",
         "reference_guided": "Popravka je vođena referentnom slikom {name}: komadi složeni i rupe popunjene po njoj; dekodirani delovi su originalni.",
+        "twin_guided": "Slika nema upotrebljivu sličicu: boje rupa su uzete sa sličnog snimka {name} (samo boja i svetlina, tamo gde se scena slaže).",
         "output": "Izlazni fajl",
         "no_output": "nije napravljen (nema šta da se sačuva)",
         "kind": {
@@ -67,6 +68,7 @@ STRINGS = {
         "fallback_thumb": "Main image unrecoverable — the embedded thumbnail was saved instead.",
         "thumb_guided": "Holes were filled following the embedded thumbnail: right colours and rough shapes, no fine detail.",
         "reference_guided": "Guided by the reference picture {name}: pieces placed and holes filled after it; decoded parts are the original data.",
+        "twin_guided": "No usable thumbnail: the colours of the holes come from the similar shot {name} (colour and brightness only, where the scene agrees).",
         "output": "Output file",
         "no_output": "none (nothing to save)",
         "kind": {
@@ -124,6 +126,7 @@ class FileReport:
     ai_output: str | None = None  # the enhanced copy, when one was made
     enhanced: list = field(default_factory=list)  # what went into it
     reference: str | None = None  # the reference picture the repair was guided by, when one was
+    twin: str | None = None  # the neighbouring shot the holes took their colours from, when one did
 
     @classmethod
     def from_context(cls, ctx: Context, findings_before: list[dict] | None = None, width=None, height=None) -> "FileReport":
@@ -159,6 +162,7 @@ class FileReport:
             "enhanced_output": self.ai_output,
             "enhanced": self.enhanced,
             "reference": self.reference,
+            "twin": self.twin,
             "log": self.log,
         }
 
@@ -193,6 +197,8 @@ class FileReport:
                 lines.append(f"  … +{len(self.holes) - 20}")
         if self.reference:
             lines.append(s["reference_guided"].format(name=self.reference))
+        elif self.twin:
+            lines.append(s["twin_guided"].format(name=self.twin))
         elif any(e.get("recipe") == "fill_holes" and (e.get("extra") or {}).get("thumbnail_guided") for e in self.log):
             lines.append(s["thumb_guided"])
         if self.fallback == "thumbnail":

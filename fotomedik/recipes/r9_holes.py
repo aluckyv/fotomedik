@@ -28,9 +28,17 @@ from ..jpeg.encoder import BitWriter, encode_flat_mcus, gray_dc
 from ..jpeg.tables import FrameTables, TableError
 from ..jpeg.writer import assemble, rst_marker
 from .base import Context, Hole, Recipe
-from .dcfield import block_mask, build_field, interpolation_sources, pull_push, thumbnail_base, vertical_reference  # noqa: F401
+from .dcfield import block_mask, build_field, interpolation_sources, pull_push, thumbnail_base, twin_base, vertical_reference  # noqa: F401
 from ..reference import for_context as reference_for
+from ..reference import twin_loader
 from .registry import register
+
+
+class _Placed:
+    """The block DCs as they stand after the pieces were placed, shaped like a scan result."""
+
+    def __init__(self, dc: dict, ok: np.ndarray):
+        self.dc, self.mcu_ok = dc, ok
 
 BACKOFF_MCUS = 3  # MCUs dropped before a detected error (silent desync margin)
 JUNK_LEVEL = 6.0  # median anomaly (in units of the reference's expected error) of a junk prefix
@@ -473,6 +481,15 @@ class FillHoles(Recipe):
             trusted[covered:] = False
 
         # ---------------------------------------------------------------- interpolation sources
+        if (thumb is None or thumb.rescued) and ctx.options.get("twin") and not ctx.options.get("reference"):
+            # no thumbnail to go by: a neighbouring shot of the scene colours the holes, checked
+            # against everything real that is now in place (placed pieces included)
+            t = twin_loader(ctx, ft)()
+            if t is not None:
+                tb = twin_base(t[0], t[1], ft, _Placed(work_dc, trusted), trusted)
+                if tb is not None and (thumb is None or tb.r > thumb.r):
+                    thumb = tb
+                    ctx.memo["thumb_base"] = thumb
         interp = interpolation_sources(work_dc, trusted, comps, qdc, thumb, mcus_per_row)
         ctx.memo["clean_mcus"] = clean  # for judging decoded blocks later (R14)
 
@@ -622,7 +639,10 @@ class FillHoles(Recipe):
         msg = f"filled {len(holes)} hole(s) covering {filled} of {total} MCUs; {kept} MCUs kept"
         if spliced:
             msg += f" (incl. {spliced} recovered after damaged stretches)"
-        if thumb is not None and holes:
+        if thumb is not None and holes and thumb.twin:
+            ctx.memo["twin_used"] = True
+            msg += f"; hole colours follow the similar shot {ctx.memo.get('twin_name', '')}"
+        elif thumb is not None and holes:
             msg += "; holes follow the embedded thumbnail"
         ctx.replace_data(new, self, msg, holes=[h.to_dict() for h in holes], kept_mcus=kept,
                          total_mcus=total, spliced_mcus=spliced, thumbnail_guided=bool(thumb is not None and holes),

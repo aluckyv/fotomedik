@@ -144,7 +144,10 @@ def plan(files: list[tuple[Path, Path]], options: dict) -> list[tuple[Path, Path
     options["reference"] (a picture of the same scene, see fotomedik.reference): every
     file is repaired guided by it, into <stem>_ref<suffix> - meant for one photo.
     options["reference_dir"] (a folder of such pictures): each photo it holds a picture
-    for gets a guided repair into <stem>_ref<suffix> besides the plain one."""
+    for gets a guided repair into <stem>_ref<suffix> besides the plain one.
+    options["twins"]: a photo with a neighbouring shot of the same scene (taken within
+    seconds, see fotomedik.twins) gets it as options["twin"] - the colours of its holes
+    follow that shot when its own thumbnail is of no use."""
     from .reference import REFERENCE_SUFFIX, pair
 
     def guided(rel: Path, ref: Path) -> tuple[Path, dict]:
@@ -158,6 +161,11 @@ def plan(files: list[tuple[Path, Path]], options: dict) -> list[tuple[Path, Path
     plain = dict(options)
     plain.pop("reference_dir", None)
     items = [(p, rel, plain) for p, rel in files]
+    if options.get("twins"):
+        from .twins import find_twins
+
+        twins = find_twins([p for p, _rel in files])
+        items = [(p, rel, dict(plain, twin=str(twins[p])) if p in twins else plain) for p, rel in files]
     if options.get("reference_dir"):
         refs = pair([p for p, _rel in files], Path(options["reference_dir"]))
         items += [(p, *guided(rel, refs[p])) for p, rel in files if p in refs]

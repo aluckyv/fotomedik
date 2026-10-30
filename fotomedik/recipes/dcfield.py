@@ -31,6 +31,13 @@ RESID_DECAY = 4.0  # block rows over which a clean row's correction to the thumb
 FADE_ROWS = 6.0  # block rows over which a one-sided fill fades to the average colour
 RESCUED_MIN_R = 0.6  # a repaired thumbnail must agree this well with what decoded
 THUMB_DIST = 3.0  # block rows a thumbnail-only reference counts as (for ordering by reliability)
+TWIN_MIN_R = 0.5  # luma agreement a neighbouring shot needs (people move between shots)
+TWIN_TILE_PX = 128  # the twin is checked against the decoded blocks per tile of this size
+TWIN_TILE_K = 2.0  # a tile whose error exceeds this many times the typical one is dropped
+TWIN_TILE_FLOOR = (6.0, 4.0)  # gray levels (luma, chroma) below which a tile always counts as agreeing
+TWIN_TILE_MIN = 12  # decoded blocks a tile needs to be judged
+TWIN_MAX_BAD = 0.5  # share of judged tiles that may disagree before the twin is not used at all
+TWIN_ECC = 0.6  # correlation the aligned block pictures must reach for the alignment to be used
 
 
 def block_mask(mcu_ok: np.ndarray, arr: np.ndarray, h: int, v: int, per_row: int) -> np.ndarray:
@@ -146,6 +153,7 @@ class ThumbBase:
     r: float  # luma correlation with the clean blocks
     fit: dict  # cid -> (gain, offset in gray levels) of the calibration
     rescued: bool = False  # the thumbnail was damaged too and has been repaired first
+    twin: bool = False  # taken from a neighbouring shot of the same scene, not the thumbnail
 
 
 def build_field(arr: np.ndarray, okm: np.ndarray, q: int, base: np.ndarray | None = None,
@@ -342,7 +350,8 @@ def _rescue_from(head: bytes, start: int, ref):
 
 
 def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,
-                   thumb_refs: list | None = None, reference: list | None = None) -> ThumbBase | None:
+                   thumb_refs: list | None = None, reference: list | None = None,
+                   twin=None) -> ThumbBase | None:
     """The embedded thumbnail mapped onto each component's block grid as DC values,
     calibrated against the clean blocks (dc = a * thumb + b). None when there is no
     thumbnail, its shape does not match the frame, or it does not agree with the clean
@@ -350,24 +359,149 @@ def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,
 
     reference: full-size pictures of the same scene (YCbCr arrays, see fotomedik.reference)
     that stand in for the thumbnail; of several (the two turns of a copy lying the other
-    way round) the one agreeing best with the clean blocks is used."""
+    way round) the one agreeing best with the clean blocks is used.
+
+    twin: a callable giving (YCbCr pixels, mask of real pixels) of a neighbouring shot of
+    the same scene, asked for only when the photo's own thumbnail is of no use. It says
+    what colour and brightness the holes have, nothing finer: it is aligned to the photo,
+    and every part of it that disagrees with what decoded is left out (people move)."""
     if reference:
         bases = [_base_from(img, None, ft, sr, clean_mcus, GAIN_WIDE) for img in reference]
         bases = [b for b in bases if b is not None]
         return max(bases, key=lambda b: b.r) if bases else None
     got = thumbnail_image(data, thumb_refs, landscape=ft.frame.width >= ft.frame.height)
-    if got is None:
+    if got is not None:
+        img, mask = got
+        img, mask = _crop_black_bars(img, mask)
+        base = _base_from(img, mask, ft, sr, clean_mcus, GAIN_THUMB)
+        if base is not None and not base.rescued:
+            return base
+    else:
+        base = None
+    if twin is not None:
+        t = twin()
+        if t is not None:
+            tb = twin_base(t[0], t[1], ft, sr, clean_mcus)
+            if tb is not None and (base is None or tb.r > base.r):
+                return tb
+    return base
+
+
+def twin_base(img: np.ndarray, real: np.ndarray, ft, sr: D.ScanResult, clean_mcus: np.ndarray) -> ThumbBase | None:
+    """A neighbouring shot (YCbCr pixels of the frame's aspect, mask of its real pixels)
+    as the DC reference of this photo: aligned to the decoded blocks, calibrated like a
+    thumbnail, and cut back to the tiles where it agrees with them. Without enough clean
+    blocks (no restart markers: nothing decodes cleanly end to end) everything that
+    decoded is what it is checked against."""
+    if int(clean_mcus.sum()) < THUMB_MIN_BLOCKS:
+        clean_mcus = sr.mcu_ok
+    img, real = _align_twin(img, real, ft, sr, clean_mcus)
+    base = _base_from(img, real, ft, sr, clean_mcus, GAIN_WIDE, min_r=TWIN_MIN_R)
+    if base is None:
         return None
-    img, mask = got
-    img, mask = _crop_black_bars(img, mask)
-    return _base_from(img, mask, ft, sr, clean_mcus, GAIN_THUMB)
+    base = _guard_twin(base, ft, sr, clean_mcus)
+    if base is not None:
+        base.twin = True
+        base.rescued = False
+    return base
+
+
+def _luma_blocks(ft, sr: D.ScanResult, clean_mcus: np.ndarray):
+    """(luma DC in gray levels, mask of clean blocks) of the frame's real area."""
+    comps, per_row, _rows = D._scan_components(ft)
+    c = comps[0]
+    arr = sr.dc[c.cid]
+    q = ft.quant[ft.frame.component(c.cid).tq].dc
+    okm = block_mask(clean_mcus, arr, c.h, c.v, per_row) & np.isfinite(arr)
+    frame = ft.frame
+    comp_w = -(-frame.width * c.h // frame.hmax)
+    comp_h = -(-frame.height * c.v // frame.vmax)
+    bw, bh = -(-comp_w // 8), -(-comp_h // 8)
+    return (np.nan_to_num(arr) * q / 8.0 + 128.0)[:bh, :bw], okm[:bh, :bw]
+
+
+def _align_twin(img: np.ndarray, real: np.ndarray, ft, sr: D.ScanResult, clean_mcus: np.ndarray):
+    """The twin warped onto this photo's frame (a homography found on the luma block
+    pictures, only where this photo decoded), or as it is when no alignment holds."""
+    try:
+        import cv2
+    except ImportError:
+        return img, real
+    luma, okm = _luma_blocks(ft, sr, clean_mcus)
+    if okm.sum() < THUMB_MIN_BLOCKS:
+        return img, real
+    bh, bw = luma.shape
+    th, tw = img.shape[:2]
+    small = np.asarray(Image.fromarray(np.ascontiguousarray(img[:, :, 0])).resize((bw, bh), Image.BILINEAR), np.float32)
+    gt = cv2.GaussianBlur(luma.astype(np.float32), (0, 0), 1.5)
+    gd = cv2.GaussianBlur(small, (0, 0), 1.5)
+    warp = np.eye(3, dtype=np.float32)
+    try:
+        rho, warp = cv2.findTransformECC(gd, gt, warp, cv2.MOTION_HOMOGRAPHY,
+                                         (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5),
+                                         okm.astype(np.uint8), 5)
+    except cv2.error:
+        return img, real
+    if rho < TWIN_ECC:
+        return img, real
+    # the warp maps block coordinates of the twin's small copy to those of the photo (the
+    # masked input): carry it to the twin's own pixels
+    s_b = np.diag([bw / tw, bh / th, 1.0])
+    h = np.linalg.inv(s_b) @ warp.astype(np.float64) @ s_b  # twin pixels -> photo (in twin pixel units)
+    flags = cv2.INTER_LINEAR
+    out = cv2.warpPerspective(np.ascontiguousarray(img), h, (tw, th), flags=flags, borderMode=cv2.BORDER_REPLICATE)
+    m = real.astype(np.float32) if real is not None else np.ones((th, tw), np.float32)
+    mw = cv2.warpPerspective(m, h, (tw, th), flags=flags, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return out, mw
+
+
+def _guard_twin(base: ThumbBase, ft, sr: D.ScanResult, clean_mcus: np.ndarray) -> ThumbBase | None:
+    """Leave out every tile where the twin disagrees with the decoded blocks (in any
+    component): there the scene changed between the shots. None when most of it does."""
+    frame = ft.frame
+    comps, per_row, _rows = D._scan_components(ft)
+    ty, tx = -(-frame.height // TWIN_TILE_PX), -(-frame.width // TWIN_TILE_PX)
+    bad = np.zeros(ty * tx, dtype=bool)
+    judged = np.zeros(ty * tx, dtype=bool)
+    ids = {}
+    for ci, c in enumerate(comps):
+        arr, dc = sr.dc[c.cid], base.dc[c.cid]
+        rows, cols = arr.shape
+        py = 8.0 * frame.vmax / c.v  # pixels per block
+        px = 8.0 * frame.hmax / c.h
+        ri = np.clip((np.arange(rows) * py // TWIN_TILE_PX).astype(int), 0, ty - 1)
+        cj = np.clip((np.arange(cols) * px // TWIN_TILE_PX).astype(int), 0, tx - 1)
+        tid = ri[:, None] * tx + cj[None, :]
+        ids[c.cid] = tid
+        okm = block_mask(clean_mcus, arr, c.h, c.v, per_row) & np.isfinite(dc) & np.isfinite(arr)
+        if not okm.any():
+            continue
+        q = ft.quant[frame.component(c.cid).tq].dc
+        res = np.abs(arr - dc)[okm] * q / 8.0
+        t = tid[okm]
+        lim = max(TWIN_TILE_K * float(np.median(res)), TWIN_TILE_FLOOR[min(ci, 1)])
+        n = np.bincount(t, minlength=ty * tx)
+        order = np.argsort(t, kind="stable")
+        starts = np.concatenate(([0], np.cumsum(n)[:-1]))
+        rs = res[order]
+        for k in np.flatnonzero(n >= TWIN_TILE_MIN):
+            judged[k] = True
+            if np.median(rs[starts[k] : starts[k] + n[k]]) > lim:
+                bad[k] = True
+    if judged.any() and bad[judged].mean() > TWIN_MAX_BAD:
+        return None
+    if bad.any():
+        for cid, tid in ids.items():
+            base.dc[cid] = np.where(bad[tid], np.nan, base.dc[cid])
+    return base
 
 
 GAIN_THUMB = (0.7, 1.4)  # calibration gain allowed for a camera thumbnail
 GAIN_WIDE = (0.5, 2.0)  # for a reference picture (edited copies are brightened or darkened)
 
 
-def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarray, gain_range) -> ThumbBase | None:
+def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarray, gain_range,
+               min_r: float = THUMB_MIN_R) -> ThumbBase | None:
     frame = ft.frame
     th, tw = img.shape[:2]
     if abs((tw / th) / (frame.width / frame.height) - 1.0) > 0.03:
@@ -433,7 +567,7 @@ def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarr
         else:
             r, a = 0.0, 1.0
         if ci == 0:
-            if r < THUMB_MIN_R:
+            if r < min_r:
                 return None
             r_luma = r
         b = float(np.median(y - a * x))

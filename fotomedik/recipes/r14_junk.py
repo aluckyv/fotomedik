@@ -45,6 +45,7 @@ from ..jpeg import decoder as D
 from ..jpeg import markers as M
 from ..jpeg.tables import FrameTables, TableError
 from ..reference import for_context as reference_for
+from ..reference import twin_loader
 from .base import Context, Hole, Recipe
 from .dcfield import interpolation_sources, thumbnail_base
 from .r12_smooth import DCT, ZIGZAG, component_planes
@@ -322,7 +323,8 @@ class JunkBlocks(Recipe):
         qdc = {c.cid: ft.quant[ft.frame.component(c.cid).tq].dc for c in comps}
         thumb = ctx.memo.get("thumb_base")
         if thumb is not None:  # R9 found the thumbnail (or the reference picture) usable: calibrate it anew
-            thumb = thumbnail_base(ctx.data, ft, sr, clean, ctx.options.get("thumb_refs"), reference_for(ctx, ft)) or thumb
+            thumb = thumbnail_base(ctx.data, ft, sr, clean, ctx.options.get("thumb_refs"), reference_for(ctx, ft),
+                                   twin_loader(ctx, ft)) or thumb
         try:
             return interpolation_sources(sr.dc, trusted, [(c.cid, c.h, c.v) for c in comps], qdc, thumb, per_row)
         except Exception:

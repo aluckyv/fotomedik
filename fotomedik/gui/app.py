@@ -260,6 +260,11 @@ class MainWindow(QMainWindow):
         self.reports = QCheckBox("Save a report file for each photo")
         self.reports.setToolTip("Writes <photo>.report.json next to every repaired copy")
         act.addWidget(self.reports)
+        self.twins = QCheckBox("Colours from similar shots")
+        self.twins.setToolTip("A photo without a usable thumbnail takes the colours of its holes from a shot of\n"
+                              "the same scene taken within 30 seconds (colour and brightness only, and only\n"
+                              "where the two shots agree). Its decoded parts stay as they are.")
+        act.addWidget(self.twins)
         act.addStretch(1)
         self.openb = QPushButton("Open results folder")
         self.openb.setEnabled(False)
@@ -482,6 +487,7 @@ class MainWindow(QMainWindow):
     def _options(self) -> dict:
         steps = [k for k, cb in self.steps.items() if cb.isChecked()]
         return {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked(),
+                "twins": self.twins.isChecked(),
                 "enhance": steps, "quality": self.quality.currentData(),
                 "prompt": self.scene.text().strip() or None}
 

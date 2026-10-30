@@ -63,6 +63,13 @@ dekodiranim pikselima i kalibriše po boji; po njoj se slažu komadi i popunjava
 pikselima, u punoj rezoluciji), a dekodirani delovi ostaju bit-po-bit originalni. Rezultat:
 `<ime>_ref.jpg` pored obične popravke.
 
+**Slični snimci** (`--twins`, u prozoru „Colours from similar shots", podrazumevano isključeno):
+slika bez upotrebljive sličice uzima boje rupa sa snimka iste scene napravljenog do 30 s ranije
+ili kasnije (vreme iz EXIF-a, imena fajla ili datuma koji je ostao u oštećenom headeru). Koristi
+se sličica tog snimka, a ako je nema, samo njegovi pravi delovi; poravnava se sa dekodiranim
+delovima, a svaki deo gde se scena promenila (ljudi se pomere) izostavlja se. Daje samo boju i
+svetlinu, bez detalja, i ne utiče na slaganje komada.
+
 **Poređenje** (`compare`, dugme „Compare with the original…"): mera popravke prema netaknutoj
 kopiji — greška po bloku, koliko je dekodiranog tačno, koliko su rupe daleko od istine, mapa greške.
 Kopija se prvo poravna glatkim poljem pomeraja (AI-restaurirane kopije „plivaju“ i po desetak piksela),

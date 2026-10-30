@@ -424,3 +424,80 @@ def best_candidate(cands: list[np.ndarray], real_y: np.ndarray, trusted: np.ndar
         return float(np.corrcoef(x, y)[0, 1])
 
     return max(cands, key=score)
+
+
+# ----------------------------------------------------------------------------- a twin shot
+
+
+TWIN_WIDTH = 160  # pixels: a twin is used at about a thumbnail's size (colour, not detail)
+TWIN_REAL = 0.2  # share of a twin pixel's area that must be real data for it to count
+
+
+def twin_loader(ctx, ft):
+    """A callable giving (YCbCr pixels, real mask) of the neighbouring shot named by
+    options["twin"], at about a thumbnail's size - or None. That is the twin's own
+    thumbnail when it has a usable one; otherwise the twin is repaired first (in memory,
+    without a twin of its own) and only its real parts count: its holes are guesses.
+    Computed on the first call only, then kept on the context."""
+    path = ctx.options.get("twin")
+    if not path:
+        return None
+
+    def load():
+        if "twin_img" not in ctx.memo:
+            ctx.memo["twin_img"] = _twin_picture(ctx, Path(path), ft.frame.width, ft.frame.height)
+        return ctx.memo["twin_img"]
+
+    return load
+
+
+def _twin_picture(ctx, path: Path, width: int, height: int):
+    from .jpeg import decoder as D
+    from .jpeg import markers as M
+    from .jpeg.tables import FrameTables
+    from .recipes.base import Context
+    from .recipes.registry import run_pipeline
+
+    from .recipes.dcfield import thumbnail_image
+
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        ctx.note("twin", f"{path.name} could not be read: {e}")
+        return None
+    got = thumbnail_image(data)
+    if got is not None and got[1] is None and (got[0].shape[1] >= got[0].shape[0]) == (width >= height):
+        ctx.memo["twin_name"] = path.name
+        return got[0], np.ones(got[0].shape[:2], dtype=np.float32)
+    opts = {k: v for k, v in ctx.options.items() if k not in ("twin", "reference", "reference_dir", "mark_holes")}
+    try:
+        tctx = Context(data=data, name=path.name, ref=ctx.ref, options=opts)
+        run_pipeline(tctx)
+        im = Image.open(io.BytesIO(tctx.data))
+        im.load()
+        res = M.parse_segments(tctx.data)
+        tft = FrameTables.from_parse(res)
+    except Exception as e:
+        ctx.note("twin", f"{path.name} could not be repaired: {e}")
+        return None
+    if (im.size[0] >= im.size[1]) != (width >= height):
+        return None
+    real = np.ones(im.size[::-1], dtype=np.float32)
+    if tctx.holes:
+        _comps, per_row, _rows = D._scan_components(tft)
+        mw, mh = 8 * tft.frame.hmax, 8 * tft.frame.vmax
+        for h in tctx.holes:
+            for m in range(h.mcu_first, h.mcu_first + h.mcu_count):
+                y, x = divmod(m, per_row)
+                real[y * mh : (y + 1) * mh, x * mw : (x + 1) * mw] = 0.0
+    w = TWIN_WIDTH
+    hgt = max(1, round(w * im.size[1] / im.size[0]))
+    ycc = np.asarray(im.convert("YCbCr"), dtype=np.float32)
+    share = np.asarray(Image.fromarray(real, mode="F").resize((w, hgt), Image.BOX), np.float32)
+    planes = []
+    for c in range(3):
+        s = np.asarray(Image.fromarray(ycc[:, :, c] * real, mode="F").resize((w, hgt), Image.BOX), np.float32)
+        planes.append(s / np.maximum(share, 1e-6))
+    small = np.clip(np.stack(planes, axis=2), 0, 255).astype(np.uint8)
+    ctx.memo["twin_name"] = path.name
+    return small, (share >= TWIN_REAL).astype(np.float32)

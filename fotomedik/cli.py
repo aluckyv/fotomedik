@@ -58,6 +58,8 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
     rep.unknown = _unknown_holes(ctx)
     if ctx.memo.get("reference_used") and options.get("reference"):
         rep.reference = Path(str(options["reference"])).name
+    if ctx.memo.get("twin_used"):
+        rep.twin = ctx.memo.get("twin_name")
     if rep.recovered_pct is None:
         if ctx.data != data:  # repaired (e.g. a new header) and nothing left to fill: measure the result
             after = scan_bytes(ctx.data, name)
@@ -336,14 +338,14 @@ def scan(path: Path, lang: str):
 
 def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
                 jobs: int = 0, reports: bool = False, enhance: str = "", quality: str | None = None,
-                prompt: str | None = None, reference: Path | None = None):
+                prompt: str | None = None, reference: Path | None = None, twins: bool = False):
     if path.is_dir() and out.resolve() == path.resolve():
         raise click.ClickException("output folder must differ from the input folder (originals are never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
     jobs = jobs or (os.cpu_count() or 1)
     t0 = time.perf_counter()
     options = {"mark_holes": mark_holes, "keep_damaged": keep_damaged, "time_budget": time_budget,
-               "write_reports": reports}
+               "write_reports": reports, "twins": twins}
     if reference is not None:
         options["reference_dir" if reference.is_dir() else "reference"] = str(reference)
     profile = CameraProfile.from_json(Path(ref).read_text(encoding="utf-8")) if ref else None
@@ -403,13 +405,16 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 @click.option("--reference", type=click.Path(exists=True, path_type=Path),
               help="a picture of the same scene (an AI-restored copy, a scan) that guides the repair into "
                    "<name>_ref; a folder of such pictures is paired with the photos by name or content")
+@click.option("--twins", is_flag=True,
+              help="a photo without a usable thumbnail takes the colours of its holes from a shot of the same "
+                   "scene taken within 30 seconds")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
 def fix(path, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality, scene,
-        reference, lang):
+        reference, twins, lang):
     """Repair a file or folder into OUT (--reports: a .report.json per file too)."""
     _fix_common(path, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
                 auto_ref=False, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""),
-                quality=quality, prompt=scene or None, reference=reference)
+                quality=quality, prompt=scene or None, reference=reference, twins=twins)
 
 
 @main.command()
@@ -445,13 +450,16 @@ def learn(good: Path, out: Path):
 @click.option("--reference", type=click.Path(exists=True, path_type=Path),
               help="a picture of the same scene (an AI-restored copy, a scan) that guides the repair into "
                    "<name>_ref; a folder of such pictures is paired with the photos by name or content")
+@click.option("--twins", is_flag=True,
+              help="a photo without a usable thumbnail takes the colours of its holes from a shot of the same "
+                   "scene taken within 30 seconds")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
 def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality,
-          scene, reference, lang):
+          scene, reference, twins, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
     reps = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
                        auto_ref=True, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""),
-                       quality=quality, prompt=scene or None, reference=reference)
+                       quality=quality, prompt=scene or None, reference=reference, twins=twins)
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])
