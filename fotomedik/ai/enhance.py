@@ -202,8 +202,16 @@ class Engine:
                 self.inpaint_s = session(models.INPAINT)
         if "deblock" in steps:
             self.deblock_s = session(models.DEBLOCK)
+        if "ai" in steps and self.face_det is None:  # small; the healing keeps away from faces
+            try:
+                self.face_det = str(models.ensure(models.FACE_DET, progress, stop))
+            except InterruptedError:
+                raise
+            except Exception as e:
+                self.notes.append(f"faces are not guarded during healing (face finder: {e})")
         if "faces" in steps:
-            self.face_det = str(models.ensure(models.FACE_DET, progress, stop))
+            if self.face_det is None:
+                self.face_det = str(models.ensure(models.FACE_DET, progress, stop))
             self.face_s = session(models.FACE)
         if "diffusion" in steps:
             from .diffusion import Diffusion
@@ -569,9 +577,15 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         elif "ai" in steps and engine.inpaint_s is not None:
             # healing: every hole filled from the real pixels around it at full size; where
             # the thumbnail knows a hole's block averages, they are given back afterwards
+            from .guard import date_stamp, drifted_blocks, face_mask, outside_only
+
             t0, st = time.perf_counter(), {}
+            # kept as the repair left it: the camera's date (the healing would invent digits)
+            stamp = date_stamp(before)
+            # faces: eyes, brows and mouths are not rotted stripes
+            faces = face_mask(before, engine.face_det) & ~stamp
             known = holes & ~unknown
-            stripes = colour_stripes(before, known)
+            stripes = outside_only(colour_stripes(before, known), faces)
             # decoded stripes of wrong colour at the edge of a hole: rotted data the repair kept
             junk = colour_stripes(before, _grow(holes, JUNK_NEAR) & ~holes, JUNK_TOL)
             if junk.any():  # and the rows right above and below, where a stripe's edge bleeds
@@ -579,11 +593,26 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                 edge[:-8] |= junk[8:]
                 edge[8:] |= junk[:-8]
                 junk = edge & ~holes
-            holes = holes | junk
+            junk = outside_only(junk, faces) & ~stamp
+            holes = (holes | junk) & ~stamp
             arr = heal_holes(arr, holes, engine, report("LaMa window"), stop, st)
             arr = keep_block_means(arr, before, holes, known & ~stripes)
+            # a healed face block that looks different from the repair's (a dash across an eye)
+            back = drifted_blocks(arr, before, faces & holes & ~junk & ~stripes)
+            if back.any():
+                a = np.asarray(Image.fromarray((back * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(2)),
+                               dtype=np.float32)[..., None] / 255.0
+                a = np.maximum(a, back[..., None]) * holes[..., None]
+                arr = np.clip(np.rint(arr * (1 - a) + before.astype(np.float32) * a), 0, 255).astype(np.uint8)
+            notes = []
+            if junk.any():
+                notes.append(f"{int(junk.sum()) // 64} block(s) of wrongly coloured stripes healed too")
+            if stamp.any():
+                notes.append("date stamp kept")
+            if faces.any():
+                notes.append("faces guarded" + (f", {int(back.sum()) // 64} block(s) put back" if back.any() else ""))
             done.append(f"holes healed from the picture around them (LaMa, {st.get('tiles', 0)} windows, {_took(t0)})"
-                        + (f"; {int(junk.sum()) // 64} block(s) of wrongly coloured stripes healed too" if junk.any() else ""))
+                        + "".join("; " + n for n in notes))
         elif "ai" in steps and engine.sr is not None:
             if engine.sr is not None:
                 t0, st = time.perf_counter(), {}

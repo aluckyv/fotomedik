@@ -106,24 +106,60 @@ def test_healing_fills_every_hole_window_by_window():
     assert np.array_equal(out[~holes], arr[~holes])
 
 
-def test_faces_are_restored_where_found(monkeypatch):
-    from fotomedik.ai import faces
+def _face_picture():
+    import cv2
 
     arr = np.full((300, 400, 3), 90, np.uint8)
     pts = np.array([[180, 120], [220, 120], [200, 145], [185, 170], [215, 170]], np.float32)
+    for x, y in pts[:2]:
+        cv2.circle(arr, (int(x), int(y)), 6, (20, 20, 20), -1)
+    cv2.ellipse(arr, (200, 170), (16, 5), 0, 0, 360, (40, 20, 20), -1)
+    return arr, pts
+
+
+class FakeGFPGAN:
+    def __init__(self, scramble=False):
+        self.scramble = scramble
+
+    def get_inputs(self):
+        return [_In("input", [1, 3, 512, 512])]
+
+    def run(self, _o, feed):
+        x = feed["input"]
+        if self.scramble:  # a face drawn upside down: the mouth where the eyes were
+            x = x[:, :, ::-1]
+        return [np.minimum(x + 0.5, 1.0)]  # the same face, lighter
+
+
+def test_faces_are_restored_where_found(monkeypatch):
+    from fotomedik.ai import faces
+
+    arr, pts = _face_picture()
     monkeypatch.setattr(faces, "detect", lambda a, p: [pts])
-
-    class FakeGFPGAN:
-        def get_inputs(self):
-            return [_In("input", [1, 3, 512, 512])]
-
-        def run(self, _o, feed):
-            return [np.ones_like(feed["input"])]  # a white "face"
-
     out, n = faces.restore_faces(arr, Engine(face=FakeGFPGAN(), face_det="x"))
     assert n == 1
-    assert out[145, 200].mean() > 150  # the face centre took the restored face
+    assert out[145, 200].mean() > 120  # the face centre took the restored face
     assert out[10, 10].mean() == 90  # far away nothing changed
+
+
+def test_faces_gfpgan_drawing_another_face_is_skipped(monkeypatch):
+    from fotomedik.ai import faces
+
+    arr, pts = _face_picture()
+    monkeypatch.setattr(faces, "detect", lambda a, p: [pts])
+    out, n = faces.restore_faces(arr, Engine(face=FakeGFPGAN(scramble=True), face_det="x"))
+    assert n == 0
+    assert np.array_equal(out, arr)
+
+
+def test_faces_with_misplaced_landmarks_are_skipped(monkeypatch):
+    from fotomedik.ai import faces
+
+    arr, pts = _face_picture()
+    bad = pts[[3, 4, 2, 0, 1]]  # the detector put the eyes on the mouth
+    monkeypatch.setattr(faces, "detect", lambda a, p: [bad])
+    _out, n = faces.restore_faces(arr, Engine(face=FakeGFPGAN(), face_det="x"))
+    assert n == 0
 
 
 def test_diffusion_fill_keeps_real_pixels():
