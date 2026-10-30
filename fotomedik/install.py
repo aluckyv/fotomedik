@@ -240,3 +240,24 @@ def is_folder_app() -> bool:
     exe = Path(sys.executable)
     return bool(getattr(sys, "frozen", False)) and exe.parent.name == "base" \
         and (exe.parent.parent / "code" / "fotomedik").is_dir()
+
+
+def make_shortcuts() -> None:
+    """A FotoMedik shortcut on the desktop and in the Start menu, pointing at the launcher
+    (made once; a missing one is made again, an existing one is left alone)."""
+    if sys.platform != "win32":
+        return
+    target = launcher_path()
+    places = [Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop",
+              Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"]
+    for d in places:
+        lnk = d / "FotoMedik.lnk"
+        if lnk.exists() or not d.is_dir():
+            continue
+        ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');"
+              f"$s.TargetPath='{target}';$s.WorkingDirectory='{target.parent}';$s.Save()")
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           creationflags=0x08000000, timeout=30, check=False)  # no console window
+        except (OSError, subprocess.SubprocessError):
+            pass

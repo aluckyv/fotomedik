@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 LOG_NAME = "FotoMedik-greske.txt"
+RUN_LOG = "FotoMedik-log.txt"  # every status line of the AI part, with the time
 
 _lock = threading.Lock()
 _counts: dict[str, int] = {}
@@ -55,3 +56,32 @@ def log_error(out: Path | None, what: str, exc: BaseException | None = None, tex
                     fh.write(entry)
             except OSError:
                 pass
+
+
+def log_line(out: Path | None, text: str) -> None:
+    """Append one status line to FotoMedik-log.txt (progress percentages are skipped)."""
+    if out is None or text.rstrip().endswith("%"):
+        return
+    stamp = datetime.now().strftime("%H:%M:%S")
+    with _lock:
+        try:
+            Path(out).mkdir(parents=True, exist_ok=True)
+            with open(Path(out) / RUN_LOG, "a", encoding="utf-8") as fh:
+                fh.write(f"{stamp}  {text}\n")
+        except OSError:
+            pass
+
+
+def system_info() -> str:
+    """One line about the computer and the program, for the top of the log."""
+    from . import _build
+
+    gpu = ""
+    try:
+        from .ai.cuda import nvidia_present
+
+        gpu = "NVIDIA driver found" if nvidia_present() else "no NVIDIA driver"
+    except Exception:
+        pass
+    return (f"FotoMedik build {_build.BUILD} ({getattr(_build, 'FLAVOR', '') or 'one-file'}), "
+            f"Python {sys.version.split()[0]}, {platform.platform()}, {gpu}")

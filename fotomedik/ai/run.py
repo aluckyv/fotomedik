@@ -190,7 +190,13 @@ class Enhancer:
                  quality: str | None = None, half: bool = True, prompt: str | None = None):
         self.sources = list(sources)
         self.out = out
-        self.say = say or (lambda s: None)
+        user_say = say or (lambda s: None)
+
+        def say_and_log(text: str) -> None:
+            errlog.log_line(out, text)
+            user_say(text)
+
+        self.say = say_and_log
         self.stop = stop
         self.on_done = on_done
         self.engine = engine
@@ -251,6 +257,8 @@ class Enhancer:
         from ..runner import is_lost
         from .enhance import Engine
 
+        errlog.log_line(self.out, "--- " + errlog.system_info() + f"; steps: {', '.join(self.steps)}")
+
         steps = list(self.steps)
         if "burst" in steps:
             try:
@@ -309,6 +317,15 @@ class Enhancer:
                     engine = Engine()
                 while engine.notes:  # networks the graphics card refused, fp16 copies dropped
                     self.say(engine.notes.pop(0))
+                try:
+                    import onnxruntime as _ort
+
+                    from . import runtime as _rt
+
+                    errlog.log_line(self.out, f"AI runtime {_ort.__version__} ({_rt.kind or 'installed'}), providers "
+                                    f"{_ort.get_available_providers()}; networks on: {engine.devices}")
+                except Exception:
+                    pass
                 in_hand = True
                 wait_all = bool(nets) and engine.device == "CPU"  # on the processor: after the repairs
                 continue

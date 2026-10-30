@@ -4,6 +4,7 @@ downloaded update while the app is closed, and starts the app (see fotomedik.ins
 Run it from anywhere: the app itself lives in %LOCALAPPDATA%\\FotoMedik.
 """
 
+import os
 import sys
 import threading
 from pathlib import Path
@@ -79,6 +80,8 @@ def main() -> int:
     if install.installed() is None:
         return 1
     smoke = bool(args) and args[0].startswith("--smoke")
+    if not smoke and not os.environ.get("FOTOMEDIK_NO_WINDOW"):
+        install.make_shortcuts()
     return install.start_app(args, wait=smoke)
 
 
