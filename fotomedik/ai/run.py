@@ -3,7 +3,7 @@ repaired photo is made, one photo at a time, with the steps chosen:
 
   burst      holes filled with real pixels from a neighbouring shot of the scene
   deblock    JPEG blocks and noise removed from the whole picture (FBCNN)
-  ai         unknown holes filled (LaMa), holes sharpened (Real-ESRGAN)
+  ai         holes healed from the picture around them (LaMa, full size)
   diffusion  holes repainted by Stable Diffusion (instead of "ai"; graphics card)
   faces      faces restored (GFPGAN)
 
@@ -35,7 +35,7 @@ STEPS = ("burst", "deblock", "ai", "diffusion", "faces")
 STEP_NAMES = {
     "burst": "similar shots",
     "deblock": "JPEG clean-up",
-    "ai": "AI sharpen and fill",
+    "ai": "AI healing",
     "diffusion": "maximum quality (diffusion)",
     "faces": "faces",
 }

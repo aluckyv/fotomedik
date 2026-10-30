@@ -79,8 +79,28 @@ def test_steps_report_what_they_did():
 
     out, done = enhance_steps(arr, holes, unknown, eng, ["burst", "deblock", "ai"], burst)
     assert done[0].startswith("similar shots") and "JPEG" in done[1]
-    assert any("LaMa" in d for d in done) and any("Real-ESRGAN" in d for d in done)
+    assert any("healed" in d and "LaMa" in d for d in done)
     assert np.array_equal(out[~holes], arr[~holes])  # identity clean-up: real pixels as they were
+
+
+def test_healing_fills_every_hole_window_by_window():
+    from fotomedik.ai.enhance import heal_holes
+
+    arr = _scene(1100, 1300)
+    holes = np.zeros((1100, 1300), bool)
+    holes[100:116, :] = True  # a thin stripe across the picture
+    holes[500:1050, 200:1150] = True  # a wide hole: seen through a twice larger view
+    calls = []
+
+    class Lama(FakeLama):
+        def run(self, names, feeds):
+            calls.append(1)
+            return super().run(names, feeds)
+
+    st = {}
+    out = heal_holes(arr, holes, Engine(None, Lama()), stats=st)
+    assert st["tiles"] == len(calls) > 4
+    assert np.array_equal(out[~holes], arr[~holes])
 
 
 def test_faces_are_restored_where_found(monkeypatch):

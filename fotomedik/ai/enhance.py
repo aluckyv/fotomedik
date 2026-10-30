@@ -4,10 +4,10 @@ Only pixels of holes change; pixels decoded from real data are carried over (the
 copy is saved as a JPEG at quality 95 without chroma subsampling, so they differ
 from the repaired file only by that re-compression).
 
-1. Holes nothing is known about (no thumbnail there) are filled by LaMa from the
-   picture around them. LaMa works on a 512x512 view of the whole frame; its fill
-   is scaled back up.
-2. Holes are sharpened by Real-ESRGAN: the photo is reduced to a quarter (the
+1. Holes are healed by LaMa from the real pixels around them, at full resolution in
+   overlapping 512x512 windows (a window that is mostly hole sees a twice larger view):
+   thin holes between real rows get the structure running through them.
+2. Without LaMa, holes are sharpened by Real-ESRGAN: the photo is reduced to a quarter (the
    holes carry no more detail than that) and enlarged 4x again by the network,
    tile by tile, only where holes are; on a graphics card several tiles go in one
    call. The same enlarging brings the holes Stable Diffusion repainted at a
@@ -265,6 +265,68 @@ def inpaint_unknown(arr: np.ndarray, unknown: np.ndarray, engine: Engine) -> np.
     return np.where(unknown[..., None], np.clip(np.rint(up), 0, 255), arr).astype(np.uint8)
 
 
+HEAL_TILE = 512  # LaMa window (pixels of the picture at full size)
+HEAL_STEP = 384  # windows overlap by a quarter; their fills are blended with a smooth weight
+HEAL_WIDE = 0.6  # share of a window that is hole above which a twice larger view is filled instead
+
+
+def heal_holes(arr: np.ndarray, holes: np.ndarray, engine: Engine, progress=None, stop=None,
+               stats: dict | None = None) -> np.ndarray:
+    """Holes filled by LaMa from the real pixels around them, at full resolution, window
+    by window (like a healing brush): thin holes between real rows get the structure and
+    texture that runs through them. Where a window is mostly hole, a twice larger view
+    (reduced to the window's size) is filled instead, so wide holes still see context."""
+    h, w = holes.shape
+    T = HEAL_TILE
+    acc = np.zeros((h, w, 3), np.float32)
+    wsum = np.zeros((h, w), np.float32)
+
+    def starts(n, size):
+        if n <= size:
+            return [0]
+        out = list(range(0, n - size + 1, HEAL_STEP))
+        if out[-1] != n - size:
+            out.append(n - size)
+        return out
+
+    jobs = []
+    for y in starts(h, T):
+        for x in starts(w, T):
+            m = holes[y : y + T, x : x + T]
+            if m.any():
+                jobs.append((y, x, float(m.mean())))
+    if stats is not None:
+        stats["tiles"] = len(jobs)
+    for i, (y, x, share) in enumerate(jobs):
+        _check(stop)
+        if share > HEAL_WIDE and h >= 2 * T and w >= 2 * T:
+            # a view twice the size, centred on the window
+            y2 = min(max(0, y - T // 2), h - 2 * T)
+            x2 = min(max(0, x - T // 2), w - 2 * T)
+            view = arr[y2 : y2 + 2 * T, x2 : x2 + 2 * T]
+            vm = holes[y2 : y2 + 2 * T, x2 : x2 + 2 * T]
+            small = np.asarray(Image.fromarray(view).resize((T, T), Image.LANCZOS))
+            sm = np.asarray(Image.fromarray((vm * 255).astype(np.uint8)).resize((T, T), Image.BOX)) > 0
+            big = np.asarray(Image.fromarray(engine.fill(small, sm)).resize((2 * T, 2 * T), Image.BICUBIC), np.float32)
+            out = big[y - y2 : y - y2 + T, x - x2 : x - x2 + T]
+        else:
+            tile = arr[y : y + T, x : x + T]
+            m = holes[y : y + T, x : x + T]
+            th, tw = m.shape
+            if (th, tw) != (T, T):  # a small picture: pad to the window
+                tile = np.pad(tile, ((0, T - th), (0, T - tw), (0, 0)), mode="reflect")
+                m = np.pad(m, ((0, T - th), (0, T - tw)))
+            out = engine.fill(tile, m).astype(np.float32)[:th, :tw]
+        th, tw = out.shape[:2]
+        win = np.outer(np.hanning(th + 2)[1:-1], np.hanning(tw + 2)[1:-1]).astype(np.float32) + 1e-3
+        acc[y : y + th, x : x + tw] += out * win[..., None]
+        wsum[y : y + th, x : x + tw] += win
+        if progress:
+            progress(i + 1, len(jobs))
+    filled = np.where(wsum[..., None] > 0, acc / np.maximum(wsum, 1e-6)[..., None], arr)
+    return np.where(holes[..., None], np.clip(np.rint(filled), 0, 255), arr).astype(np.uint8)
+
+
 def reduce_mask(mask: np.ndarray, factor: int) -> np.ndarray:
     """`mask` reduced `factor` times: a reduced pixel is set when any of its pixels is."""
     h, w = mask.shape
@@ -419,11 +481,14 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                                       prompt)
             arr = keep_block_means(arr, before, holes, holes & ~unknown)
             done.append(f"holes repainted (Stable Diffusion, follows the thumbnail; {what}, {_took(t0)})")
-        elif "ai" in steps and (engine.sr is not None or engine.inpaint_s is not None):
-            if unknown.any() and engine.inpaint_s is not None:
-                t0 = time.perf_counter()
-                arr = inpaint_unknown(arr, unknown, engine)
-                done.append(f"unknown holes filled (LaMa, {_took(t0)})")
+        elif "ai" in steps and engine.inpaint_s is not None:
+            # healing: every hole filled from the real pixels around it at full size; where
+            # the thumbnail knows a hole's block averages, they are given back afterwards
+            t0, st = time.perf_counter(), {}
+            arr = heal_holes(arr, holes, engine, report("LaMa window"), stop, st)
+            arr = keep_block_means(arr, before, holes, holes & ~unknown)
+            done.append(f"holes healed from the picture around them (LaMa, {st.get('tiles', 0)} windows, {_took(t0)})")
+        elif "ai" in steps and engine.sr is not None:
             if engine.sr is not None:
                 t0, st = time.perf_counter(), {}
                 filled_arr = arr

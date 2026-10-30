@@ -150,8 +150,8 @@ def test_steps_report_times_and_progress_labels():
     seen = []
     out, done = enhance_steps(arr, holes, np.zeros_like(holes), Engine(FakeSR(), FakeLama()), ["ai"],
                               progress=lambda i, n, what: seen.append((i, n, what)))
-    assert any("Real-ESRGAN" in d and " s)" in d for d in done)
-    assert seen and all(w == "Real-ESRGAN tile" for _i, _n, w in seen) and seen[-1][0] == seen[-1][1]
+    assert any("LaMa" in d and " s)" in d for d in done)
+    assert seen and all(w == "LaMa window" for _i, _n, w in seen) and seen[-1][0] == seen[-1][1]
 
 
 # ----------------------------------------------------------------------------- enhancer

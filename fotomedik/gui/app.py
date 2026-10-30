@@ -283,8 +283,9 @@ class MainWindow(QMainWindow):
             "burst": "Fill holes with REAL pixels from another shot of the same scene\n"
                      "(taken within 3 minutes), aligned and colour-matched. Nothing invented.",
             "deblock": "Remove JPEG blocks and noise from the whole picture (FBCNN, ~290 MB once).",
-            "ai": "Sharpen areas rebuilt from the thumbnail (Real-ESRGAN) and fill holes nothing\n"
-                  "is known about (LaMa). Invented detail. ~275 MB once.",
+            "ai": "Heal the holes from the real pixels around them, like a healing brush (LaMa, at\n"
+                  "full size): lines and blurred parts get the structure running through them;\n"
+                  "colours follow the thumbnail where there is one. Invented detail. ~275 MB once.",
             "faces": "Restore faces (GFPGAN, ~340 MB once). Can make a face look like someone else.",
             "diffusion": "Maximum quality: holes repainted by Stable Diffusion following the thumbnail.\n"
                          "Needs a graphics card (minutes per photo on the processor). ~2.1 GB once.",
