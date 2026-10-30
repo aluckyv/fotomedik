@@ -264,6 +264,147 @@ def _decoded(r: D.ScanResult) -> int:
     return sum(iv.decoded for iv in r.intervals)
 
 
+GAIN_BUCKET = 64  # MCUs of progress treated as equal when ranking partial fixes of a long interval
+DIVERGE_FWD = 4 * W_BACK  # bytes after the thumbnail's divergence point searched (the flip lies before it)
+
+
+def err_mcu_of(cur: D.ScanResult) -> int:
+    return cur.error.mcu_index if cur.error is not None else cur.total_mcus
+
+
+DIVERGE_T = 8.0  # strength (t statistic) a step in the thumbnail residual needs
+DIVERGE_STEP = 3.0  # gray levels it must at least shift the residual by
+
+
+def thumbnail_divergence(data: bytes, ft: FrameTables, sr: D.ScanResult, thumb_refs=None):
+    """A function giving, for a decode, the MCU where it starts to disagree with the
+    thumbnail, or None when there is no usable thumbnail.
+
+    A flipped bit breaks the chain of DC differences: from it on, a component is off by
+    a constant (and the blocks may sit a few places off). Against the thumbnail that is a
+    step in the residual (decoded minus thumbnail) of some component; the strongest step
+    before the decoder's error point - by the t statistic of the two means - is where to
+    look for the flip."""
+    from .dcfield import thumbnail_base
+
+    first_err = err_mcu_of(sr)
+    clean = sr.mcu_ok.copy()
+    clean[first_err:] = False
+    try:
+        thumb = thumbnail_base(data, ft, sr, clean, thumb_refs)
+    except Exception:  # noqa: BLE001
+        return None
+    if thumb is None or thumb.twin:
+        return None
+    comps_d, per_row, _rows = D._scan_components(ft)
+    comps = [(c, ft.quant[ft.frame.component(c.cid).tq].dc) for c in comps_d if c.cid in thumb.dc]
+
+    def resid(cur: D.ScanResult, a: int, b: int) -> np.ndarray:
+        """Mean residual (decoded minus thumbnail, gray levels) per component over MCUs [a, b)."""
+        out = []
+        for c, q in comps:
+            arr, t = cur.dc[c.cid], thumb.dc[c.cid]
+            vals = []
+            for m in range(a, b):
+                r0, c0 = divmod(m, per_row)
+                blk = arr[r0 * c.v : (r0 + 1) * c.v, c0 * c.h : (c0 + 1) * c.h] - t[r0 * c.v : (r0 + 1) * c.v,
+                                                                                    c0 * c.h : (c0 + 1) * c.h]
+                fin = np.isfinite(blk)
+                vals.append(float(blk[fin].mean()) if fin.any() else np.nan)
+            v = np.array(vals, dtype=float) * q / 8.0
+            out.append(float(np.nanmean(v)) if np.isfinite(v).any() else np.nan)
+        return np.array(out)
+
+    def diverge(cur: D.ScanResult):
+        e = err_mcu_of(cur)
+        best_t, best_k = 0.0, None
+        for c, q in comps:
+            arr, t = cur.dc[c.cid], thumb.dc[c.cid]
+            rows = arr.shape[0] // c.v
+            d = ((arr - t) * q / 8.0)[: rows * c.v, : per_row * c.h].reshape(rows, c.v, per_row, c.h)
+            ok = np.isfinite(d)
+            r = (np.where(ok, d, 0.0).sum(axis=(1, 3)) / np.maximum(ok.sum(axis=(1, 3)), 1)).ravel()[:e]
+            n = len(r)
+            if n < 2 * per_row:
+                continue
+            cs = np.cumsum(r)
+            k = np.arange(per_row, n - per_row)  # a step with at least a row on each side
+            m1, m2 = cs[k - 1] / k, (cs[-1] - cs[k - 1]) / (n - k)
+            tstat = np.abs(m1 - m2) * np.sqrt(k * (n - k) / n) / (float(np.std(r)) + 1e-6)
+            i = int(np.argmax(tstat))
+            if tstat[i] > max(DIVERGE_T, best_t) and abs(m1[i] - m2[i]) > DIVERGE_STEP:
+                best_t, best_k = float(tstat[i]), int(k[i])
+        return best_k
+
+    diverge.resid = resid
+    diverge.per_row = per_row
+    return diverge
+
+
+STEP_ROWS = 3  # MCU rows decoded after a candidate flip to see whether the step is gone
+STEP_BACK = 4  # MCUs before the step in which the flipped bit is looked for
+STEP_FWD = 1
+
+
+def flips_by_thumbnail(buf: bytearray, parse, ft: FrameTables, diverge, deadline: float,
+                       rounds: int = 8) -> list[tuple[int, int]]:
+    """Undo flips of a long interval one by one where the thumbnail shows them.
+
+    For a scan without restart markers the decoder notices a flip thousands of MCUs
+    later, and a wrong flip nearer the detection point often decodes just as far. The
+    thumbnail's step (see thumbnail_divergence) pins the flip to a few MCUs; every bit
+    there is tried, decoding a few rows on, and the one that makes the step vanish -
+    the colours after it agree with the thumbnail as well as those before - is kept."""
+    per_row = diverge.per_row
+    found: list[tuple[int, int]] = []
+    for _ in range(rounds):
+        if time.monotonic() > deadline:
+            break
+        cur = D.decode_scan(bytes(buf), parse, ft)
+        md = diverge(cur)
+        e = err_mcu_of(cur)
+        if md is None or md >= e or md < STEP_BACK + per_row:
+            break
+        m0 = md - STEP_BACK
+        n = min(STEP_ROWS * per_row, e - m0 - 1)
+        if n < per_row:
+            break
+        before = diverge.resid(cur, md - per_row, md)
+        a = cur.mcus[m0].bit_start
+        lo, hi = a // 8, cur.mcus[min(len(cur.mcus) - 1, md + STEP_FWD)].bit_start // 8 + 1
+        preds = D.preds_before_mcu(cur, ft, m0)
+
+        def step_of(data: bytes) -> float:
+            r = D._decode_scan(data, parse, ft, start_byte=a // 8, start_bit=a % 8, first_mcu=m0, max_mcus=n,
+                               init_preds=preds, resync=False)
+            if r.error is not None or int(r.mcu_ok.sum()) < n:
+                return math.inf
+            after = diverge.resid(r, md + 1, m0 + n)
+            return float(np.nansum(np.abs(after - before)))
+
+        base = step_of(bytes(buf))
+        best = (base, None)
+        for off in range(lo, hi):
+            for bit in range(8):
+                buf[off] ^= 1 << bit
+                sc = step_of(bytes(buf))
+                buf[off] ^= 1 << bit
+                if sc < best[0]:
+                    best = (sc, (off, 1 << bit))
+        if best[1] is None or not best[0] < 0.4 * base:
+            break
+        off, mask = best[1]
+        buf[off] ^= mask
+        after = D.decode_scan(bytes(buf), parse, ft)
+        if err_mcu_of(after) <= e or diverge(after) == md:
+            # the true flip lets the decode run on past where it stopped and takes the step
+            # away for good; one that only hides it for a few rows (a lost stretch, not a flip) is not it
+            buf[off] ^= mask
+            break
+        found.append((off, mask))
+    return found
+
+
 def repair_interval(
     buf: bytearray,
     parse: M.ParseResult,
@@ -273,11 +414,15 @@ def repair_interval(
     deadline: float,
     baseline: float = 0.0,
     stats: dict | None = None,
+    diverge=None,
 ) -> tuple[bool, list[tuple[int, int]], str]:
     """Try to make one failed interval decode cleanly. Mutates buf. Returns (ok, flips, note).
 
     `baseline` is the typical DC roughness of the undamaged part of this image; a
     'complete' candidate much rougher than that is a wrong flip that happens to decode.
+    `diverge(scan) -> MCU or None`: where a decode stops agreeing with the thumbnail. Without
+    restart markers a flip is often noticed thousands of MCUs after it, far beyond the
+    windows searched around the detection point; the thumbnail shows where it really is.
     """
     spec = _Interval(iv, parse, len(buf), ft.restart_interval)
     pk = K.packed_for(ft)
@@ -317,6 +462,12 @@ def repair_interval(
             # than a few windows before the detection point
             hint = max(min(e_byte, cur.mcus[mi - spec.first].bit_start // 8 + 2), e_byte - 4 * W_BACK)
         hi = min(e_byte + W_FWD, spec.decode_end - (2 if spec.marker_pos is not None else 0))
+        if diverge is not None:
+            md = diverge(cur)
+            if md is not None and spec.first <= md < err_mcu_of(cur) and md - spec.first < len(cur.mcus):
+                # the flipped bit sits in the MCUs just before the step, not after it
+                hint = cur.mcus[max(0, md - 2 - spec.first)].bit_start // 8
+                hi = min(hi, hint + DIVERGE_FWD)
         if hi <= max(spec.start, hint - W_BACK):
             return (False, progress, math.inf, list(flips))
         err_mcu = cur.error.mcu_index if cur.error is not None else spec.first + spec.count
@@ -401,7 +552,12 @@ def repair_interval(
                 return res
         # No clean completion: explore the most promising partial fixes deeper.
         best = (False, progress, math.inf, list(flips))
-        ranked = sorted(partials.items(), key=lambda kv: (-kv[0][0], kv[0][1]))[:BEAM]
+        if diverge is not None:
+            # a long interval: a wrong flip may happen to decode a few MCUs further than the
+            # true one; progress within GAIN_BUCKET counts the same, smoothness decides
+            ranked = sorted(partials.items(), key=lambda kv: (-(kv[0][0] // GAIN_BUCKET), kv[0][1]))[:BEAM]
+        else:
+            ranked = sorted(partials.items(), key=lambda kv: (-kv[0][0], kv[0][1]))[:BEAM]
         branches: list[tuple[int, int]] = []
         for _key, lst in ranked:
             lst.sort()  # 0->1 repairs first
@@ -569,7 +725,13 @@ class BitFlipRepair(Recipe):
         deadline = time.monotonic() + budget
         buf = bytearray(ctx.data)
         baseline = image_roughness(sr, ft)
-        all_flips: list[list[int]] = []
+        diverge = thumbnail_divergence(ctx.data, ft, sr, ctx.options.get("thumb_refs")) if not ft.restart_interval else None
+        pre_flips: list[tuple[int, int]] = []
+        if diverge is not None:
+            pre_flips = flips_by_thumbnail(buf, parse, ft, diverge, time.monotonic() + budget / 2)
+            if pre_flips:
+                sr = D.decode_scan(bytes(buf), parse, ft)
+        all_flips: list[list[int]] = [[o, m] for o, m in pre_flips]
         repaired = unrepaired = 0
         notes: dict[str, int] = {}
         skipped_for_time = 0
@@ -592,7 +754,7 @@ class BitFlipRepair(Recipe):
                     continue
                 attempted.add(iv.index)
                 iv_deadline = min(deadline, time.monotonic() + per_interval)
-                ok, flips, note = repair_interval(buf, parse, ft, sr, iv, iv_deadline, baseline, stats)
+                ok, flips, note = repair_interval(buf, parse, ft, sr, iv, iv_deadline, baseline, stats, diverge)
                 if flips:
                     after = D.decode_scan(bytes(buf), parse, ft)
                     m_from = iv.mcu_first + (iv.decoded or 0)
@@ -614,6 +776,8 @@ class BitFlipRepair(Recipe):
             parse = M.parse_segments(bytes(buf))
             sr = D.decode_scan(bytes(buf), parse, ft)
         msg = f"{repaired} interval(s) repaired with {len(all_flips)} bit flip(s); {unrepaired} unrepaired"
+        if pre_flips:
+            msg += f" ({len(pre_flips)} flip(s) found where the thumbnail shows a colour step)"
         if notes:
             msg += " (" + ", ".join(f"{k}: {v}" for k, v in notes.items()) + ")"
         if skipped_for_time:

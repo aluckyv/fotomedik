@@ -67,8 +67,9 @@ def _aligned(rng, lo: int, hi: int) -> int:
     return int(rng.integers(lo // SECTOR, hi // SECTOR + 1)) * SECTOR
 
 
-def damage(data: bytes, other: bytes, seed: int) -> tuple[bytes, list[str]]:
-    """One or two kinds of damage seen on real photos, in the scan data."""
+def damage(data: bytes, other: bytes, seed: int, spans: list | None = None) -> tuple[bytes, list[str]]:
+    """One or two kinds of damage seen on real photos, in the scan data. `spans` (when
+    given) receives the destroyed byte ranges in the good file's offsets."""
     rng = np.random.default_rng(seed)
     s = scan_start(data)
     end = len(data) - 2
@@ -76,6 +77,13 @@ def damage(data: bytes, other: bytes, seed: int) -> tuple[bytes, list[str]]:
     chosen = list(rng.choice(kinds, size=int(rng.integers(1, 3)), replace=False))
     buf = bytearray(data)
     done = []
+    deleted: list[tuple[int, int]] = []
+
+    def mark(a: int, b: int) -> None:  # a range of buf, in the good file's offsets
+        if spans is not None:
+            shift = sum(n for p, n in deleted if p <= a)
+            spans.append((a + shift, b + shift))
+
     for k in chosen:
         span = end - s
         at = s + int(rng.uniform(0.1, 0.85) * span)
@@ -84,12 +92,14 @@ def damage(data: bytes, other: bytes, seed: int) -> tuple[bytes, list[str]]:
             for o in range(at, min(at + n, len(buf) - 2)):
                 if rng.random() < 0.3:
                     buf[o] ^= 1 << int(rng.integers(0, 8))
+            mark(at, at + n)
             done.append(f"rot {n} B")
         elif k == "flips":
             n = int(rng.integers(1, 4))
             for _ in range(n):
                 o = s + int(rng.integers(0, span))
                 buf[o] ^= 1 << int(rng.integers(0, 8))
+                mark(o, o + 1)
             done.append(f"{n} bit flip(s)")
         elif k == "foreign":  # sectors of another photo where this one's were
             n = _aligned(rng, 4096, 32768)
@@ -98,19 +108,24 @@ def damage(data: bytes, other: bytes, seed: int) -> tuple[bytes, list[str]]:
             src = os_ + _aligned(rng, 0, max(SECTOR, len(other) - os_ - n - SECTOR))
             chunk = other[src : src + n]
             buf[at : at + len(chunk)] = chunk
+            mark(at, at + len(chunk))
             done.append(f"foreign {n // 1024} KB")
         elif k == "zeros":
             n = _aligned(rng, 4096, 16384)
             at -= at % SECTOR
             buf[at : at + n] = bytes(min(n, len(buf) - 2 - at))
+            mark(at, at + n)
             done.append(f"zeros {n // 1024} KB")
         elif k == "missing":  # a fragment the recovery lost: everything after it moves up
             n = _aligned(rng, 4096, 16384)
             at -= at % SECTOR
+            mark(at, at + n)
             del buf[at : at + n]
+            deleted.append((at, n))
             done.append(f"missing {n // 1024} KB")
         elif k == "truncate":
             cut = int(rng.uniform(0.55, 0.9) * (len(buf) - s)) + s
+            mark(cut, len(buf))
             del buf[cut:]
             done.append(f"truncated at {100 * (cut - s) // (len(data) - s)} %")
     return bytes(buf), done

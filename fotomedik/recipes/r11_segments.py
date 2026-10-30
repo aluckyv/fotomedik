@@ -55,6 +55,7 @@ from .r9_holes import decode_for
 from .registry import register
 
 BLOCK = 32  # MCUs placed together
+STEP_LEAD = 2  # MCUs before the thumbnail's step where the search starts (the damage lies just before it)
 MIN_SEG = 512  # bytes: shorter intact stretches are not worth it
 PROBE = 256  # bytes searched for a converged start at the beginning of a stretch
 ACCEPT = 3.0  # mean squared misfit per component (in units of the reference's expected error)
@@ -560,8 +561,13 @@ class SegmentPlacement(Recipe):
         return got if any(not iv.ok and iv.error is not None and iv.error.reason != "skipped"
                           for iv in sr.intervals) else None
 
-    def _jobs(self, sr: D.ScanResult, parse, ft, tails: dict) -> list[dict]:
-        """Damaged stretches to search: byte range, MCU range and anchor points (byte, MCU)."""
+    def _jobs(self, sr: D.ScanResult, parse, ft, tails: dict, step: int | None = None) -> list[dict]:
+        """Damaged stretches to search: byte range, MCU range and anchor points (byte, MCU).
+
+        step: the MCU where the decode starts to disagree with the thumbnail (see
+        r5_bitflip.thumbnail_divergence). Without restart markers a lost or foreign stretch
+        is often noticed thousands of MCUs later; what decoded in between is real data of
+        the photo at the wrong place, so the search starts at the step, not at the error."""
         dri = ft.restart_interval
         total = sr.total_mcus
         _comps, per_row, _rows = D._scan_components(ft)
@@ -575,6 +581,10 @@ class SegmentPlacement(Recipe):
             m_end = min(total, (last + 1) * dri) if dri else total
             b_lo = max(iv.byte_start, iv.error.byte_offset)
             m_lo = iv.mcu_first + iv.decoded
+            if step is not None and iv.mcu_first + STEP_LEAD < step < m_lo:
+                k = step - STEP_LEAD - iv.mcu_first
+                if 0 <= k < len(sr.mcus) and sr.mcus[k].index == step - STEP_LEAD:
+                    m_lo, b_lo = step - STEP_LEAD, sr.mcus[k].bit_start // 8
             anchors = [(iv.byte_start, iv.mcu_first), (b_lo, m_lo)]
             m_hi = m_end
             # a recovered tail closes the range; whole intervals recovered after it too
@@ -700,7 +710,13 @@ class SegmentPlacement(Recipe):
             data, ft, sr, clean, ctx.options.get("thumb_refs"), reference_for(ctx, ft))
         ctx.memo["thumb_base"] = thumb
         placer = Placer(ft, sr, thumb, clean)
-        jobs = self._jobs(sr, parse, ft, tails)
+        step = None
+        if not ft.restart_interval and thumb is not None:
+            from .r5_bitflip import thumbnail_divergence
+
+            dv = thumbnail_divergence(data, ft, sr, ctx.options.get("thumb_refs"))
+            step = dv(sr) if dv is not None else None
+        jobs = self._jobs(sr, parse, ft, tails, step)
         if not jobs:
             return
         found = parallel.pmap(lambda jb: self._run(data, pk, placer, jb, (parse, ft)), jobs)

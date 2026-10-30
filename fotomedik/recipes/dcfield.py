@@ -513,6 +513,24 @@ AGREE_FLOOR = 10.0  # gray levels of luma a decoded MCU may stray from the thumb
 AGREE_K = 4.0  # ... or this many times the typical stray of the run's first part
 
 
+STEP_T = 8.0  # t statistic a step in the residual needs
+STEP_MIN = 3.0  # gray levels it must shift the residual by
+
+
+def _step(r: np.ndarray, per_row: int) -> int | None:
+    """Index of the strongest step in the mean of `r` (at least a row on each side), when
+    it is clear (t statistic of the two means) and large enough; None otherwise."""
+    n = len(r)
+    if n < 3 * per_row:
+        return None
+    cs = np.cumsum(r)
+    k = np.arange(per_row, n - per_row)
+    m1, m2 = cs[k - 1] / k, (cs[-1] - cs[k - 1]) / (n - k)
+    t = np.abs(m1 - m2) * np.sqrt(k * (n - k) / n) / (float(np.std(r)) + 1e-6)
+    i = int(np.argmax(t))
+    return int(k[i]) if t[i] > STEP_T and abs(m1[i] - m2[i]) > STEP_MIN else None
+
+
 def agreeing_mcus(tdc: np.ndarray, arr: np.ndarray, mcu_ok: np.ndarray, h: int, v: int, per_row: int,
                   q: float) -> np.ndarray:
     """`mcu_ok` without the decoded garbage at the end of each run of decoded MCUs.
@@ -530,8 +548,10 @@ def agreeing_mcus(tdc: np.ndarray, arr: np.ndarray, mcu_ok: np.ndarray, h: int, 
         return out
     off = float(np.median(diff[known]))  # the thumbnail's overall brightness offset
     dev = np.where(known, np.abs(diff - off), 0.0).reshape(rows // v, v, per_row, h).sum(axis=(1, 3))
+    sgn = np.where(known, diff - off, 0.0).reshape(rows // v, v, per_row, h).sum(axis=(1, 3))
     cnt = known.reshape(rows // v, v, per_row, h).sum(axis=(1, 3))
     per_mcu = (dev / np.maximum(cnt, 1)).ravel()[:n]
+    signed = (sgn / np.maximum(cnt, 1)).ravel()[:n]
     ok = mcu_ok[:n]
     i = 0
     while i < n:
@@ -548,14 +568,20 @@ def agreeing_mcus(tdc: np.ndarray, arr: np.ndarray, mcu_ok: np.ndarray, h: int, 
             # the first point from which the rest of the run is mostly off
             rest_bad = np.cumsum(bad[::-1])[::-1] / np.arange(j - i, 0, -1)
             cut = np.flatnonzero(bad & (rest_bad > 0.8))
-            if len(cut):
-                out[i + int(cut[0]) : j] = False
+            at = int(cut[0]) if len(cut) else None
+            # a step in the signed residual: from a lost or wrong bit on, the brightness is off
+            # by a constant and the blocks sit a few places off - smaller than the floor above
+            st = _step(signed[i:j], per_row)
+            if st is not None and (at is None or st < at):
+                at = st
+            if at is not None:
+                out[i + at : j] = False
         i = j
     return out
 
 
 def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarray, gain_range,
-               min_r: float = THUMB_MIN_R) -> ThumbBase | None:
+               min_r: float = THUMB_MIN_R, _trim: bool = True) -> ThumbBase | None:
     frame = ft.frame
     th, tw = img.shape[:2]
     if abs((tw / th) / (frame.width / frame.height) - 1.0) > 0.03:
@@ -629,6 +655,10 @@ def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarr
             r, a = 0.0, 1.0
         if ci == 0:
             if r < min_r:
+                if _trim:  # perhaps the "clean" part holds garbage decoded before an error
+                    agree = agreeing_mcus(tdc, arr, clean_mcus, c.h, c.v, per_row, q)
+                    if int(agree.sum()) < int(clean_mcus.sum()):
+                        return _base_from(img, mask, ft, sr, agree, gain_range, min_r, _trim=False)
                 return None
             r_luma = r
         b = float(np.median(y - a * x))
