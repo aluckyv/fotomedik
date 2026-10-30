@@ -3,6 +3,7 @@ them, repaired, and compared with the photo they were.
 
     python scripts/bench.py make  GOOD_FOLDER  BENCH_FOLDER [--per 2] [--long 1600]
     python scripts/bench.py run   BENCH_FOLDER RESULT.json [--ai MODELS_FOLDER] [--only N]
+    python scripts/bench.py score BENCH_FOLDER OUT_FOLDER RESULT.json   (pictures made by the app)
     python scripts/bench.py compare OLD.json NEW.json
 
 `make` keeps only photos the scanner finds healthy, brings them to `--long` pixels on
@@ -359,6 +360,41 @@ def compare(args) -> None:
             print(f"worse ({stage}): {c}  good {o:.3f} -> {n:.3f}")
 
 
+def score_folder(args) -> None:
+    """Score pictures made elsewhere (the app on a graphics card): OUT holds <case>.jpg
+    (repaired) and/or <case>_enhanced.jpg for damaged copies of the bench."""
+    bench, out = Path(args.bench), Path(args.out)
+    manifest = {m["case"]: m for m in json.loads((bench / "manifest.json").read_text(encoding="utf-8"))}
+    face_model = Path(args.faces) if args.faces else None
+    rows = []
+    for case, m in manifest.items():
+        stem = Path(case).stem
+        rep, enh = out / f"{stem}.jpg", out / f"{stem}_enhanced.jpg"
+        if not rep.exists() and not enh.exists():
+            continue
+        truth = decode((bench / "truth" / m["truth"]).read_bytes())
+        naive = decode((bench / "damaged" / case).read_bytes())
+        if naive is not None and naive.shape == truth.shape:
+            area = np.abs(naive.astype(np.int16) - truth.astype(np.int16)).max(axis=-1) > TOL
+            area = np.asarray(Image.fromarray(area).resize((area.shape[1] // 8, area.shape[0] // 8), Image.BOX)
+                              .resize((area.shape[1], area.shape[0]), Image.NEAREST)) > 0
+        else:
+            area = np.ones(truth.shape[:2], bool)
+        faces = face_area(truth, face_model)
+        row = {"case": case, "damage": m["damage"], "area": round(float(area.mean()), 4),
+               "naive": score(truth, naive, area, faces)}
+        if rep.exists():
+            row["repair"] = score(truth, decode(rep.read_bytes()), area, faces)
+        if enh.exists():
+            row["ai"] = score(truth, decode(enh.read_bytes()), area, faces)
+        rows.append(row)
+        print(f"{case:<34} " + "  ".join(f"{k} {row[k]['good']:.2f}/{row[k]['stripes']:.2f}/{row[k]['ssim']:.2f}"
+                                         for k in ("naive", "repair", "ai") if k in row))
+    res = {"when": time.strftime("%Y-%m-%d %H:%M"), "cases": rows, "summary": summary(rows)}
+    Path(args.result).write_text(json.dumps(res, indent=1), encoding="utf-8")
+    print_summary(res["summary"])
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -376,11 +412,16 @@ def main() -> None:
     r.add_argument("--cases", help="comma separated case names (default: all)")
     r.add_argument("--jobs", type=int, default=0)
     r.add_argument("--keep", help="folder to save the repaired and healed pictures in")
+    sc = sub.add_parser("score")
+    sc.add_argument("bench")
+    sc.add_argument("out")
+    sc.add_argument("result")
+    sc.add_argument("--faces", help="YuNet face model, to score faces")
     c = sub.add_parser("compare")
     c.add_argument("old")
     c.add_argument("new")
     a = p.parse_args()
-    {"make": make, "run": run, "compare": compare}[a.cmd](a)
+    {"make": make, "run": run, "score": score_folder, "compare": compare}[a.cmd](a)
 
 
 if __name__ == "__main__":
