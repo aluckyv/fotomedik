@@ -109,6 +109,9 @@ class ParseResult:
         return not self.errors and self.scan_start is not None
 
 
+EOI_SLACK = 4096  # bytes: an end marker further from a rotted one at the very end is not trusted over it
+
+
 def find_eoi(data: bytes) -> int | None:
     """Offset of the trailing EOI, ignoring zero/garbage padding after it."""
     pos = data.rfind(b"\xff\xd9")
@@ -157,8 +160,10 @@ def parse_segments(data: bytes) -> ParseResult:
             res.scan_start = p
             if res.eoi_offset is not None and res.eoi_offset < p:
                 res.eoi_offset = None  # that FF D9 ends the embedded thumbnail, not the image
-            if res.eoi_offset is None and n - p >= 4:
-                # the last two bytes a few flipped bits away from FF D9: the image's end marker
+            if n - p >= 4 and (res.eoi_offset is None or n - 2 - res.eoi_offset > EOI_SLACK):
+                # the last two bytes a few flipped bits away from FF D9: the image's end marker.
+                # An exact FF D9 far before it is a rotted stretch of data by chance spelling
+                # one (dense bit rot does, every hundred kilobytes or so), not the end.
                 if bin(data[n - 2] ^ 0xFF).count("1") + bin(data[n - 1] ^ EOI).count("1") <= 3:
                     res.eoi_offset = n - 2
             return res
