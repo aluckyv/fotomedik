@@ -51,6 +51,21 @@ blokove), `--time-budget 120` (sekundi po fajlu za pogađanje bitova), `--lang s
 `batch` sam pravi referentne profile iz zdravih slika u folderu i koristi ih za one sa
 uništenim headerom. Uz svaki izlazni fajl ide `<ime>.report.json`.
 
+```
+fotomedik fix   D:\slike -o out --reference D:\ai_verzije   # referentne slike vode popravku
+fotomedik compare out\IMG_0031.JPG original.jpg --picture mapa.jpg --runs
+```
+
+**Referentna slika** (`--reference`, u prozoru dugme „Reference photo…" ili polje „References"):
+približna kopija iste fotografije — AI rekonstrukcija, skenirana fotografija, kopija iz albuma —
+zamenjuje ugrađenu sličicu 160×120. Uparuje se po imenu ili sadržaju, poravnava se lokalno sa
+dekodiranim pikselima i kalibriše po boji; po njoj se slažu komadi i popunjavaju rupe (njenim
+pikselima, u punoj rezoluciji), a dekodirani delovi ostaju bit-po-bit originalni. Rezultat:
+`<ime>_ref.jpg` pored obične popravke.
+
+**Poređenje** (`compare`, dugme „Compare with the original…"): mera popravke prema netaknutoj
+kopiji — greška po bloku, koliko je dekodiranog tačno, koliko su rupe daleko od istine, mapa greške.
+
 ## Šta ume (recepti)
 
 | | oštećenje | popravka |
