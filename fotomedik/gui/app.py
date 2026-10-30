@@ -127,6 +127,9 @@ class RepairWorker(QObject):
                        on_status=self.status.emit, stop=self.stop, on_ai=self.ai_done.emit,
                        on_ai_status=self.ai_status.emit)
         except Exception as e:  # shown to the user, the app keeps running
+            from .. import errlog
+
+            errlog.log_error(self.out, "the run", e)
             err = f"{type(e).__name__}: {e}"
         self.finished.emit(time.perf_counter() - t, err)
 
@@ -159,6 +162,8 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.worker: RepairWorker | None = None
         self.total = 0
+        self.out_dir: Path | None = None
+        self.quiet = False  # no summary window (the self-test)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -569,9 +574,21 @@ class MainWindow(QMainWindow):
         n = len(self.results)
         if err:
             self.stat.setText("Stopped by an error.")
-            QMessageBox.critical(self, APP_NAME, err)
         else:
             self.stat.setText(f"Done: {n} photo(s) in {secs:.1f} s")
+        if not self.quiet:
+            self._summary(secs, err)
+
+    def _summary(self, secs: float, err: str) -> None:
+        """A window at the end of every run: what came out of it, and where errors went."""
+        from .. import errlog
+
+        errors = errlog.count(self.out_dir) if self.out_dir else 0
+        text = runner.summary_text(self.results, self.total, secs, err, self.out_dir, self.aibox.isVisible(), errors)
+        box = QMessageBox(QMessageBox.Icon.Warning if (err or errors) else QMessageBox.Icon.Information,
+                          f"{APP_NAME} - finished", text, QMessageBox.StandardButton.Ok, self)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.exec()
 
     def _show_selected(self) -> None:
         rows = self.table.selectionModel().selectedRows()
@@ -735,6 +752,7 @@ def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, a
     from PySide6.QtCore import QTimer
 
     log = open(shot.with_suffix(".txt"), "w", encoding="utf-8")  # noqa: SIM115
+    w.quiet = True
     for cb in w.steps.values():
         cb.setChecked(False)
     if ai:
@@ -792,6 +810,8 @@ def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, a
                 log.write(f"manual window failed: {type(e).__name__}: {e}\n")
             code["v"] = 0 if ok else 1
             log.write(f"smoke: {len(w.results)}/{w.total} photos, {len(ai_rows)} AI copies\n")
+            log.write("summary window:\n" + runner.summary_text(w.results, w.total, time.perf_counter() - started,
+                                                                 "", w.out_dir, w.aibox.isVisible()) + "\n")
             app.quit()
         elif time.perf_counter() - started > (1500 if ai else 300):
             app.quit()

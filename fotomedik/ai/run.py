@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .. import errlog
 from ..report.report import FileReport
 
 STEPS = ("burst", "deblock", "ai", "diffusion", "faces")
@@ -42,6 +43,7 @@ STEP_NAMES = {
 NETWORK_STEPS = {"deblock", "ai", "diffusion", "faces"}
 NEAR_FILES = 10  # photos this close in the list may be the same scene when their time is unknown
 PROGRESS_EVERY = 1.0  # seconds between progress lines of a slow step
+RESTARTS = 3  # times the enhanced copies start again after an unexpected error
 
 
 def enhanced_name(output_name: str) -> str:
@@ -59,7 +61,7 @@ _ENGINE = None  # the Engine of this process, kept between runs
 _ENGINE_LOCK = threading.Lock()
 
 
-def engine_for(nets, say=None, stop=None, half: bool = True):
+def engine_for(nets, say=None, stop=None, half: bool = True, out: Path | None = None):
     """The shared engine with the networks of `nets` loaded (downloaded first when
     needed), or None when they cannot be used here (the reason goes to say, unless
     the run was stopped)."""
@@ -68,6 +70,7 @@ def engine_for(nets, say=None, stop=None, half: bool = True):
     try:
         import onnxruntime  # noqa: F401
     except Exception as e:  # not bundled / not installed
+        errlog.log_error(out, "starting the AI (onnxruntime)", e)
         say(f"AI steps are not available here ({type(e).__name__}: {e})")
         return None
     from . import models
@@ -90,7 +93,8 @@ def engine_for(nets, say=None, stop=None, half: bool = True):
             except InterruptedError:
                 return None
             except Exception as e:
-                say(f"AI models could not be loaded: {e}")
+                errlog.log_error(out, f"loading the AI models ({', '.join(todo)})", e)
+                say(f"AI models could not be loaded ({type(e).__name__}); details in {errlog.LOG_NAME}")
                 return None
         _ENGINE = eng
     return eng
@@ -193,6 +197,7 @@ class Enhancer:
         self.steps = steps
         self.device: str | None = None
         self.made = 0
+        self.failed = 0
         self.cond = threading.Condition()
         self.repaired: dict[int, FileReport] = {}
         self.closed = False
@@ -227,10 +232,14 @@ class Enhancer:
         return self.stop is not None and self.stop.is_set()
 
     def _run(self) -> None:
-        try:
-            self._work()
-        except Exception as e:  # the repairs must not suffer from this
-            self.say(f"Enhanced copies stopped: {type(e).__name__}: {e}")
+        for _attempt in range(RESTARTS + 1):
+            try:
+                self._work()
+                return
+            except Exception as e:  # the repairs must not suffer from this; the copies go on
+                errlog.log_error(self.out, "making the enhanced copies", e)
+                self.say(f"Enhanced copies: an error, written to {errlog.LOG_NAME}; going on with the next photo")
+        self.say(f"Enhanced copies stopped after repeated errors (see {errlog.LOG_NAME})")
 
     def _work(self) -> None:
         from ..runner import is_lost
@@ -254,9 +263,9 @@ class Enhancer:
         if in_hand:
             engine = engine or Engine()
         whole_picture = bool({"deblock", "faces"} & set(steps))
-        photos = _Photos(self.out)
-        seen: set[int] = set()
-        pending: list[int] = []
+        if not hasattr(self, "_state"):  # kept when the work starts again after an error
+            self._state = (_Photos(self.out), set(), [])
+        photos, seen, pending = self._state
         while True:
             with self.cond:
                 while True:
@@ -283,7 +292,7 @@ class Enhancer:
                         return
                     self.cond.wait(0.5)
             if not in_hand:  # loading overlaps with the repairs still running
-                engine = engine_for(nets, self.say, self.stop, self.half)
+                engine = engine_for(nets, self.say, self.stop, self.half, self.out)
                 if self._stopped():
                     return
                 if engine is None:
@@ -346,8 +355,13 @@ class Enhancer:
         except Stopped:
             return
         except Exception as e:  # one photo must not stop the rest
-            self.say(f"Enhanced copy of {rep.name} failed: {type(e).__name__}: {e}")
+            errlog.log_error(self.out, f"enhanced copy of {rep.name} ({', '.join(steps)})", e)
+            self.failed += 1
+            self.say(f"Enhanced copy of {rep.name} failed ({type(e).__name__}); details in {errlog.LOG_NAME}")
             return
+        finally:
+            while engine.notes:  # e.g. a network the graphics card failed on, moved to the processor
+                self.say(engine.notes.pop(0))
         if not done:
             return
         out_name = enhanced_name(rep.output_name)

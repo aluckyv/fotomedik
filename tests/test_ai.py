@@ -104,3 +104,46 @@ def test_block_means_are_kept_in_known_holes():
     m = lambda a: a[24:40, 24:40].astype(float).reshape(2, 8, 2, 8, 3).mean(axis=(1, 3))  # noqa: E731
     assert np.abs(m(fixed) - m(ref)).max() < 4
     assert np.array_equal(fixed[~holes], out[~holes])
+
+
+def test_lama_failing_on_the_graphics_card_moves_to_the_processor(monkeypatch, tmp_path):
+    """DirectML can load LaMa and then fail while running it: the processor takes over."""
+    import onnxruntime as ort
+
+    class GpuLama(FakeLama):
+        def get_providers(self):
+            return ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+        def run(self, _out, feed):
+            raise RuntimeError("Non-zero status code returned while running MatMul node. The parameter is incorrect.")
+
+    made = []
+
+    class CpuSession(FakeLama):
+        def __init__(self, path, providers=None):
+            made.append((path, providers))
+
+    monkeypatch.setattr(ort, "InferenceSession", CpuSession)
+    eng = Engine(FakeSR(), GpuLama(), "GPU (DirectML)")
+    eng.paths["LaMa (inpainting)"] = tmp_path / "lama_fp32.onnx"
+    rgb = np.zeros((512, 512, 3), np.uint8)
+    m = np.zeros((512, 512), bool)
+    m[100:200, 100:200] = True
+    out = eng.fill(rgb, m)
+    assert out[150, 150, 0] == 200 and made and made[0][1] == ["CPUExecutionProvider"]
+    assert eng.devices["LaMa (inpainting)"] == "CPU" and any("processor" in n for n in eng.notes)
+    eng.fill(rgb, m)  # stays on the processor
+    assert len(made) == 1
+
+
+def test_errors_go_to_a_file_in_the_output_folder(tmp_path):
+    from fotomedik import errlog
+
+    errlog.start(tmp_path)
+    try:
+        raise ValueError("boom")
+    except ValueError as e:
+        errlog.log_error(tmp_path, "enhanced copy of x.jpg", e)
+    text = (tmp_path / errlog.LOG_NAME).read_text(encoding="utf-8")
+    assert "enhanced copy of x.jpg" in text and "ValueError: boom" in text and "Traceback" in text
+    assert errlog.count(tmp_path) == 1

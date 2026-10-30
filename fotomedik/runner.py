@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .cli import IMAGE_SUFFIXES, Workers, _counted, _learn_candidates, _repair_file
+from . import errlog
 from .report.report import FileReport
 
 
@@ -51,6 +52,36 @@ def verdict(rep: FileReport, has_output: bool = True) -> str:
     if pct is not None and pct >= MOSTLY_LOST_PCT:
         return "Partly recovered"
     return "Mostly lost"
+
+
+def summary_text(results: list, total: int, secs: float, err: str = "", out: Path | None = None,
+                 enhanced: bool = False, errors: int = 0) -> str:
+    """What the window at the end of a run says: how the photos came out, how long it
+    took, and where the errors (if any) were written."""
+    verdicts = [verdict(r.report, r.output is not None) for r in results]
+    pcts = [r.report.recovered_pct for r in results if r.report.recovered_pct is not None]
+    m, s = divmod(int(round(secs)), 60)
+    lines = []
+    if err:
+        lines += [f"The run stopped early: {err}", ""]
+    lines += [f"Photos: {len(results)} of {total}",
+              f"  healthy or repaired: {sum(v in ('Healthy', 'Repaired') for v in verdicts)}",
+              f"  partly recovered: {verdicts.count('Partly recovered')}",
+              f"  mostly or wholly lost: {sum(v in LOST for v in verdicts)}"]
+    if pcts:
+        lines.append(f"Recovered on average: {sum(pcts) / len(pcts):.0f} %")
+    if enhanced:
+        lines.append(f"Enhanced copies made: {sum(1 for r in results if r.ai_output)}")
+    lines.append(f"Time: {m} min {s} s" if m else f"Time: {s} s")
+    if errors:
+        from .errlog import log_path
+
+        lines.append(f"Errors: {errors} (the photo or step with an error was skipped, the rest went on)")
+        if out is not None:
+            lines.append(f"Details: {log_path(out)}")
+    if out is not None:
+        lines.append(f"Saved to: {out}")
+    return "\n".join(lines)
 
 
 def is_lost(rep: FileReport) -> bool:
@@ -182,6 +213,7 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
     their progress; options["quality"] is the diffusion preset, options["prompt"] what the
     scene shows); options["ai"] means ["ai"]."""
     out.mkdir(parents=True, exist_ok=True)
+    errlog.start(out)
     for p in paths:
         if p.is_dir() and p.resolve() == out.resolve():
             raise ValueError("the output folder must differ from the input folder")
@@ -225,6 +257,7 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
 
         def failed(i, err: Exception) -> tuple[FileReport, float]:
             src = items[i][0]
+            errlog.log_error(out, f"repairing {src}", err)
             rep = FileReport(src.name, None, src.stat().st_size, 0, None,
                              findings=[{"kind": "internal_error", "severity": "high", "offset": None,
                                         "detail": f"{type(err).__name__}: {err}"}])

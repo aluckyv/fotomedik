@@ -132,6 +132,7 @@ class Engine:
         self.notes: list[str] = []
         self.loaded: set[str] = set()
         self.sr_batch = 1
+        self.paths: dict[str, object] = {}  # model name -> its file (for a fallback to the processor)
 
     @classmethod
     def load(cls, progress=None, stop=None, steps=("ai",), half: bool = True, say=None) -> "Engine":
@@ -171,6 +172,7 @@ class Engine:
 
         def session(model):
             path = models.ensure(model, progress, stop)
+            self.paths[model.name] = path
             if half and gpu:
                 from . import half as H
 
@@ -235,6 +237,25 @@ class Engine:
             out.extend(np.clip(yi.transpose(1, 2, 0), 0, 1) for yi in y)
         return out
 
+    def _on_processor(self, name: str, current):
+        """A processor-only session of model `name`, or None when `current` already runs
+        there (or the model's file is not known)."""
+        prov = current.get_providers()[0] if hasattr(current, "get_providers") else "CPUExecutionProvider"
+        path = self.paths.get(name)
+        if prov == "CPUExecutionProvider" or path is None:
+            return None
+        import onnxruntime as ort
+
+        from . import models
+
+        p = path
+        if "fp16" in str(p).lower():  # the half-precision copy: go back to the original
+            p = models.model_dir() / next(m.file for m in models.ALL if m.name == name)
+        s = ort.InferenceSession(str(p), providers=["CPUExecutionProvider"])
+        self.devices[name] = "CPU"
+        self.notes.append(f"{name} runs on the processor: the graphics card failed while running it")
+        return s
+
     def fill(self, rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """uint8 (512, 512, 3) and bool (512, 512) -> uint8 (512, 512, 3), masked part filled."""
         ins = self.inpaint_s.get_inputs()
@@ -243,7 +264,17 @@ class Engine:
             img_name, mask_name = mask_name, img_name
         img = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
         m = mask.astype(np.float32)[None, None]
-        out = self.inpaint_s.run(None, {img_name: np.ascontiguousarray(img), mask_name: np.ascontiguousarray(m)})[0][0]
+        feeds = {img_name: np.ascontiguousarray(img), mask_name: np.ascontiguousarray(m)}
+        try:
+            out = self.inpaint_s.run(None, feeds)[0][0]
+        except Exception:
+            # some graphics cards load LaMa but fail while running it (DirectML: "The parameter
+            # is incorrect" in its Fourier layers): the processor takes over for good
+            cpu = self._on_processor("LaMa (inpainting)", self.inpaint_s)
+            if cpu is None:
+                raise
+            self.inpaint_s = cpu
+            out = cpu.run(None, feeds)[0][0]
         out = out.transpose(1, 2, 0)
         if out.max() <= 1.5:  # some exports give 0..1
             out = out * 255.0
