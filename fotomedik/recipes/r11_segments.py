@@ -15,6 +15,19 @@ and is placed where it fits clearly best. Later blocks of a chain must continue
 where the previous one ended (a desync inside the chain shows up as a block that
 fits nowhere and is left out). Placed runs become pieces that R9 splices
 bit-exactly, like the tails of R10.
+
+Without any reference (no thumbnail, nothing clean nearby - a photo whose header was
+rebuilt and whose first rows are the only clean ones) a long chain can still tell its
+own horizontal position: laid out from the wrong column, the end of every picture row
+lands beside the start of the next one, and the pixels across that seam do not match,
+while every other MCU boundary in the chain is a real one (Two-ACIR, CVPR 2023, does
+the same with its row alignment). The chain is decoded on its own, the pixel
+disagreement across each MCU boundary (see seam_phase) is averaged per column phase,
+and the phase that stands out clearly is the seam. On healthy photos cut into chains
+of 2 to 9 rows this places 87 to 98 percent of them in the right column and none in
+a wrong one; a star field or a black background can fool it (a few percent wrong). The row comes from the byte position (lost bytes are
+counted in MCUs at the rate of the neighbouring chains) and the DC offset from R9, as
+for every piece.
 """
 
 from __future__ import annotations
@@ -41,6 +54,9 @@ MIN_WINDOW = 48
 MAX_WINDOW = 3000
 SHIFT = 6  # MCUs a block may move against its predecessor (a lost or extra MCU after a flipped bit)
 SHORT = 10  # with restart markers the search stays inside one interval: chains this short are placed too
+BLIND_ROWS = 2.0  # rows of MCUs a chain must span to tell its own column (no reference)
+BLIND_LONG_ROWS = 6.0  # ... from here on the seam is clear enough at a smaller lead
+BLIND_LEAD, BLIND_LEAD_SHORT = 2.0, 2.5  # standard deviations the seam must lead the runner-up by
 
 
 def damage_points(data: bytes, lo: int, hi: int) -> np.ndarray:
@@ -81,6 +97,169 @@ def chains(data: bytes, pk: K.Packed, a: int, c: int, min_len: int = BLOCK) -> l
     return out
 
 
+def chain_pixels(data: bytes, parse, ft, pk: K.Packed, start_bit: int, end_bit: int,
+                 dc_rel: np.ndarray) -> np.ndarray | None:
+    """YCbCr pixels (float32, the frame's size) of a chain decoded on its own: laid out
+    from MCU 1, after a flat MCU whose DC puts the chain's values near mid-gray (its
+    DC chain is relative to an unknown predictor)."""
+    import io
+
+    from PIL import Image, ImageFile
+
+    from ..jpeg.encoder import BitWriter, encode_flat_mcus
+    from ..jpeg.writer import assemble
+
+    comps, _per_row, _rows = D._scan_components(ft)
+    targets = {}
+    col = 0
+    for c in comps:
+        q = ft.quant[ft.frame.component(c.cid).tq].dc
+        lim = (1024 + q) // q - 1
+        med = float(np.median(dc_rel[:, col : col + c.h * c.v]))
+        targets[c.cid] = int(np.clip(round(-med), -lim, lim))
+        col += c.h * c.v
+    w = BitWriter()
+    encode_flat_mcus(ft, 1, targets, {c.cid: 0 for c in comps}, writer=w)
+    w.copy_bits(data, start_bit, end_bit)
+    blob = assemble(data[: parse.scan_start], w.finish())
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        im = Image.open(io.BytesIO(blob))
+        im.draft("YCbCr", im.size)
+        im = im.convert("YCbCr") if im.mode != "YCbCr" else im
+        return np.asarray(im, dtype=np.float32)
+    except Exception:
+        return None
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = False
+
+
+def _local_norm(d: np.ndarray, radius: int = 8) -> np.ndarray:
+    """Every boundary's difference relative to the median of its neighbours along the
+    chain (the boundary itself left out): a seam in flat sky stands out as much as one
+    between textured walls."""
+    n = len(d)
+    pad = np.pad(d, radius, mode="edge")
+    win = np.lib.stride_tricks.sliding_window_view(pad, 2 * radius + 1)[:n]
+    neigh = np.concatenate([win[:, :radius], win[:, radius + 1 :]], axis=1)
+    return d / np.maximum(np.median(neigh, axis=1), 0.5)
+
+
+def seam_phase(ycc: np.ndarray, n: int, per_row: int, mw: int, mh: int, first: int = 1) -> tuple[int, float]:
+    """For a chain of n MCUs laid out from image MCU `first`: the phase (chain index mod
+    per_row) of the boundary between consecutive chain MCUs where the pixels disagree
+    most, and how clearly it stands out (its lead over the runner-up in standard
+    deviations of all other phases). Four measures of a boundary are averaged per phase,
+    each normalised to its largest phase mean and added: the mean absolute pixel
+    difference across it, the same relative to the neighbouring boundaries, its excess
+    over the gradients just inside either side (a seam jumps where the texture does
+    not), and the share of pixel rows with such a clear jump. ycc: the layout."""
+    H, W = ycc.shape[:2]
+    rows = -(-H // mh)
+    total = rows * per_row
+    img = np.pad(ycc, ((0, rows * mh - H), (0, per_row * mw - W), (0, 0)), mode="edge")
+    grid = img.reshape(rows, mh, per_row, mw, 3)
+
+    def column(i):
+        return grid[:, :, :, i, :].transpose(0, 2, 1, 3).reshape(total, mh, 3)
+
+    last = min(first + n, total)  # chain MCUs at image indices first .. last-1
+    a, b = slice(first, last - 1), slice(first + 1, last)  # boundary k | k+1 of the chain
+    l0, l1, r0, r1 = column(0), column(1), column(-1), column(-2)
+    plain = np.abs(r0[a] - l0[b])
+    inner = 0.5 * (np.abs(r0[a] - r1[a]) + np.abs(l0[b] - l1[b]))
+    excess = np.maximum(0.0, plain - inner)
+
+    def weigh(d):
+        return d[..., 0].mean(1) + 0.5 * d[..., 1:].mean((1, 2))
+
+    score = weigh(plain)
+    measures = (score, np.minimum(_local_norm(score), 10.0), weigh(excess),
+                (plain[..., 0] > 2.0 * inner[..., 0] + 4.0).mean(1))
+    phase = np.arange(len(score)) % per_row
+    cnt = np.bincount(phase, minlength=per_row)
+    have = cnt >= 1
+    combined = np.full(per_row, -np.inf)
+    combined[have] = 0.0
+    for v in measures:
+        mean = np.bincount(phase, weights=v, minlength=per_row) / np.maximum(cnt, 1)
+        combined[have] += mean[have] / max(float(mean[have].max()), 1e-6)
+    j = int(np.argmax(combined))
+    rest = np.sort(combined[have])[:-1]
+    if len(rest) < 3:
+        return j, 0.0
+    lead = (float(combined[j]) - float(rest[-1])) / max(float(np.std(rest)), 1e-6)
+    return j, lead
+
+
+def blind_offset(data: bytes, parse, ft, pk: K.Packed, start_bit: int, end_bit: int, dc_rel: np.ndarray,
+                 per_row: int) -> list[tuple[int, int, int]]:
+    """(chain index, column the piece starts at, MCUs) of the pieces of a chain placed by
+    its own seam: the whole chain when its seam is clear and its halves agree; the halves
+    on their own when each is sure of a different column (the decoder desynced inside);
+    nothing when the seam does not stand out or the chain is too short."""
+    n = len(dc_rel)
+    span = n / per_row
+    if span < BLIND_ROWS:
+        return []
+    ycc = chain_pixels(data, parse, ft, pk, start_bit, end_bit, dc_rel)
+    if ycc is None:
+        return []
+    fr = ft.frame
+    mw, mh = fr.mcu_width, fr.mcu_height
+
+    def column_of(k0: int, count: int) -> int | None:
+        """Column where chain MCU k0 sits, from the seam of chain MCUs k0 .. k0+count-1."""
+        j, lead = seam_phase(ycc, count, per_row, mw, mh, k0 + 1)
+        if lead < (BLIND_LEAD if count >= BLIND_LONG_ROWS * per_row else BLIND_LEAD_SHORT):
+            return None
+        return (per_row - 1 - j) % per_row  # the phase counts from k0
+
+    if span >= 2 * BLIND_ROWS:
+        half = n // 2
+        a, b = column_of(0, half), column_of(half, n - half)
+        if a is not None and b is not None and (a + half) % per_row != b:
+            return [(0, a, half), (half, b, n - half)]
+    whole = column_of(0, n)
+    return [(0, whole, n)] if whole is not None else []
+
+
+def dc_in_range(dc_rel: np.ndarray, lim: np.ndarray) -> bool:
+    """Whether the relative DC values of a piece (n, blocks per MCU) can be offset into
+    the legal range of every block column (a desynced stretch drifts out of it)."""
+    if not len(dc_rel):
+        return True
+    span = dc_rel.max(axis=0) - dc_rel.min(axis=0)
+    return bool((span <= 2 * lim).all())
+
+
+def extend_blocks(blocks: list[tuple[int, int, int]], n: int, per_row: int) -> list[tuple[int, int, int]]:
+    """Blocks placed by the reference (chain index, MCU index, count) stretched over the
+    rest of the chain: a chain is one run of MCUs, so the blocks between two placed ones
+    that agree on the chain's offset (MCU index minus chain index) belong at that
+    offset too - they only fitted the reference nowhere clearly (flat sky). Where the
+    offset changes (a desync inside the chain, or MCUs lost), the gap is split halfway."""
+    if not blocks:
+        return []
+    runs: list[list[int]] = []  # [chain start, chain end, offset]
+    for k, m, c in sorted(blocks):
+        off = m - k
+        if runs and runs[-1][2] == off and runs[-1][1] == k:
+            runs[-1][1] = k + c
+        else:
+            runs.append([k, k + c, off])
+    out = []
+    for i, (ka, kb, off) in enumerate(runs):
+        lo = 0 if i == 0 else (runs[i - 1][1] + ka) // 2
+        hi = n if i == len(runs) - 1 else (kb + runs[i + 1][0]) // 2
+        if i > 0 and runs[i - 1][2] == off:  # the same offset again: everything between is ours too
+            lo = ka
+        if i + 1 < len(runs) and runs[i + 1][2] == off:
+            hi = kb
+        out.append((lo, lo + off, hi - lo))
+    return out
+
+
 def _win_sum(a: np.ndarray, n: int) -> np.ndarray:
     """Sums of every window of n consecutive values."""
     cs = np.concatenate([[0.0], np.cumsum(a)])
@@ -109,6 +288,7 @@ class Placer:
         self.ref = np.stack(refs, axis=1)  # (total, blocks per MCU) gray levels, NaN unknown
         self.sig = np.stack(sigs, axis=1)
         self.q = np.array(qs)
+        self.lim = np.array([(1024 + 8 * q) // (8 * q) - 1 for q in qs], dtype=float)  # legal |DC| per block column
         self.total = total
 
     def costs(self, rel: np.ndarray, m_lo: int, m_hi: int) -> tuple[np.ndarray, int]:
@@ -218,6 +398,19 @@ def place_chain(placer: Placer, rel: np.ndarray, byte_of: np.ndarray, anchors: A
     return out
 
 
+def blind_position(expected: int, offset: int, n: int, floor: int, m_hi: int, per_row: int) -> int | None:
+    """The MCU index nearest to `expected` that starts at column `offset`, with room for
+    n MCUs between floor and m_hi; None when there is none."""
+    base = expected - ((expected - offset) % per_row)  # the start at or before expected
+    cands = sorted((base, base + per_row), key=lambda m: abs(m - expected))
+    for m in cands:
+        while m < floor:
+            m += per_row
+        if m + n <= m_hi:
+            return m
+    return None
+
+
 def merge_blocks(blocks: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
     """Runs of blocks contiguous in the chain and in the image: (chain index, MCU index, count)."""
     runs: list[list[int]] = []
@@ -249,6 +442,7 @@ class SegmentPlacement(Recipe):
         """Damaged stretches to search: byte range, MCU range and anchor points (byte, MCU)."""
         dri = ft.restart_interval
         total = sr.total_mcus
+        _comps, per_row, _rows = D._scan_components(ft)
         jobs = []
         ivs = sr.intervals
         for k, iv in enumerate(ivs):
@@ -276,10 +470,10 @@ class SegmentPlacement(Recipe):
             anchors.append((b_hi, m_hi))
             if b_hi - b_lo >= (MIN_SEG // 2 if dri else MIN_SEG) and m_hi - m_lo >= (SHORT if dri else BLOCK):
                 jobs.append({"iv": iv, "b_lo": b_lo, "b_hi": b_hi, "m_lo": m_lo, "m_hi": m_hi,
-                             "anchors": sorted(anchors), "dri": dri})
+                             "anchors": sorted(anchors), "dri": dri, "per_row": per_row})
         return jobs
 
-    def _run(self, data: bytes, pk: K.Packed, placer: Placer, job: dict) -> list[dict]:
+    def _run(self, data: bytes, pk: K.Packed, placer: Placer, job: dict, parse_ft=(None, None)) -> list[dict]:
         anchors = Anchors(job["anchors"])
         pieces = []
         floor = job["m_lo"]
@@ -289,19 +483,53 @@ class SegmentPlacement(Recipe):
         # finding the parses is independent per stretch (compiled code, parallel threads);
         # placing them is sequential, every piece must come after the previous one
         found = parallel.pmap(lambda sc: chains(data, pk, sc[0], sc[1], min_len), segs)
+        per_row = job["per_row"]
+        prev = None  # (end byte, end MCU, bytes per MCU) of the last piece placed, for the blind estimate
         for (a, c), seg_chains in zip(segs, found):
             for bits in seg_chains:
                 if len(bits) < min_len:
                     continue
                 preds = np.zeros(pk.ncomp, dtype=np.int32)
                 s = int(bits[0])
-                dn, _err, *_r, dc = K.decode_mcus(data, s // 8, s % 8, c, pk, preds, len(bits), check_dc=False)
+                dn, _err, *_r, end_b, end_bit, _bs, dc = K.decode_mcus(data, s // 8, s % 8, c, pk, preds, len(bits),
+                                                                       check_dc=False)
                 rel = dc[:dn].astype(float) * placer.q[None, :]
                 blocks = place_chain(placer, rel, bits[:dn] / 8.0, anchors, floor, job["m_hi"], min_len,
                                      ACCEPT_ROW if job["dri"] else ACCEPT)
+                if not job["dri"]:
+                    if blocks:
+                        # the reference placed parts of the chain: the rest goes with them,
+                        # unless the DC runs away in it (a desync: the stretched piece would be lost whole)
+                        ext = [(k, m, c) for k, m, c in extend_blocks(blocks, dn, per_row)
+                               if m >= floor and m + c <= job["m_hi"]]
+                        if all(dc_in_range(dc[k : k + c], placer.lim) for k, _m, c in ext):
+                            blocks = ext
+                    elif dn >= BLIND_ROWS * per_row:
+                        # the reference said nothing: the chain's own seam
+                        pieces_b = blind_offset(data, parse_ft[0], parse_ft[1], pk, s, end_b * 8 + end_bit, dc[:dn], per_row)
+                        bytes_here = (end_b * 8 + end_bit - s) / 8.0
+                        start_e = None
+                        for k0, o, count in pieces_b:
+                            if not dc_in_range(dc[k0 : k0 + count], placer.lim):
+                                continue
+                            if start_e is None:
+                                if prev is not None:
+                                    rate = (prev[2] + bytes_here / dn) / 2.0  # bytes per MCU around the gap
+                                    start_e = int(round(prev[1] + max(0.0, s / 8.0 - prev[0]) / max(rate, 1e-6)))
+                                else:
+                                    start_e = anchors.expect(s / 8.0)[0]
+                            m = blind_position(start_e + k0, o, count, floor, job["m_hi"], per_row)
+                            if m is not None:
+                                blocks.append((k0, m, count))
+                                anchors.add(float(bits[k0]) / 8.0, m)
+                                floor = m + count
+                                start_e = m - k0  # the rest of the chain follows
                 for k, m, n in merge_blocks(blocks):
                     pieces.append({"chain_bits": bits, "k": k, "m": m, "n": n, "end": c})
                     floor = max(floor, m + n)
+                if blocks:
+                    k, m, n = blocks[-1]
+                    prev = ((end_b * 8 + end_bit) / 8.0, m + n, (end_b * 8 + end_bit - s) / 8.0 / max(dn, 1))
         return pieces
 
     def fix(self, ctx: Context, got) -> None:
@@ -321,7 +549,7 @@ class SegmentPlacement(Recipe):
         jobs = self._jobs(sr, parse, ft, tails)
         if not jobs:
             return
-        found = parallel.pmap(lambda jb: self._run(data, pk, placer, jb), jobs)
+        found = parallel.pmap(lambda jb: self._run(data, pk, placer, jb, (parse, ft)), jobs)
         dri = ft.restart_interval
         out: dict[int, list[dict]] = {}
         placed = 0

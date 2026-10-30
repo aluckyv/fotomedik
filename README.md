@@ -78,6 +78,7 @@ pa se tek onda meri.
 | R6 | tuđ sadržaj na kraju fajla | odsecanje + EOI |
 | R5 | izvrnuti bitovi u podacima slike | pogađanje bita dekodovanjem do restart markera |
 | R9 | nepopravljivi intervali | popunjavanje bojom suseda, fajl se otvara ceo |
+| R11 | netaknuti komadi usred oštećenja, bez ikakve reference | komad sam kaže kolonu: pogrešno složen, kraj svakog reda slike pada uz početak sledećeg i pikseli se tu ne slažu (šav) |
 | R14 | dekodirano smeće (šare, kockice, crno-bele mrlje) | spektar luma i hroma bloka + zasićenje, mereno prema statistici same slike; smeće postaje rupa i popunjava se nanovo |
 | R8 | ništa od slike | ugrađeni Exif thumbnail |
 

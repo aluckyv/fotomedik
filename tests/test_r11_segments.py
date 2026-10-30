@@ -61,3 +61,31 @@ def test_stretch_after_damage_without_restart_markers_is_placed():
     err = np.abs(got - want).mean(axis=2)
     placed_rows = [r for r in range(0, 384, 16) if err[r : r + 16].mean() < 3]
     assert len(placed_rows) >= 10
+
+
+def test_stretch_is_placed_without_any_reference():
+    """No thumbnail, nothing clean next to the stretch: the chain's own seam (the end of
+    every picture row beside the start of the next) tells its column; the row comes from
+    the byte position, so it may be off by a row or two."""
+    img = make_image(512, 384)
+    healthy = make_jpeg(img)  # no thumbnail, no restart markers
+    res, ft = _scan(healthy)
+    span = res.eoi_offset - res.scan_start
+    buf = bytearray(healthy)
+    rng = np.random.default_rng(2)
+    for a in (res.scan_start + span // 4, res.scan_start + 3 * span // 4):
+        for o in range(a, a + 600):
+            if rng.random() < 0.3:
+                buf[o] ^= 1 << int(rng.integers(0, 8))
+    broken = bytes(buf)
+    base = run_pipeline(Context(data=broken, name="b.jpg"), recipes=[TailRecovery(), FillHoles()])
+    ctx = run_pipeline(Context(data=broken, name="s.jpg"), recipes=[TailRecovery(), SegmentPlacement(), FillHoles()])
+    assert ctx.recovered_fraction > base.recovered_fraction + 0.2
+    got, want = _pixels(ctx.data), _pixels(healthy)
+    mh = 16
+    # rows of the output that match a row of the original at most 3 MCU rows away: right column
+    matched = 0
+    for r in range(0, 384 - mh + 1, mh):
+        best = min(np.abs(got[r : r + mh] - want[q : q + mh]).mean() for q in range(max(0, r - 3 * mh), min(384 - mh, r + 3 * mh) + 1, mh))
+        matched += best < 4
+    assert matched >= 12, matched

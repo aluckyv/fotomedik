@@ -35,7 +35,7 @@ from .registry import register
 BACKOFF_MCUS = 3  # MCUs dropped before a detected error (silent desync margin)
 JUNK_LEVEL = 6.0  # median anomaly (in units of the reference's expected error) of a junk prefix
 MARK_YCC = (105, 212, 235)  # magenta in YCbCr
-TAIL_REF_ROUNDS = (2.0, 6.0, math.inf)  # mean reference distance (block rows) accepted per round
+TAIL_REF_ROUNDS = (2.0, 6.0, 12.0, 24.0, 48.0, math.inf)  # mean reference distance (block rows) accepted per round
 
 
 def tail_blocks(first: int, n: int, h: int, v: int, per_row: int) -> tuple[np.ndarray, np.ndarray]:
@@ -86,6 +86,40 @@ def anomaly_series(fields: dict, comps, per_row: int, qdc: dict, dc: dict, first
         a = np.where(np.isfinite(sg) & ~np.isnan(rv), a, np.nan)
         out = np.where(np.isnan(out), a, np.where(np.isnan(a), out, np.maximum(out, a)))
     return out
+
+
+NEAREST_BAND = 1.0  # block rows: the offset comes from the blocks closest to a real row, within this band
+NEAREST_MIN = 8  # ... at least this many blocks (the band widens until there are)
+
+
+def nearest_offset(rv: np.ndarray, r: np.ndarray, dv: np.ndarray, good: np.ndarray) -> float | None:
+    """DC offset of a part (median of reference minus relative value) from the blocks
+    nearest to a real row: far from one, a reference fades towards the picture's average
+    and would pull a part lying across a gradient to the wrong level."""
+    if not good.any():
+        return None
+    d = np.where(good, dv, np.inf)
+    lo = float(d.min())
+    band = NEAREST_BAND
+    while True:
+        sel = good & (dv <= lo + band)
+        if sel.sum() >= NEAREST_MIN or sel.sum() == good.sum():
+            break
+        band *= 2
+    return shorth(rv[sel] - r[sel])
+
+
+def shorth(x: np.ndarray) -> float:
+    """Midpoint of the shortest interval holding half the values: the level most of them
+    agree on, however scattered the rest (an edge or a line crossing the row)."""
+    x = np.sort(np.asarray(x, dtype=float))
+    n = len(x)
+    if n < 4:
+        return float(np.median(x))
+    h = (n + 1) // 2
+    widths = x[h - 1 :] - x[: n - h + 1]
+    i = int(np.argmin(widths))
+    return float((x[i] + x[i + h - 1]) / 2.0)
 
 
 def legal_offset(rel: np.ndarray, q: int, d: float) -> float | None:
@@ -382,7 +416,7 @@ class FillHoles(Recipe):
                     r = rel[:, col : col + h * v]
                     good = np.isfinite(dv) & ~np.isnan(rv)
                     dists.append(float(np.mean(dv[good])) if good.any() else math.inf)
-                    deltas[cid] = float(np.median(rv[good] - r[good])) if good.any() else None
+                    deltas[cid] = nearest_offset(rv, r, dv, good)
                     col += h * v
                 if max(dists) > max_dist:
                     later.append((pl, tail))
