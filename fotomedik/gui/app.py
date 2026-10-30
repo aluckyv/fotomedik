@@ -155,7 +155,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         build = updater.current_build()
-        self.setWindowTitle(f"{APP_NAME} — repair damaged photos" + (f"  (build {build})" if build else ""))
+        kind = ", CUDA (NVIDIA)" if updater.current_flavor() == "cuda" else ""
+        self.setWindowTitle(f"{APP_NAME} — repair damaged photos" + (f"  (build {build}{kind})" if build else ""))
         self.resize(1280, 820)
         self.setAcceptDrops(True)
         self.results: list[runner.Result] = []
@@ -688,8 +689,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ updates
     def _offer_update(self, upd) -> None:
         self.pending_update = upd
-        self.banner_text.setText(f"A new version of {APP_NAME} is available (build {upd.build}, "
-                                 f"you have build {updater.current_build()}).")
+        if upd.flavor == "cuda" and updater.current_flavor() != "cuda":
+            self.banner_text.setText(f"An NVIDIA graphics card was found: the {APP_NAME} version that runs the AI on it "
+                                     f"(CUDA) is available (build {upd.build}).")
+        else:
+            self.banner_text.setText(f"A new version of {APP_NAME} is available (build {upd.build}, "
+                                     f"you have build {updater.current_build()}).")
         self.banner.show()
 
     def _do_update(self) -> None:

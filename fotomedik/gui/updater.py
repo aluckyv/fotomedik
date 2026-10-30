@@ -36,10 +36,15 @@ class Update:
     commit: str
     exe_url: str
     size: int
+    flavor: str = ""  # "cuda": the build for NVIDIA graphics cards
 
 
 def current_build() -> int:
     return BUILD
+
+
+def current_flavor() -> str:
+    return getattr(_build, "FLAVOR", "")
 
 
 def current_commit() -> str:
@@ -82,7 +87,7 @@ def check() -> Update | None:
     if build < BUILD or (build == BUILD and flavor == getattr(_build, "FLAVOR", "")):
         return None
     exe = assets[name]
-    return Update(build, str(info.get("commit", "")), exe["url"], int(exe.get("size", 0)))
+    return Update(build, str(info.get("commit", "")), exe["url"], int(exe.get("size", 0)), flavor)
 
 
 def download(upd: Update, dest: Path, progress=None, cancelled=None) -> None:
