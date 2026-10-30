@@ -1,3 +1,4 @@
+import pytest
 """AI copy with stand-in networks (the real models are tested in CI, see test_ai_models)."""
 
 import io
@@ -108,7 +109,7 @@ def test_block_means_are_kept_in_known_holes():
 
 def test_lama_failing_on_the_graphics_card_moves_to_the_processor(monkeypatch, tmp_path):
     """DirectML can load LaMa and then fail while running it: the processor takes over."""
-    import onnxruntime as ort
+    ort = pytest.importorskip("onnxruntime")
 
     class GpuLama(FakeLama):
         def get_providers(self):
