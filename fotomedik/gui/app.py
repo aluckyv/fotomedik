@@ -142,7 +142,7 @@ class UpdateChecker(QObject):
     def start(self) -> None:
         def work():
             try:
-                upd = updater.check()
+                upd = updater.check_any()
             except Exception:
                 upd = None  # offline or not reachable: no update offered
             if upd is not None:
@@ -689,7 +689,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ updates
     def _offer_update(self, upd) -> None:
         self.pending_update = upd
-        if upd.flavor == "cuda" and updater.current_flavor() != "cuda":
+        if upd.flavor == "folder":
+            self.banner_text.setText(f"A new version of {APP_NAME} is available (build {upd.build}, "
+                                     f"you have build {updater.current_build()}).")
+        elif upd.flavor == "cuda" and updater.current_flavor() != "cuda":
             self.banner_text.setText(f"An NVIDIA graphics card was found: the {APP_NAME} version that runs the AI on it "
                                      f"(CUDA) is available (build {upd.build}).")
         else:
@@ -703,6 +706,9 @@ class MainWindow(QMainWindow):
             return
         if self.worker is not None and self.thread is not None and self.thread.isRunning():
             QMessageBox.information(self, APP_NAME, "Wait until the repair finishes, then update.")
+            return
+        if upd.flavor == "folder":
+            self._update_folder(upd)
             return
         new_exe = Path(sys.executable).with_name("FotoMedik.new.exe")
         dlg = QProgressDialog("Downloading the new version…", "Cancel", 0, 100, self)
@@ -718,6 +724,38 @@ class MainWindow(QMainWindow):
             updater.download(upd, new_exe, progress, cancelled=dlg.wasCanceled)
             dlg.close()
             updater.install_and_restart(new_exe)
+        except InterruptedError:
+            dlg.close()
+            return
+        except Exception as e:
+            dlg.close()
+            QMessageBox.warning(self, APP_NAME, f"The update did not work: {e}")
+            return
+        QApplication.quit()
+
+    def _update_folder(self, upd) -> None:
+        """The installed folder app: download the changed parts next to the running ones,
+        then let the launcher swap them in and start the new version."""
+        from .. import install
+
+        dlg = QProgressDialog("Downloading the new version…", "Cancel", 0, 1000, self)
+        dlg.setWindowTitle(APP_NAME)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        def progress(done, total, name):
+            dlg.setLabelText(f"Downloading the new version ({name}, {done >> 20} MB)…")
+            dlg.setValue(int(1000 * done / total) if total else 0)
+            QApplication.processEvents()
+
+        try:
+            install.stage(upd.release, progress, cancelled=dlg.wasCanceled)
+            dlg.close()
+            launcher = Path(os.environ.get("FOTOMEDIK_LAUNCHER") or install.launcher_path())
+            flags = 0
+            if sys.platform == "win32":
+                flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            subprocess.Popen([str(launcher)], creationflags=flags, close_fds=True, env=updater.fresh_env())
         except InterruptedError:
             dlg.close()
             return

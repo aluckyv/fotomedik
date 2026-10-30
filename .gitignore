@@ -15,3 +15,4 @@ fotomedik/jpeg/_fastdec.dll
 fotomedik/jpeg/_fastdec.dylib
 fotomedik/jpeg/*.obj
 samples_rest/
+base_manifest.txt

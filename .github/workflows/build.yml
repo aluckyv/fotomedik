@@ -65,6 +65,9 @@ jobs:
           path: fotomedik/jpeg/_fastdec.dll
 
   app-windows:
+    # the folder app (see fotomedik/install.py): a small launcher FotoMedik.exe, the base
+    # (Python, Qt, numpy... - fotomedik-base.zip) and the code (fotomedik-code.zip); the AI
+    # runtime for the computer's graphics card is downloaded by the app (fotomedik.ai.runtime)
     runs-on: windows-latest
     permissions:
       contents: write
@@ -73,7 +76,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e . pyside6 pyinstaller onnxruntime-directml onnx packaging opencv-python-headless
+      - run: pip install -e . pyside6 pyinstaller onnx packaging opencv-python-headless
       - name: build _fastdec.dll
         run: python build_fastdec.py
       - name: demo photos
@@ -90,46 +93,69 @@ jobs:
       - name: stamp the build number
         shell: pwsh
         run: |
-          "BUILD = ${{ github.run_number }}`nCOMMIT = `"${{ github.sha }}`"`n" | Set-Content -Encoding utf8 fotomedik/_build.py
-          "{`"build`": ${{ github.run_number }}, `"commit`": `"${{ github.sha }}`"}" | Set-Content -Encoding utf8 version.json
-      - name: package FotoMedik.exe
+          "BUILD = ${{ github.run_number }}`nCOMMIT = `"${{ github.sha }}`"`nFLAVOR = `"folder`"`n" | Set-Content -Encoding utf8 fotomedik/_build.py
+      - name: build the base (app\base)
+        run: pyinstaller --noconfirm fotomedik.spec
+      - name: build the launcher (FotoMedik.exe)
         run: >
-          pyinstaller --noconfirm --onefile --windowed --name FotoMedik
-          --add-binary "fotomedik/jpeg/_fastdec.dll;fotomedik/jpeg"
-          --hidden-import onnxruntime --collect-binaries onnxruntime
-          --hidden-import onnxruntime.transformers.float16 --hidden-import onnx
-          --exclude-module tkinter --exclude-module pytest
-          fotomedik_app.py
-      - name: smoke test of the packaged app
+          pyinstaller --noconfirm --onefile --windowed --name FotoMedik --distpath dist_launcher
+          --workpath build_launcher --exclude-module PySide6 --exclude-module numpy --exclude-module PIL
+          --exclude-module cv2 --exclude-module onnx --exclude-module onnxruntime launcher.py
+      - name: pack the release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force assets, code_stage | Out-Null
+          Compress-Archive -Path dist\FotoMedik\* -DestinationPath assets\fotomedik-base.zip -Force
+          Copy-Item -Recurse fotomedik code_stage\fotomedik
+          Get-ChildItem code_stage -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+          Compress-Archive -Path code_stage\fotomedik -DestinationPath assets\fotomedik-code.zip -Force
+          Copy-Item dist_launcher\FotoMedik.exe assets\FotoMedik.exe
+          $freeze = (pip freeze | Where-Object { $_ -notmatch '^-e |fotomedik' }) -join "`n"
+          $id_text = (python --version) + "`n" + $freeze + "`n" + (Get-Content -Raw base_manifest.txt) + (Get-Content -Raw fotomedik.spec) + (Get-Content -Raw fotomedik_app.py)
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          $base_id = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($id_text)))).Replace("-","").ToLower()
+          $info = [ordered]@{ build = ${{ github.run_number }}; commit = "${{ github.sha }}"; base_id = $base_id;
+                              base_sha256 = (Get-FileHash assets\fotomedik-base.zip -Algorithm SHA256).Hash.ToLower();
+                              code_sha256 = (Get-FileHash assets\fotomedik-code.zip -Algorithm SHA256).Hash.ToLower() }
+          $info | ConvertTo-Json | Set-Content -Encoding utf8 assets\version.json
+          Get-ChildItem assets | ForEach-Object { Write-Host "::notice title=release file::$($_.Name) $([math]::Round($_.Length / 1MB, 1)) MB" }
+      - name: smoke test through the launcher (installs from the release files)
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
+          FOTOMEDIK_HOME: ${{ github.workspace }}\inst
+          FOTOMEDIK_ASSETS: ${{ github.workspace }}\assets
+          FOTOMEDIK_NO_WINDOW: "1"
         run: |
-          $p = Start-Process -FilePath dist\FotoMedik.exe -ArgumentList "--smoke","demo","demo_out_exe","shot_exe.png" -PassThru -Wait
+          $p = Start-Process -FilePath assets\FotoMedik.exe -ArgumentList "--smoke","demo","demo_out_exe","shot_exe.png" -PassThru -Wait
           Write-Host "exit code $($p.ExitCode)"
-          if (Test-Path shot_exe.txt) { Get-Content shot_exe.txt | ForEach-Object { Write-Host "::notice title=smoke (exe)::$_" } }
+          if (Test-Path shot_exe.txt) { Get-Content shot_exe.txt | ForEach-Object { Write-Host "::notice title=smoke (installed)::$_" } }
           if ($p.ExitCode -ne 0) { exit 1 }
+          if (!(Test-Path inst\app\base\FotoMedik.exe)) { exit 1 }
           if (!(Test-Path demo_out_exe\healthy.jpg)) { exit 1 }
       - uses: actions/cache@v4
         with:
           path: models
           key: ai-models-win-v2
-      - name: AI smoke test of the packaged app (real models)
+      - name: AI smoke test (the runtime for this computer is downloaded)
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
           FOTOMEDIK_MODELS: ${{ github.workspace }}\models
+          FOTOMEDIK_HOME: ${{ github.workspace }}\inst
+          FOTOMEDIK_ASSETS: ${{ github.workspace }}\assets
+          FOTOMEDIK_NO_WINDOW: "1"
         run: |
-          $p = Start-Process -FilePath dist\FotoMedik.exe -ArgumentList "--smoke-ai","demo","demo_out_ai","shot_ai.png" -PassThru -Wait
-          if (Test-Path shot_ai.txt) { Get-Content shot_ai.txt | Where-Object { $_ -notmatch 'Downloading .*%$' } | Select-Object -Last 9 | ForEach-Object { Write-Host "::notice title=smoke (AI)::$_" } }
+          $p = Start-Process -FilePath assets\FotoMedik.exe -ArgumentList "--smoke-ai","demo","demo_out_ai","shot_ai.png" -PassThru -Wait
+          if (Test-Path shot_ai.txt) { Get-Content shot_ai.txt | Where-Object { $_ -notmatch 'Downloading .*%$' } | Select-Object -Last 12 | ForEach-Object { Write-Host "::notice title=smoke (AI)::$_" } }
           Write-Host "exit code $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { exit 1 }
           if (!(Get-ChildItem demo_out_ai -Filter *_enhanced.jpg)) { exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: FotoMedik-windows
-          path: dist/FotoMedik.exe
-      - name: publish as the "app" release (stable download link)
+          path: assets/*
+      - name: publish in the "app" release
         if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
@@ -137,11 +163,13 @@ jobs:
         run: |
           gh release view app *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create app dist/FotoMedik.exe version.json --title "FotoMedik app (latest build)" --notes "Build ${{ github.run_number }}"
+            gh release create app assets/FotoMedik.exe assets/fotomedik-base.zip assets/fotomedik-code.zip assets/version.json --title "FotoMedik app (latest build)" --notes "Build ${{ github.run_number }}"
           } else {
-            gh release upload app dist/FotoMedik.exe version.json --clobber
-            gh release edit app --notes "Build ${{ github.run_number }} from commit ${{ github.sha }}. Download FotoMedik.exe and run it; it updates itself afterwards."
+            gh release upload app assets/FotoMedik.exe assets/fotomedik-base.zip assets/fotomedik-code.zip assets/version.json --clobber
+            gh release edit app --notes "Build ${{ github.run_number }} from commit ${{ github.sha }}. Download FotoMedik.exe and run it: it installs the app and updates it afterwards."
           }
+          foreach ($old in @("FotoMedik-CUDA.exe", "version-cuda.json")) { gh release delete-asset app $old -y 2>$null }
+          exit 0
       - name: publish the screenshots (release "ci-preview")
         if: always() && github.ref == 'refs/heads/main'
         shell: pwsh
@@ -161,55 +189,3 @@ jobs:
             shot_*.png
             shot_*.txt
             demo_out_ai/*_enhanced.jpg
-
-  app-windows-cuda:
-    # the same app for NVIDIA graphics cards: ONNX Runtime's CUDA build; the CUDA
-    # libraries are found on the user's computer or downloaded there (fotomedik.ai.cuda)
-    runs-on: windows-latest
-    needs: app-windows  # its release exists; and no CUDA exe of a build whose tests failed
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -e . pyside6 pyinstaller "onnxruntime-gpu==1.22.0" onnx packaging opencv-python-headless
-      - name: the CUDA build of ONNX Runtime is in place
-        run: python -c "import onnxruntime as o; print(o.__version__, o.get_available_providers()); assert 'CUDAExecutionProvider' in o.get_available_providers()"
-      - name: build _fastdec.dll
-        run: python build_fastdec.py
-      - name: demo photos
-        run: python scripts/make_demo_photos.py demo
-      - name: stamp the build number
-        shell: pwsh
-        run: |
-          "BUILD = ${{ github.run_number }}`nCOMMIT = `"${{ github.sha }}`"`nFLAVOR = `"cuda`"`n" | Set-Content -Encoding utf8 fotomedik/_build.py
-          "{`"build`": ${{ github.run_number }}, `"commit`": `"${{ github.sha }}`"}" | Set-Content -Encoding utf8 version-cuda.json
-      - name: package FotoMedik-CUDA.exe
-        run: >
-          pyinstaller --noconfirm --onefile --windowed --name FotoMedik-CUDA
-          --add-binary "fotomedik/jpeg/_fastdec.dll;fotomedik/jpeg"
-          --hidden-import onnxruntime --collect-binaries onnxruntime
-          --hidden-import onnxruntime.transformers.float16 --hidden-import onnx
-          --exclude-module tkinter --exclude-module pytest
-          fotomedik_app.py
-      - name: smoke test of the packaged app (no graphics card here, the processor takes over)
-        shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          $p = Start-Process -FilePath dist\FotoMedik-CUDA.exe -ArgumentList "--smoke","demo","demo_out_exe","shot_cuda.png" -PassThru -Wait
-          Write-Host "exit code $($p.ExitCode)"
-          if (Test-Path shot_cuda.txt) { Get-Content shot_cuda.txt | ForEach-Object { Write-Host "::notice title=smoke (CUDA exe)::$_" } }
-          if ($p.ExitCode -ne 0) { exit 1 }
-      - uses: actions/upload-artifact@v4
-        with:
-          name: FotoMedik-CUDA-windows
-          path: dist/FotoMedik-CUDA.exe
-      - name: publish in the "app" release
-        if: github.ref == 'refs/heads/main'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload app dist/FotoMedik-CUDA.exe version-cuda.json --clobber

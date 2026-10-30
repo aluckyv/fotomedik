@@ -36,7 +36,8 @@ class Update:
     commit: str
     exe_url: str
     size: int
-    flavor: str = ""  # "cuda": the build for NVIDIA graphics cards
+    flavor: str = ""  # "cuda": the build for NVIDIA graphics cards; "folder": the installed folder app
+    release: object = None  # install.Release of a folder update
 
 
 def current_build() -> int:
@@ -151,3 +152,17 @@ def cleanup_old() -> None:
         old.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def check_any() -> Update | None:
+    """The update this program can take: the folder app updates part by part (see
+    fotomedik.install), a one-file build swaps its exe."""
+    from .. import install
+
+    if install.is_folder_app():
+        rel = install.Release()
+        have = install.installed()
+        if not rel.has_folder_app() or not install.needs_update(rel, have):
+            return None
+        return Update(rel.build, str(rel.info.get("commit", "")), "", 0, "folder", rel)
+    return check()

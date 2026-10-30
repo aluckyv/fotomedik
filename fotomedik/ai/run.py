@@ -67,9 +67,15 @@ def engine_for(nets, say=None, stop=None, half: bool = True, out: Path | None = 
     the run was stopped)."""
     global _ENGINE
     say = say or (lambda s: None)
+    from . import runtime
+
+    def rt_progress(done, total, what):
+        say(f"Downloading {what}: {100 * done // max(1, total)} %")
+
     try:
-        import onnxruntime  # noqa: F401
-    except Exception as e:  # not bundled / not installed
+        if runtime.load(say, rt_progress, stop) is None:
+            return None
+    except Exception as e:  # not bundled / not reachable
         errlog.log_error(out, "starting the AI (onnxruntime)", e)
         say(f"AI steps are not available here ({type(e).__name__}: {e})")
         return None
