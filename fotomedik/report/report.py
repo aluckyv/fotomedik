@@ -47,6 +47,12 @@ STRINGS = {
             "smooth_holes": "rupe izglađene (bez kockica)",
             "foreign_sectors": "izbačeni sektori koji nisu deo slike (nule, tekst, drugi fajlovi)",
             "orientation": "vraćena orijentacija (uspravna slika)",
+            "junk_blocks": "dekodirano smeće pretvoreno u rupe",
+        },
+        "reason": {
+            "damaged": "oštećeno",
+            "missing": "nedostaje (kraj fajla)",
+            "junk": "dekodirano smeće (šare, kockice)",
         },
     },
     "en": {
@@ -88,6 +94,12 @@ STRINGS = {
             "smooth_holes": "holes smoothed (no squares)",
             "foreign_sectors": "foreign sectors blanked (zeros, text, other files)",
             "orientation": "orientation restored (photo shows upright)",
+            "junk_blocks": "decoded garbage turned into holes",
+        },
+        "reason": {
+            "damaged": "damaged",
+            "missing": "missing (end of file)",
+            "junk": "decoded garbage (stripes, checkerboards)",
         },
     },
 }
@@ -174,7 +186,8 @@ class FileReport:
             lines.append(f"{s['holes']}: {len(self.holes)}")
             for h in self.holes[:20]:
                 lines.append(
-                    "  - " + s["hole_line"].format(first=h["mcu_first"], last=h["mcu_first"] + h["mcu_count"] - 1, count=h["mcu_count"], reason=h["reason"])
+                    "  - " + s["hole_line"].format(first=h["mcu_first"], last=h["mcu_first"] + h["mcu_count"] - 1, count=h["mcu_count"],
+                                                   reason=s.get("reason", {}).get(h["reason"], h["reason"]))
                 )
             if len(self.holes) > 20:
                 lines.append(f"  … +{len(self.holes) - 20}")

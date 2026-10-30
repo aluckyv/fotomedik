@@ -28,7 +28,7 @@ from ..jpeg.encoder import BitWriter, encode_flat_mcus, gray_dc
 from ..jpeg.tables import FrameTables, TableError
 from ..jpeg.writer import assemble, rst_marker
 from .base import Context, Hole, Recipe
-from .dcfield import block_mask, build_field, pull_push, thumbnail_base, vertical_reference  # noqa: F401
+from .dcfield import block_mask, build_field, interpolation_sources, pull_push, thumbnail_base, vertical_reference  # noqa: F401
 from ..reference import for_context as reference_for
 from .registry import register
 
@@ -439,23 +439,8 @@ class FillHoles(Recipe):
             trusted[covered:] = False
 
         # ---------------------------------------------------------------- interpolation sources
-        interp = {}
-        for (cid, f), (_c, h, v) in zip(fields_for(work_dc, trusted).items(), comps):
-            lim = (1024 + qdc[cid]) // qdc[cid] - 1  # stay inside the legal DC range
-            val = f.val
-            # where the thumbnail says nothing, fill from all sides (no vertical streaks)
-            guide = thumb.dc[cid] if thumb is not None else None
-            unguided = ~np.isfinite(guide) if guide is not None else np.ones_like(val, dtype=bool)
-            if unguided.any():
-                known = block_mask(trusted, work_dc[cid], h, v, mcus_per_row)
-                if known.any():
-                    # thin gaps (a row or two missing) are best bridged from the rows above
-                    # and below; the taller the gap, the more the all-sides fill takes over
-                    pp = pull_push(np.nan_to_num(work_dc[cid]), known)
-                    wv = np.where(np.isfinite(f.dist), np.exp(-np.maximum(0.0, f.dist - 2.0) / 2.0), 0.0)
-                    mixed = np.where(np.isfinite(val), wv * val + (1 - wv) * pp, pp)
-                    val = np.where(unguided & ~known, mixed, val)
-            interp[cid] = np.clip(np.nan_to_num(val, nan=0.0), -lim, lim)
+        interp = interpolation_sources(work_dc, trusted, comps, qdc, thumb, mcus_per_row)
+        ctx.memo["clean_mcus"] = clean  # for judging decoded blocks later (R14)
 
         def fill_targets(first, count, last_override=None):
             per_block: dict[int, list[int]] = {}

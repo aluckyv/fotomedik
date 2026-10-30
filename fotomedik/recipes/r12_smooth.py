@@ -219,13 +219,17 @@ def reference_coefficients(plane: np.ndarray, holes: np.ndarray, quant: np.ndarr
     return out, dc
 
 
-def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None) -> bytes | None:
+def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None, junk_mcus: np.ndarray | None = None,
+                 hole_dc: dict | None = None) -> bytes | None:
     """`data` with the given MCUs rewritten as smooth blocks, or None when the scan
     does not decode cleanly or nothing would change.
 
     reference: YCbCr picture(s) of the same scene (fotomedik.reference): the hole blocks
     then carry its pixels (aligned and calibrated against the decoded ones) instead of
-    the smooth surface; decoded MCUs are copied bit for bit either way."""
+    the smooth surface; decoded MCUs are copied bit for bit either way.
+    junk_mcus: hole MCUs whose decoded colours are garbage (r14): their block averages
+    are taken from the blocks around them before the surface is built, or from hole_dc
+    (cid -> block grid of DC values, the hole filling worked out anew without the junk)."""
     parse = M.parse_segments(data)
     try:
         ft = FrameTables.from_parse(parse)
@@ -243,11 +247,21 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None) -> bytes | 
     grids = {}
     planes = component_planes(data, ft, comps)
     hole_blocks = {}
+    dc_of = {}
     for c in comps:
         arr = sr.dc[c.cid]
         if np.isnan(arr).any():
             return None
         hole_blocks[c.cid] = block_mask(hole_mcus, arr, c.h, c.v, per_row)
+        given = hole_dc.get(c.cid) if hole_dc else None
+        if given is not None and given.shape == arr.shape:
+            arr = np.where(hole_blocks[c.cid], given, arr)
+        elif junk_mcus is not None and junk_mcus.any():
+            from .dcfield import pull_push
+
+            jb = block_mask(junk_mcus, arr, c.h, c.v, per_row)
+            arr = np.where(jb, pull_push(arr, ~jb), arr)  # garbage colours replaced by the surroundings
+        dc_of[c.cid] = arr
     planes_ok = planes is not None and all(
         planes[c.cid].shape == (sr.dc[c.cid].shape[0] * 8, sr.dc[c.cid].shape[1] * 8) for c in comps)
     ref_planes = None
@@ -262,7 +276,7 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None) -> bytes | 
         except Exception:
             ref_planes = None
     for c in comps:
-        arr = sr.dc[c.cid]
+        arr = dc_of[c.cid]
         quant = np.asarray(ft.quant[ft.frame.component(c.cid).tq].values, dtype=float)
         holes = hole_blocks[c.cid]
         dcg = np.rint(arr).astype(np.int32)
@@ -274,7 +288,7 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None) -> bytes | 
             if planes_ok:
                 bridged, good = bridge_coefficients(planes[c.cid], holes, quant)
                 ac = np.where(good[..., None], bridged, ac)
-        grids[c.cid] = (dcg, ac, np.rint(arr).astype(np.int32))
+        grids[c.cid] = (dcg, ac, np.rint(sr.dc[c.cid]).astype(np.int32))
     if not any(g[1].any() for g in grids.values()):
         return None
 
@@ -384,14 +398,18 @@ class SmoothHoles(Recipe):
         from ..reference import for_context
 
         reference = for_context(ctx, ft)
-        new = smooth_holes(ctx.data, mask, reference)
+        junk = ctx.memo.get("junk_mcus")
+        if junk is not None and len(junk) != total:
+            junk = None
+        new = smooth_holes(ctx.data, mask, reference, junk, ctx.memo.get("hole_dc") if junk is not None else None)
         if new is None:
             ctx.note(self, "holes left flat (scan did not re-encode cleanly)")
             return
         n = int(mask.sum())
+        tail = f"; {int(junk.sum())} junk MCU(s) refilled" if junk is not None and junk.any() else ""
         if reference:
             ctx.memo["reference_used"] = True
-            ctx.replace_data(new, self, f"{n} filled MCU(s) carry the reference picture's pixels", mcus=n,
+            ctx.replace_data(new, self, f"{n} filled MCU(s) carry the reference picture's pixels{tail}", mcus=n,
                              reference=str(ctx.options.get("reference")))
         else:
-            ctx.replace_data(new, self, f"smoothed {n} filled MCU(s) (soft surface instead of flat squares)", mcus=n)
+            ctx.replace_data(new, self, f"smoothed {n} filled MCU(s) (soft surface instead of flat squares){tail}", mcus=n)

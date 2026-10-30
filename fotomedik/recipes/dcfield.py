@@ -185,6 +185,32 @@ def build_field(arr: np.ndarray, okm: np.ndarray, q: int, base: np.ndarray | Non
     return Field(val, dist, sigma)
 
 
+def interpolation_sources(work_dc: dict, trusted: np.ndarray, comps, qdc: dict, thumb: ThumbBase | None,
+                          per_row: int) -> dict:
+    """Per component (cid -> block grid): the DC every block probably has, in quantised
+    units within the legal range. Trusted blocks keep theirs; the others follow the
+    thumbnail (or the reference picture) corrected by the real rows around them, and
+    where that says nothing, the rows above and below - bridged with an all-sides fill
+    the taller the gap, so thin gaps stay sharp and tall ones leave no vertical streaks.
+    comps: (cid, h, v) per component; trusted: per MCU."""
+    out = {}
+    for cid, h, v in comps:
+        arr = work_dc[cid]
+        known = block_mask(trusted, arr, h, v, per_row)
+        f = build_field(arr, known, qdc[cid], thumb.dc[cid] if thumb else None, thumb.sigma[cid] if thumb else None)
+        lim = (1024 + qdc[cid]) // qdc[cid] - 1
+        val = f.val
+        guide = thumb.dc[cid] if thumb is not None else None
+        unguided = ~np.isfinite(guide) if guide is not None else np.ones_like(val, dtype=bool)
+        if unguided.any() and known.any():
+            pp = pull_push(np.nan_to_num(arr), known)
+            wv = np.where(np.isfinite(f.dist), np.exp(-np.maximum(0.0, f.dist - 2.0) / 2.0), 0.0)
+            mixed = np.where(np.isfinite(val), wv * val + (1 - wv) * pp, pp)
+            val = np.where(unguided & ~known, mixed, val)
+        out[cid] = np.clip(np.nan_to_num(val, nan=0.0), -lim, lim)
+    return out
+
+
 def _crop_black_bars(img: np.ndarray, mask: np.ndarray | None = None):
     """Letterboxed thumbnails (16:9 photo in a 4:3 preview) carry black bars."""
     y = img[:, :, 0]

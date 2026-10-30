@@ -76,6 +76,7 @@ kopiji — greška po bloku, koliko je dekodiranog tačno, koliko su rupe daleko
 | R6 | tuđ sadržaj na kraju fajla | odsecanje + EOI |
 | R5 | izvrnuti bitovi u podacima slike | pogađanje bita dekodovanjem do restart markera |
 | R9 | nepopravljivi intervali | popunjavanje bojom suseda, fajl se otvara ceo |
+| R14 | dekodirano smeće (šare, kockice, crno-bele mrlje) | spektar luma i hroma bloka + zasićenje, mereno prema statistici same slike; smeće postaje rupa i popunjava se nanovo |
 | R8 | ništa od slike | ugrađeni Exif thumbnail |
 
 Dizajn: `docs/superpowers/specs/`, plan i rezultati: `docs/superpowers/plans/`.
