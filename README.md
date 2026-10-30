@@ -65,6 +65,8 @@ pikselima, u punoj rezoluciji), a dekodirani delovi ostaju bit-po-bit originalni
 
 **Poređenje** (`compare`, dugme „Compare with the original…"): mera popravke prema netaknutoj
 kopiji — greška po bloku, koliko je dekodiranog tačno, koliko su rupe daleko od istine, mapa greške.
+Kopija se prvo poravna glatkim poljem pomeraja (AI-restaurirane kopije „plivaju“ i po desetak piksela),
+pa se tek onda meri.
 
 ## Šta ume (recepti)
 

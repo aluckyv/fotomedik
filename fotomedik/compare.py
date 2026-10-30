@@ -3,9 +3,11 @@
 An intact copy found later (another backup, a print scan, a copy somebody edited) tells
 how good a repair really is: which "real" parts are right, which were put together
 wrongly, how far the filled holes are from the truth. Such copies are rarely the same
-file: editors re-save, resample by a pixel or two and sometimes brighten, so every row
-of blocks is compared at its best local shift and the result is a map of the error per
-MCU rather than a bit-exact test.
+file: editors re-save, resample by a pixel or two and sometimes brighten, and an
+AI-restored copy drifts by a dozen pixels here and there. So the copy is first moved
+onto the repaired picture with a smooth shift field (the one the reference-guided repair
+uses, fotomedik.reference), then every row of blocks is compared at its best remaining
+local shift, and the result is a map of the error per MCU rather than a bit-exact test.
 
 Numbers: mean absolute luma error (0..255) over the whole picture, over the trusted
 (decoded) MCUs and over the filled holes; the share of trusted MCUs that are right
@@ -24,7 +26,7 @@ from PIL import Image
 
 RIGHT = 10.0  # mean |error| of an MCU that is as it should be (JPEG noise, small shifts)
 WRONG = 20.0  # an MCU this far off is not the picture
-SHIFT_Y, SHIFT_X = 4, 2  # pixels of local misalignment tolerated (re-saved copies drift)
+SHIFT_Y, SHIFT_X = 4, 2  # pixels of local misalignment tolerated after the shift field (per row)
 UNDO_ORIENTATION = {3: Image.ROTATE_180, 6: Image.ROTATE_90, 8: Image.ROTATE_270}
 
 
@@ -37,13 +39,15 @@ class Comparison:
     err: np.ndarray  # (rows, per_row) mean |luma error| per MCU
     holes: np.ndarray | None  # (rows, per_row) bool, when a report was given
     chroma: np.ndarray = field(default=None)  # (rows, per_row) mean |chroma error|
+    drift: float = 0.0  # pixels: the largest shift the copy needed to lie on the repaired picture
 
     @property
     def trusted(self) -> np.ndarray | None:
         return None if self.holes is None else ~self.holes
 
     def summary(self) -> dict:
-        out = {"error": float(self.err.mean()), "chroma_error": float(self.chroma.mean()), "mcus": int(self.err.size)}
+        out = {"error": float(self.err.mean()), "chroma_error": float(self.chroma.mean()), "mcus": int(self.err.size),
+               "drift": round(float(self.drift), 1)}
         if self.holes is not None:
             t = self.trusted
             n = int(t.sum())
@@ -57,7 +61,8 @@ class Comparison:
 
     def format_text(self) -> str:
         s = self.summary()
-        lines = [f"Mean error: {s['error']:.1f} of 255 (colour {s['chroma_error']:.1f}) over {s['mcus']} MCUs"]
+        lines = [f"Mean error: {s['error']:.1f} of 255 (colour {s['chroma_error']:.1f}) over {s['mcus']} MCUs"
+                 + (f"; the copy drifted up to {s['drift']:.0f} px" if s["drift"] >= 1 else "")]
         if self.holes is not None and s["trusted_mcus"]:
             n = s["trusted_mcus"]
             lines.append(f"Decoded (trusted) MCUs: {n} ({n / s['mcus']:.0%}), error {s['trusted_error']:.1f}: "
@@ -130,6 +135,8 @@ def compare(repaired_path: Path, truth_path: Path, report: dict | None = None) -
     ri = Image.open(repaired_path)
     rep = np.asarray(ri.convert("YCbCr"), np.float32)
     tru = np.asarray(into_frame(Image.open(truth_path).convert("RGB"), ri).convert("YCbCr"), np.float32)
+    holes = holes_mask(report, per_row, rows) if report else None
+    tru, drift = aligned(tru, rep, holes, mw, mh)
     py, px = SHIFT_Y, SHIFT_X
     tp = np.pad(tru, ((py, py), (px, px), (0, 0)), mode="edge")
     err = np.zeros((rows, per_row), np.float32)
@@ -147,8 +154,29 @@ def compare(repaired_path: Path, truth_path: Path, report: dict | None = None) -
         d = d.reshape(y1 - y0, per_row, mw, 3).mean(axis=(0, 2))
         err[r] = d[:, 0]
         chroma[r] = d[:, 1:].mean(axis=1)
-    holes = holes_mask(report, per_row, rows) if report else None
-    return Comparison(W, H, mw, mh, err, holes, chroma)
+    return Comparison(W, H, mw, mh, err, holes, chroma, drift)
+
+
+def aligned(tru: np.ndarray, rep: np.ndarray, holes: np.ndarray | None, mw: int, mh: int) -> tuple[np.ndarray, float]:
+    """The copy moved onto the repaired picture by a smooth shift field estimated where
+    the picture is trusted (decoded) and textured; (copy, largest shift in pixels). The
+    copy stays as it is when no shift can be told (flat picture, nothing trusted)."""
+    from .reference import shift_field, warp
+
+    H, W = rep.shape[:2]
+    trusted = np.ones((H, W), dtype=bool)
+    if holes is not None:
+        trusted = ~np.repeat(np.repeat(holes, mh, 0), mw, 1)[:H, :W]
+    try:
+        dy, dx = shift_field(tru[..., 0], rep[..., 0], trusted)
+    except Exception:
+        return tru, 0.0
+    if not (np.isfinite(dy).all() and np.isfinite(dx).all()):
+        return tru, 0.0
+    drift = float(np.hypot(dy, dx).max())
+    if drift < 0.5:
+        return tru, drift
+    return np.stack([warp(tru[..., i], dy, dx) for i in range(tru.shape[2])], axis=-1), drift
 
 
 def report_for(repaired_path: Path) -> dict | None:

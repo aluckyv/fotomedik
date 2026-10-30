@@ -45,3 +45,19 @@ def test_compare_survives_a_shifted_rotated_copy(tmp_path):
     Image.fromarray(shifted).transpose(Image.ROTATE_90).save(tmp_path / "t.png")
     cmp = C.compare(tmp_path / "a.jpg", tmp_path / "t.png", None)
     assert cmp.holes is None and cmp.err.mean() < 4
+
+
+def test_compare_follows_a_drifting_copy(tmp_path):
+    img = make_image(640, 480, seed=3)
+    healthy = make_jpeg(img, restart_rows=1)
+    (tmp_path / "a.jpg").write_bytes(healthy)
+    # an AI-restored copy: the picture slides by up to ten pixels from one side to the other
+    arr = np.asarray(img.convert("RGB")).astype(np.float32)
+    H, W = arr.shape[:2]
+    yy, xx = np.mgrid[0:H, 0:W]
+    sy = np.clip(np.rint(yy + 10 * xx / W).astype(int), 0, H - 1)
+    sx = np.clip(np.rint(xx - 6 * yy / H).astype(int), 0, W - 1)
+    Image.fromarray(arr[sy, sx].astype(np.uint8)).save(tmp_path / "t.png")
+    cmp = C.compare(tmp_path / "a.jpg", tmp_path / "t.png", None)
+    assert cmp.drift > 6 and cmp.err.mean() < 6, (cmp.drift, cmp.err.mean())
+    assert "drifted" in cmp.format_text()
