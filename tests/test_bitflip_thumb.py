@@ -36,3 +36,18 @@ def test_damaged_photo_keeps_its_colours(seed):
     g = got.reshape(15, 32, 20, 32, 3).mean(axis=(1, 3))
     off = np.abs(t - g).max(axis=-1)
     assert np.mean(off > 40) < 0.1
+
+
+def test_agreeing_mcus_drops_garbage_before_the_error():
+    from fotomedik.recipes.dcfield import agreeing_mcus
+
+    rng = np.random.default_rng(0)
+    per_row, rows = 20, 30  # 1x1 sampling: one block per MCU
+    tdc = rng.normal(0, 20, (rows, per_row))
+    arr = tdc + rng.normal(0, 0.5, tdc.shape)
+    arr[12:24] = rng.normal(0, 20, (12, per_row))  # decoded garbage, noticed only at row 24
+    ok = np.zeros(rows * per_row, bool)
+    ok[: 24 * per_row] = True
+    got = agreeing_mcus(tdc, arr, ok, 1, 1, per_row, q=8.0)
+    assert got[: 11 * per_row].all()
+    assert not got[13 * per_row : 24 * per_row].any()

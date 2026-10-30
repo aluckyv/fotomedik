@@ -509,6 +509,51 @@ GAIN_THUMB = (0.7, 1.4)  # calibration gain allowed for a camera thumbnail
 GAIN_WIDE = (0.5, 2.0)  # for a reference picture (edited copies are brightened or darkened)
 
 
+AGREE_FLOOR = 10.0  # gray levels of luma a decoded MCU may stray from the thumbnail before it counts as garbage
+AGREE_K = 4.0  # ... or this many times the typical stray of the run's first part
+
+
+def agreeing_mcus(tdc: np.ndarray, arr: np.ndarray, mcu_ok: np.ndarray, h: int, v: int, per_row: int,
+                  q: float) -> np.ndarray:
+    """`mcu_ok` without the decoded garbage at the end of each run of decoded MCUs.
+
+    A damaged stretch is often noticed only hundreds of MCUs after it begins: until
+    then the decoder happily turns the wrong bits into blocks of wrong brightness. The
+    (uncalibrated) thumbnail luma `tdc` shows where a run stops agreeing with the photo
+    for good; from there to the end of the run nothing is trusted."""
+    rows, _cols = arr.shape
+    n = min(len(mcu_ok), (rows // v) * per_row)
+    out = mcu_ok.copy()
+    diff = (arr - tdc)[: (rows // v) * v, : per_row * h] * q / 8.0
+    known = block_mask(mcu_ok, arr, h, v, per_row)[: (rows // v) * v, : per_row * h] & np.isfinite(diff)
+    if not known.any():
+        return out
+    off = float(np.median(diff[known]))  # the thumbnail's overall brightness offset
+    dev = np.where(known, np.abs(diff - off), 0.0).reshape(rows // v, v, per_row, h).sum(axis=(1, 3))
+    cnt = known.reshape(rows // v, v, per_row, h).sum(axis=(1, 3))
+    per_mcu = (dev / np.maximum(cnt, 1)).ravel()[:n]
+    ok = mcu_ok[:n]
+    i = 0
+    while i < n:
+        if not ok[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and ok[j]:
+            j += 1
+        if j - i >= 2 * per_row:
+            sm = np.convolve(per_mcu[i:j], np.ones(per_row) / per_row, mode="same")  # over one MCU row
+            limit = max(AGREE_FLOOR, AGREE_K * float(np.median(sm[: max(per_row, (j - i) // 4)])))
+            bad = sm > limit
+            # the first point from which the rest of the run is mostly off
+            rest_bad = np.cumsum(bad[::-1])[::-1] / np.arange(j - i, 0, -1)
+            cut = np.flatnonzero(bad & (rest_bad > 0.8))
+            if len(cut):
+                out[i + int(cut[0]) : j] = False
+        i = j
+    return out
+
+
 def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarray, gain_range,
                min_r: float = THUMB_MIN_R) -> ThumbBase | None:
     frame = ft.frame
@@ -560,7 +605,14 @@ def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarr
             if ci == 0 and int(anyok.sum()) >= 50:
                 xa, ya = tdc[anyok], arr[anyok]
                 if np.std(xa) < 1e-6 or np.std(ya) < 1e-6 or np.corrcoef(xa, ya)[0, 1] < need_r:
-                    return None
+                    # perhaps only the garbage decoded before an error disagrees
+                    agree = agreeing_mcus(tdc, arr, sr.mcu_ok, c.h, c.v, per_row, q)
+                    anyok = block_mask(agree, arr, c.h, c.v, per_row) & np.isfinite(tdc)
+                    if int(anyok.sum()) < 50:
+                        return None
+                    xa, ya = tdc[anyok], arr[anyok]
+                    if np.std(xa) < 1e-6 or np.std(ya) < 1e-6 or np.corrcoef(xa, ya)[0, 1] < need_r:
+                        return None
             if ci > 0 and isinstance(mask, RescuedMask):
                 # a repaired thumbnail with no clean rows: its colours are guesses and nothing here
                 # can check them, so they say nothing; the picture's own rows give the colour
