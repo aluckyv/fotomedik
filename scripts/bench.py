@@ -1,7 +1,7 @@
 """Measuring ground: good photos are damaged the way real cards and recoveries damage
 them, repaired, and compared with the photo they were.
 
-    python scripts/bench.py make  GOOD_FOLDER  BENCH_FOLDER [--per 2] [--long 1600]
+    python scripts/bench.py make  GOOD_FOLDER  BENCH_FOLDER [--per 2] [--long 1600] [--kind mixed|dense]
     python scripts/bench.py run   BENCH_FOLDER RESULT.json [--ai MODELS_FOLDER] [--only N]
     python scripts/bench.py score BENCH_FOLDER OUT_FOLDER RESULT.json   (pictures made by the app)
     python scripts/bench.py compare OLD.json NEW.json
@@ -131,6 +131,40 @@ def damage(data: bytes, other: bytes, seed: int, spans: list | None = None) -> t
     return bytes(buf), done
 
 
+DENSE_SHARE = (0.15, 0.40)  # share of the scan's sectors rotted, as measured on photos from a dying card
+DENSE_STAY = 0.5  # a rotted sector is followed by another one this often (runs of ~2 sectors)
+DENSE_BIT = 0.08  # bits flipped in a rotted sector (half of its FF00 pairs break, as on the real photos)
+
+
+def dense_rot(data: bytes, seed: int, spans: list | None = None) -> tuple[bytes, list[str]]:
+    """Rot spread over the whole scan the way a dying memory card leaves it: about a
+    quarter of the 512-byte sectors, in runs of one to a few, every bit of them wrong
+    with a probability of 8 % (measured on the 2005 photos: 26 % of the sectors show
+    broken FF00 pairs, half of the pairs in them broken, runs of 2 rotted and 2 good
+    sectors at the median)."""
+    rng = np.random.default_rng(seed)
+    s = scan_start(data)
+    share = float(rng.uniform(*DENSE_SHARE))
+    p_in = share * (1 - DENSE_STAY) / (1 - share)  # good -> rotted, for that share in the long run
+    buf = bytearray(data)
+    first = (s // SECTOR + 1) * SECTOR
+    bad = False
+    n_bad = 0
+    for a in range(first, len(buf) - 2, SECTOR):
+        bad = rng.random() < (DENSE_STAY if bad else p_in)
+        if not bad:
+            continue
+        n_bad += 1
+        b = min(a + SECTOR, len(buf) - 2)
+        flips = rng.random((b - a, 8)) < DENSE_BIT
+        mask = np.packbits(flips, axis=1).ravel()
+        buf[a:b] = (np.frombuffer(bytes(buf[a:b]), np.uint8) ^ mask).tobytes()
+        if spans is not None:
+            spans.append((a, b))
+    total = max(1, (len(buf) - 2 - first) // SECTOR)
+    return bytes(buf), [f"dense rot: {n_bad} of {total} sectors ({100 * n_bad // total} %)"]
+
+
 def exif_with_thumbnail(img: Image.Image) -> bytes:
     """A camera-like EXIF block (TIFF, IFD1) carrying a 160x120 JPEG thumbnail, the way
     cameras of the time wrote it - photos that went through other software often lost it."""
@@ -183,10 +217,10 @@ def make(args) -> None:
         other = (out / "truth" / goods[(i + 1) % len(goods)]).read_bytes()
         for k in range(args.per):
             seed = 1000 * i + k
-            bad, what = damage(data, other, seed)
+            bad, what = dense_rot(data, seed) if args.kind == "dense" else damage(data, other, seed)
             case = f"{Path(name).stem}__{k}.jpg"
             (out / "damaged" / case).write_bytes(bad)
-            manifest.append({"case": case, "truth": name, "damage": what, "seed": seed})
+            manifest.append({"case": case, "truth": name, "damage": what, "seed": seed, "kind": args.kind})
             print(f"{case}: {', '.join(what)}")
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     print(f"{len(goods)} good photos, {len(manifest)} damaged copies")
@@ -418,6 +452,8 @@ def main() -> None:
     m.add_argument("bench")
     m.add_argument("--per", type=int, default=2)
     m.add_argument("--long", type=int, default=1600)
+    m.add_argument("--kind", choices=("mixed", "dense"), default="mixed",
+                   help="mixed: one or two kinds of damage per copy; dense: rot over the whole scan (a dying card)")
     r = sub.add_parser("run")
     r.add_argument("bench")
     r.add_argument("result")

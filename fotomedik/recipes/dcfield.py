@@ -509,6 +509,9 @@ GAIN_THUMB = (0.7, 1.4)  # calibration gain allowed for a camera thumbnail
 GAIN_WIDE = (0.5, 2.0)  # for a reference picture (edited copies are brightened or darkened)
 
 
+FLAT_STD = 0.5  # DC units: below this a stretch is flat and its pattern cannot be compared
+FLAT_LEVEL = 24.0
+CLOSE_LEVEL = 12.0  # gray levels: blocks this close to the thumbnail (median) agree with it  # gray levels a flat stretch may differ from the thumbnail's level
 AGREE_FLOOR = 10.0  # gray levels of luma a decoded MCU may stray from the thumbnail before it counts as garbage
 AGREE_K = 4.0  # ... or this many times the typical stray of the run's first part
 
@@ -629,19 +632,34 @@ def _base_from(img: np.ndarray, mask, ft, sr: D.ScanResult, clean_mcus: np.ndarr
             # too little clean data to calibrate: cameras render the thumbnail from the
             # same picture (measured gain 0.98-1.1, offset < 4 gray levels), so use it as
             # is - unless whatever did decode contradicts it
-            anyok = block_mask(sr.mcu_ok, arr, c.h, c.v, per_row) & np.isfinite(tdc)
+            # judged by what decoded before the first error: everything after it may be
+            # garbage that decoded (dense rot leaves little else), and garbage contradicts
+            # any thumbnail
+            first_bad = np.flatnonzero(~sr.mcu_ok)
+            prefix = sr.mcu_ok.copy()
+            if len(first_bad):
+                prefix[int(first_bad[0]) :] = False
+            anyok = block_mask(prefix, arr, c.h, c.v, per_row) & np.isfinite(tdc)
+            if int(anyok.sum()) < 50 and mask is not None:
+                anyok = block_mask(sr.mcu_ok, arr, c.h, c.v, per_row) & np.isfinite(tdc)
             need_r = RESCUED_MIN_R if mask is not None else UNCAL_MIN_R
-            if ci == 0 and int(anyok.sum()) >= 50:
-                xa, ya = tdc[anyok], arr[anyok]
-                if np.std(xa) < 1e-6 or np.std(ya) < 1e-6 or np.corrcoef(xa, ya)[0, 1] < need_r:
-                    # perhaps only the garbage decoded before an error disagrees
-                    agree = agreeing_mcus(tdc, arr, sr.mcu_ok, c.h, c.v, per_row, q)
-                    anyok = block_mask(agree, arr, c.h, c.v, per_row) & np.isfinite(tdc)
-                    if int(anyok.sum()) < 50:
-                        return None
-                    xa, ya = tdc[anyok], arr[anyok]
-                    if np.std(xa) < 1e-6 or np.std(ya) < 1e-6 or np.corrcoef(xa, ya)[0, 1] < need_r:
-                        return None
+
+            def contradicts(xa, ya) -> bool:
+                if float(np.median(np.abs(xa - ya))) * q / 8.0 <= CLOSE_LEVEL:
+                    return False  # close block by block: a low-contrast stretch whose pattern is noise
+                if np.std(xa) < FLAT_STD or np.std(ya) < FLAT_STD:
+                    # a flat stretch (sky, a wall) says nothing about the pattern, only the level
+                    return abs(float(np.mean(xa) - np.mean(ya))) * q / 8.0 > FLAT_LEVEL
+                return float(np.corrcoef(xa, ya)[0, 1]) < need_r
+
+            if ci == 0 and int(anyok.sum()) >= 50 and contradicts(tdc[anyok], arr[anyok]):
+                # perhaps only the garbage decoded before an error disagrees
+                agree = agreeing_mcus(tdc, arr, prefix, c.h, c.v, per_row, q)
+                anyok = block_mask(agree, arr, c.h, c.v, per_row) & np.isfinite(tdc)
+                # what remains must not contradict it; when nothing remains, rot began at the
+                # top and nothing decoded can speak against the camera's own thumbnail
+                if int(anyok.sum()) >= 50 and contradicts(tdc[anyok], arr[anyok]):
+                    return None
             if ci > 0 and isinstance(mask, RescuedMask):
                 # a repaired thumbnail with no clean rows: its colours are guesses and nothing here
                 # can check them, so they say nothing; the picture's own rows give the colour
