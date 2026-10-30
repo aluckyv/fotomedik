@@ -577,7 +577,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         elif "ai" in steps and engine.inpaint_s is not None:
             # healing: every hole filled from the real pixels around it at full size; where
             # the thumbnail knows a hole's block averages, they are given back afterwards
-            from .guard import date_stamp, drifted_blocks, face_mask, outside_only
+            from .guard import date_stamp, face_mask, outside_only
 
             t0, st = time.perf_counter(), {}
             # kept as the repair left it: the camera's date (the healing would invent digits)
@@ -597,20 +597,13 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             holes = (holes | junk) & ~stamp
             arr = heal_holes(arr, holes, engine, report("LaMa window"), stop, st)
             arr = keep_block_means(arr, before, holes, known & ~stripes)
-            # a healed face block that looks different from the repair's (a dash across an eye)
-            back = drifted_blocks(arr, before, faces & holes & ~junk & ~stripes)
-            if back.any():
-                a = np.asarray(Image.fromarray((back * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(2)),
-                               dtype=np.float32)[..., None] / 255.0
-                a = np.maximum(a, back[..., None]) * holes[..., None]
-                arr = np.clip(np.rint(arr * (1 - a) + before.astype(np.float32) * a), 0, 255).astype(np.uint8)
             notes = []
             if junk.any():
                 notes.append(f"{int(junk.sum()) // 64} block(s) of wrongly coloured stripes healed too")
             if stamp.any():
                 notes.append("date stamp kept")
             if faces.any():
-                notes.append("faces guarded" + (f", {int(back.sum()) // 64} block(s) put back" if back.any() else ""))
+                notes.append("faces guarded")
             done.append(f"holes healed from the picture around them (LaMa, {st.get('tiles', 0)} windows, {_took(t0)})"
                         + "".join("; " + n for n in notes))
         elif "ai" in steps and engine.sr is not None:

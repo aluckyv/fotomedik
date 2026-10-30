@@ -4,8 +4,8 @@
   a hole as texture and invents new ones ("13/08/2005" -> "18/118/02II05"); the stamp
   is therefore kept exactly as the repair left it and the healing sees it only as context.
 * Faces. Eyes, brows and mouths are small dark marks on a light face, which the stripe
-  checks take for rotted colour; on a face those checks are switched off, and a healed
-  face block that drifted from what the repair had is put back.
+  checks take for rotted colour; on a face those checks are switched off (a stripe that
+  runs on past the face is still treated).
 * Face landmarks for GFPGAN: a detector fooled by a damaged face gives landmarks in the
   wrong places, and GFPGAN then draws a mouth over the eyes. Such faces are skipped.
 """
@@ -69,7 +69,6 @@ def date_stamp(arr: np.ndarray) -> np.ndarray:
 
 # faces
 FACE_GROW = 0.35  # the protected oval reaches this share of the face size past the detection
-FACE_DRIFT = 22.0  # gray levels: a healed face block whose smoothed look moved more than this is put back
 
 
 def landmarks_ok(pts: np.ndarray) -> bool:
@@ -141,26 +140,3 @@ def outside_only(mask: np.ndarray, faces: np.ndarray, blocks: int = 3) -> np.nda
     keep = outside >= blocks * 64
     keep[0] = False
     return keep[lab]
-
-
-def _smooth(arr: np.ndarray) -> np.ndarray:
-    """Luma averaged over 4x4 pixels: the look of a block without its fine texture."""
-    a = arr.astype(np.float32)
-    y = 0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]
-    h, w = y.shape
-    hh, ww = -(-h // 4) * 4, -(-w // 4) * 4
-    y = np.pad(y, ((0, hh - h), (0, ww - w)), mode="edge").reshape(hh // 4, 4, ww // 4, 4).mean(axis=(1, 3))
-    return y
-
-
-def drifted_blocks(out: np.ndarray, ref: np.ndarray, where: np.ndarray, tol: float = FACE_DRIFT) -> np.ndarray:
-    """8x8 blocks inside `where` in which the healed `out` looks different from `ref`
-    (some 4x4 patch's average luma moved more than `tol`): a dark dash drawn across an
-    eye, a gray patch on a cheek. Pixel mask."""
-    h, w = where.shape
-    d = np.abs(_smooth(out) - _smooth(ref))  # per 4x4 patch
-    hh, ww = d.shape
-    bh, bw = -(-hh // 2), -(-ww // 2)
-    d = np.pad(d, ((0, bh * 2 - hh), (0, bw * 2 - ww))).reshape(bh, 2, bw, 2).max(axis=(1, 3))
-    bad = np.repeat(np.repeat(d > tol, 8, 0), 8, 1)[:h, :w]
-    return bad & where

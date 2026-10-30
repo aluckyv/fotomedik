@@ -8,7 +8,6 @@ cv2 = pytest.importorskip("cv2")
 from fotomedik.ai.faces import TEMPLATE, agrees
 from fotomedik.ai.guard import (
     date_stamp,
-    drifted_blocks,
     landmarks_ok,
     outside_only,
 )
@@ -93,14 +92,3 @@ def test_outside_only():
     out = outside_only(m, faces)
     assert not out[16:24, 16:32].any()
     assert out[48:56].all() and out[32:40].all()
-
-
-def test_drifted_blocks():
-    ref = np.full((32, 32, 3), 180, np.uint8)
-    out = ref.copy()
-    out[8:12, 8:16] = 60  # a dark dash
-    out[24:28, 24:28] = 175  # a small change
-    where = np.ones((32, 32), bool)
-    bad = drifted_blocks(out, ref, where)
-    assert bad[8:16, 8:16].all()
-    assert not bad[24:32, 24:32].any()
