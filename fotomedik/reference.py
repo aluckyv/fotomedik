@@ -31,6 +31,7 @@ MIN_MATCH = 0.5  # correlation the best shift must reach
 MIN_CONFIDENCE = 0.1  # ... and by how much it must beat the typical shift's correlation
 TRIM = 2.0  # pixels: a window this far from the shift surface is a wrong match and is dropped
 GAIN_RANGE = (0.5, 2.0)  # calibration gain allowed (edited copies are brightened or darkened)
+TONE_TILE = 256  # pixels: tones are matched per window of this size (luma)
 PAIR_MIN_R = 0.75  # correlation at 32x24 that pairs a reference with a photo by content
 REFERENCE_SUFFIX = "_ref"  # output of a repair guided by a reference: <stem>_ref<suffix>
 
@@ -276,6 +277,73 @@ def warp(plane: np.ndarray, dy: np.ndarray, dx: np.ndarray) -> np.ndarray:
     return plane[sy, sx]
 
 
+def _window_grid(H: int, W: int, tile: int) -> tuple[list[int], list[int]]:
+    stride = max(8, tile // 2)
+    ys = list(range(0, max(1, H - tile) + 1, stride))
+    xs = list(range(0, max(1, W - tile) + 1, stride))
+    if ys[-1] + tile < H:
+        ys.append(max(0, H - tile))
+    if xs[-1] + tile < W:
+        xs.append(max(0, W - tile))
+    return ys, xs
+
+
+def _dense(vals: np.ndarray, cy: np.ndarray, cx: np.ndarray, H: int, W: int) -> np.ndarray:
+    """Window values spread over the picture: NaN windows take a distance-weighted mean of
+    the estimated ones, then linear interpolation between window centres."""
+    known = np.isfinite(vals)
+    if not known.any():
+        return np.zeros((H, W), np.float32)
+    f = vals.copy()
+    if not known.all():
+        iy, ix = np.nonzero(known)
+        v = vals[known]
+        for i, j in zip(*np.nonzero(~known)):
+            w = np.exp(-((iy - i) ** 2 + (ix - j) ** 2) / 8.0)
+            f[i, j] = float((w * v).sum() / w.sum()) if w.sum() > 1e-9 else v[int(np.argmin((iy - i) ** 2 + (ix - j) ** 2))]
+    yy = np.interp(np.arange(H), cy, np.arange(len(cy))) if len(cy) > 1 else np.zeros(H)
+    xx = np.interp(np.arange(W), cx, np.arange(len(cx))) if len(cx) > 1 else np.zeros(W)
+    iy, ix = np.floor(yy).astype(int), np.floor(xx).astype(int)
+    iy1, ix1 = np.minimum(iy + 1, len(cy) - 1), np.minimum(ix + 1, len(cx) - 1)
+    fy, fx = (yy - iy)[:, None], (xx - ix)[None, :]
+    return (f[iy][:, ix] * (1 - fy) * (1 - fx) + f[iy1][:, ix] * fy * (1 - fx)
+            + f[iy][:, ix1] * (1 - fy) * fx + f[iy1][:, ix1] * fy * fx).astype(np.float32)
+
+
+def calibrate_local(ref: np.ndarray, real: np.ndarray, trusted: np.ndarray, tile: int = TONE_TILE) -> np.ndarray:
+    """`ref` brought to `real`'s tones region by region: gain and offset are fitted per
+    window on the trusted pixels and interpolated between windows (an image model
+    re-renders tones differently in the sky and on a facade; one global curve leaves
+    bands where real and reference rows alternate)."""
+    H, W = real.shape
+    tile = min(tile, H, W)
+    ys, xs = _window_grid(H, W, tile)
+    gain = np.full((len(ys), len(xs)), np.nan)
+    off = np.full((len(ys), len(xs)), np.nan)
+    a0, b0 = calibrate(ref, real, trusted)
+    for i, y0 in enumerate(ys):
+        for j, x0 in enumerate(xs):
+            y1, x1 = min(H, y0 + tile), min(W, x0 + tile)
+            m = trusted[y0:y1, x0:x1]
+            if m.mean() < MIN_TRUSTED or m.sum() < 256:
+                continue
+            x, y = ref[y0:y1, x0:x1][m].astype(np.float64), real[y0:y1, x0:x1][m].astype(np.float64)
+            if np.std(x) < MIN_TEXTURE:  # flat: only the offset is known here
+                gain[i, j], off[i, j] = a0, float(np.median(y - a0 * x))
+                continue
+            a = float(np.clip(np.cov(x, y)[0, 1] / np.var(x), *GAIN_RANGE))
+            d = y - a * x
+            lo, hi = np.percentile(d, [10, 90])
+            core = d[(d >= lo) & (d <= hi)]
+            gain[i, j], off[i, j] = a, float(core.mean()) if core.size else float(d.mean())
+    if not np.isfinite(gain).any():
+        return np.clip(a0 * ref + b0, -128.0, 127.0)
+    cy = np.array(ys) + min(tile, H) / 2.0
+    cx = np.array(xs) + min(tile, W) / 2.0
+    g, o = _dense(gain, cy, cx, H, W), _dense(off, cy, cx, H, W)
+    return np.clip(g * ref + o, -128.0, 127.0)
+
+
 def calibrate(ref: np.ndarray, real: np.ndarray, trusted: np.ndarray) -> tuple[float, float]:
     """(gain, offset) with real ~ gain * ref + offset over the trusted pixels (the 5 %
     tails of the difference left out), gain within GAIN_RANGE."""
@@ -317,8 +385,7 @@ def aligned_planes(ref_ycc: np.ndarray, planes: dict, comps, frame, hole_blocks:
         fx = np.asarray(Image.fromarray(dx, mode="F").resize((w, h), Image.BILINEAR), np.float32) / sx
         r = warp(r, fy, fx)
         t = ~np.repeat(np.repeat(hole_blocks[c.cid], 8, 0), 8, 1)[:h, :w]
-        a, b = calibrate(r, plane, t)
-        out[c.cid] = np.clip(a * r + b, -128.0, 127.0)
+        out[c.cid] = calibrate_local(r, plane, t, max(32, TONE_TILE // max(sy, sx)))
     return out
 
 
