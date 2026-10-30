@@ -233,6 +233,76 @@ def dc_in_range(dc_rel: np.ndarray, lim: np.ndarray) -> bool:
     return bool((span <= 2 * lim).all())
 
 
+EXT_SUB = 16  # MCUs: an extension is checked against the reference in steps of this many
+EXT_TOL = 3.0  # ... and stops where its level differs from the placed blocks' by this many expected errors
+
+
+def verify_extension(placer: "Placer", rel: np.ndarray, placed: list[tuple[int, int, int]],
+                     seg: tuple[int, int, int]) -> list[tuple[int, int, int]]:
+    """An extended segment (chain index, MCU index, count) as the pieces that agree with
+    the reference. A bit error inside a chain can keep the decoder in step and still
+    change one DC difference: from there on a component sits at another level (a green
+    band through a white facade). So the placed blocks of the segment are grouped by
+    level (the reference minus their relative DC, per block column), every group grows
+    outwards only while the reference agrees with its level, and each group becomes a
+    piece of its own, with its own DC offset. Where the reference knows nothing the
+    extension stands."""
+    k0, m0, c = seg
+    off = m0 - k0
+    own = sorted((k, m, n) for k, m, n in placed if m - k == off and k0 <= k < k0 + c)
+    if not own:
+        return []
+    nb = rel.shape[1]
+
+    def level_of(a: int, b: int) -> np.ndarray:
+        r = placer.ref[a + off : b + off] - rel[a:b]
+        out = np.full(nb, np.nan)
+        for j in range(nb):
+            f = np.isfinite(r[:, j])
+            if f.sum() >= max(2, (b - a) // 2):
+                out[j] = np.median(r[f, j])
+        return out
+
+    lo, hi = own[0][0], own[-1][0] + own[-1][2]
+    sig = placer.sig[lo + off : hi + off]
+    tol = EXT_TOL * np.array([np.nanmedian(sig[:, j]) if np.isfinite(sig[:, j]).any() else np.inf for j in range(nb)])
+
+    def differ(a: np.ndarray, b: np.ndarray) -> bool:
+        d = np.abs(a - b)
+        return bool((np.isfinite(d) & (d > tol)).any())
+
+    # the placed blocks in groups of one level, checked in steps of EXT_SUB
+    steps = [(a, min(a + EXT_SUB, k + n)) for k, _m, n in own for a in range(k, k + n, EXT_SUB)]
+    groups: list[list] = []  # [start, end, level]
+    for a, b in steps:
+        lv = level_of(a, b)
+        g = groups[-1] if groups else None
+        if g is not None and a - g[1] <= 2 * BLOCK and not differ(lv, g[2]):
+            g[1] = b
+            g[2] = np.where(np.isfinite(g[2]), g[2], lv)
+        else:
+            groups.append([a, b, lv])
+    out = []
+    for i, (a, b, lv) in enumerate(groups):
+        left = k0 if i == 0 else groups[i - 1][1]
+        right = k0 + c if i == len(groups) - 1 else groups[i + 1][0]
+        while a > left:
+            a2 = max(left, a - EXT_SUB)
+            if differ(level_of(a2, a), lv):
+                break
+            a = a2
+        while b < right:
+            b2 = min(right, b + EXT_SUB)
+            if differ(level_of(b, b2), lv):
+                break
+            b = b2
+        if out and out[-1][0] + out[-1][2] >= a:  # two groups meet: one MCU between them carries
+            a = out[-1][0] + out[-1][2] + 1      # the predictor, so they stay two pieces
+        if b - a >= 2:
+            out.append((a, a + off, b - a))
+    return out
+
+
 def extend_blocks(blocks: list[tuple[int, int, int]], n: int, per_row: int) -> list[tuple[int, int, int]]:
     """Blocks placed by the reference (chain index, MCU index, count) stretched over the
     rest of the chain: a chain is one run of MCUs, so the blocks between two placed ones
@@ -502,7 +572,8 @@ class SegmentPlacement(Recipe):
                         # unless the DC runs away in it (a desync: the stretched piece would be lost whole)
                         ext = [(k, m, c) for k, m, c in extend_blocks(blocks, dn, per_row)
                                if m >= floor and m + c <= job["m_hi"]]
-                        if all(dc_in_range(dc[k : k + c], placer.lim) for k, _m, c in ext):
+                        ext = [piece for e in ext for piece in verify_extension(placer, rel, blocks, e)]
+                        if ext and all(dc_in_range(dc[k : k + c], placer.lim) for k, _m, c in ext):
                             blocks = ext
                     elif dn >= BLIND_ROWS * per_row:
                         # the reference said nothing: the chain's own seam
