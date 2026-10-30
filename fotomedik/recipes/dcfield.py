@@ -517,9 +517,10 @@ STEP_T = 8.0  # t statistic a step in the residual needs
 STEP_MIN = 3.0  # gray levels it must shift the residual by
 
 
-def _step(r: np.ndarray, per_row: int) -> int | None:
+def _step(r: np.ndarray, per_row: int, with_t: bool = False, min_t: float = STEP_T, min_step: float = STEP_MIN):
     """Index of the strongest step in the mean of `r` (at least a row on each side), when
-    it is clear (t statistic of the two means) and large enough; None otherwise."""
+    it is clear (t statistic of the two means) and large enough; None otherwise.
+    with_t: (index, t) instead."""
     n = len(r)
     if n < 3 * per_row:
         return None
@@ -528,7 +529,9 @@ def _step(r: np.ndarray, per_row: int) -> int | None:
     m1, m2 = cs[k - 1] / k, (cs[-1] - cs[k - 1]) / (n - k)
     t = np.abs(m1 - m2) * np.sqrt(k * (n - k) / n) / (float(np.std(r)) + 1e-6)
     i = int(np.argmax(t))
-    return int(k[i]) if t[i] > STEP_T and abs(m1[i] - m2[i]) > STEP_MIN else None
+    if not (t[i] > min_t and abs(m1[i] - m2[i]) > min_step):
+        return None
+    return (int(k[i]), float(t[i])) if with_t else int(k[i])
 
 
 def agreeing_mcus(tdc: np.ndarray, arr: np.ndarray, mcu_ok: np.ndarray, h: int, v: int, per_row: int,

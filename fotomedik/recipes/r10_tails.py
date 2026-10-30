@@ -46,6 +46,7 @@ class References:
     decode before any repair."""
 
     def __init__(self, sr: D.ScanResult, ft, thumb=None):
+        self.thumb = thumb is not None
         self.comps, self.per_row, _rows = D._scan_components(ft)
         self.ref = {}
         for c in self.comps:
@@ -105,6 +106,27 @@ def head_anomaly(refs: References, first_mcu: int, dc_rel: np.ndarray, delta: di
         a = np.where((dv[:, 0] <= max_dist) & ~np.isnan(rv[:, 0]), a, np.nan)
         out = np.where(np.isnan(out), a, np.where(np.isnan(a), out, np.maximum(out, a)))
     return out
+
+
+STEP_CUTS = 4  # junctions (lost or foreign stretches) a tail may be cut at
+TAIL_STEP_T, TAIL_STEP_MIN = 12.0, 8.0  # a junction is a clear, large step (gray levels): a tail is long,
+# and its residual against the small thumbnail drifts a little with the scene
+
+
+def tail_step(refs: "References", first_mcu: int, dc_rel: np.ndarray, delta: dict, pk: K.Packed) -> int | None:
+    """MCU of the tail where its colours step away from the thumbnail-guided reference
+    (see dcfield._step), the strongest over the components, or None."""
+    from .dcfield import _step
+
+    n = dc_rel.shape[0]
+    best = None
+    for ci, (cid, sl, rv, _dv) in enumerate(refs.blocks(first_mcu, n)):
+        r = (dc_rel[:, sl][:, 0] + delta[cid] - rv[:, 0]) * (pk.qdc[ci] / 8.0)
+        r = np.where(np.isfinite(r), r, 0.0)
+        got = _step(r, refs.per_row, with_t=True, min_t=TAIL_STEP_T, min_step=TAIL_STEP_MIN)
+        if got is not None and (best is None or got[1] > best[1]):
+            best = got
+    return best[0] if best else None
 
 
 def leading_junk(anom: np.ndarray, floor: float = ANOMALY_MIN, gap: int = 4) -> int:
@@ -220,6 +242,25 @@ class TailRecovery(Recipe):
                 base = dc_rel[trim - 1][[sum(h * v for h, v in pk.hv[:i + 1]) - 1 for i in range(pk.ncomp)]]
                 delta = {cid: delta[cid] + float(base[i]) for i, cid in enumerate(pk.cids)}
                 dc_rel = dc_rel_t - base[np.repeat(np.arange(pk.ncomp), [h * v for h, v in pk.hv])]
+            # a tail flowing back over a lost or foreign stretch carries the data before it
+            # too, but at the wrong place: against the thumbnail that part shows a step.
+            # Only what follows the last step belongs here; the rest is left to R11.
+            if not full and refs.thumb:
+                cut_total = 0
+                for _ in range(STEP_CUTS):
+                    k = tail_step(refs, first_tail, dc_rel, delta, pk)
+                    if k is None or n_tail - k < MIN_TAIL:
+                        break
+                    base = dc_rel[k - 1][[sum(h * v for h, v in pk.hv[:i + 1]) - 1 for i in range(pk.ncomp)]]
+                    dc_rel = dc_rel[k:] - base[np.repeat(np.arange(pk.ncomp), [h * v for h, v in pk.hv])]
+                    n_tail -= k
+                    first_tail += k
+                    cut_total += k
+                    d2 = refs.offsets(first_tail, dc_rel)
+                    delta = {cid: (d2[cid] if d2[cid] is not None else delta[cid] + float(base[i]))
+                             for i, cid in enumerate(pk.cids)}
+                if cut_total:
+                    s_bit = bits[drop + trim + cut_total]
             # keep every spliced DC inside the legal range (|DC*q| <= 1024+q): a bad
             # neighbour estimate must not produce a file decoders reject
             ok = True
