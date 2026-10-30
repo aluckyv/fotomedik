@@ -60,6 +60,7 @@ SAT_JUMP = 50.0  # gray levels a saturated MCU must differ from the rows above a
 WINDOW, WINDOW_SHARE = 9, 0.45  # MCUs; a window with this share of strong MCUs is junk
 PEEL_MAX, PEEL_GAP = 16, 1  # a head or tail next to a hole: weak MCUs, gaps of this many allowed
 GAP = 3  # MCUs: a gap this short between junk MCUs is junk too
+GROW_ROUNDS = 3  # how far junk spreads through saturated patches beside and below it
 
 _POS = np.empty(64, dtype=int)
 _POS[ZIGZAG] = np.arange(64)  # natural index -> zigzag position
@@ -206,6 +207,29 @@ def junk_runs(strong: np.ndarray, weak: np.ndarray, isolated: np.ndarray, truste
     return out
 
 
+def grow_saturated(junk: np.ndarray, f: dict, trusted: np.ndarray, rounds: int = GROW_ROUNDS) -> np.ndarray:
+    """Saturated MCUs (black or white patches) inside a junk region: junk above or below
+    them and junk beside them. Garbage whose DC chain ran away leaves such patches with
+    no real neighbour to jump from; a real dark region touching junk on one side only
+    is not taken (it would need junk both above/below and beside it)."""
+    out = junk.copy()
+    cand = trusted & (f["sat"] >= SATURATED) & ~junk
+    for _ in range(rounds):
+        up = np.zeros_like(out)
+        dn = np.zeros_like(out)
+        lf = np.zeros_like(out)
+        rt = np.zeros_like(out)
+        up[1:] = out[:-1]
+        dn[:-1] = out[1:]
+        lf[:, 1:] = out[:, :-1]
+        rt[:, :-1] = out[:, 1:]
+        new = cand & ~out & (up | dn) & (lf | rt)
+        if not new.any():
+            break
+        out |= new
+    return out
+
+
 def junk_mask(f: dict, trusted: np.ndarray) -> tuple[np.ndarray, dict]:
     """MCUs (rows, per_row) judged junk among the trusted ones, and the thresholds used.
     The thresholds come from the trusted MCUs themselves, so a second pass leaves out
@@ -218,6 +242,8 @@ def junk_mask(f: dict, trusted: np.ndarray) -> tuple[np.ndarray, dict]:
         strong, weak, isolated, thr = cues(f, reference)
         strong, weak, isolated = strong & trusted, weak & trusted, isolated & trusted
         junk = junk_runs(strong, weak, isolated, trusted) if strong.any() else strong
+        if junk.any():
+            junk = grow_saturated(junk, f, trusted)
         if not junk.any() or not (trusted & ~junk).any():
             break
         reference = trusted & ~junk
