@@ -43,6 +43,8 @@ piece.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from .. import parallel
@@ -355,6 +357,7 @@ class Placer:
     def __init__(self, ft, sr: D.ScanResult, thumb, clean: np.ndarray):
         comps, per_row, _rows = D._scan_components(ft)
         total = sr.total_mcus
+        self.thumb = thumb is not None
         mrow, mcol = np.divmod(np.arange(total), per_row)
         refs, sigs, qs = [], [], []
         # every block of the MCU (4 luma blocks in 4:2:0): shifts of a single MCU show
@@ -545,6 +548,124 @@ def merge_blocks(blocks: list[tuple[int, int, int]]) -> list[tuple[int, int, int
     return [tuple(r) for r in runs]
 
 
+# ---------------------------------------------------------------- placing the chains as a sequence
+
+SEQ_MIN = 12  # MCUs: shortest unit placed in a sequence (the order around it makes it safe)
+SEQ_MIN_CHAINS = 3  # chains in a range from which they are placed as a sequence
+SEQ_CANDS = 24  # best positions kept per unit
+SEQ_SKIP = ACCEPT  # cost of leaving a unit out (a unit fitting worse than this is garbage)
+SEQ_KEEP = 1.5  # a unit is kept only when it fits this well where the sequence puts it
+SEQ_GAP_SIGMA = (3.0, 0.35)  # tolerance of a gap's MCU count: MCUs + share of the gap
+SEQ_WEIGHT = 0.5  # weight of a gap's misfit against a unit's
+SEQ_BACK = 8  # units a transition may jump over (left out)
+SEQ_SPREAD = 0.12  # candidate window: this share of the range (at least SEQ_MIN_WINDOW MCUs) around the count
+SEQ_MIN_WINDOW = 200
+
+
+def place_sequence(placer: Placer, units: list[dict], b_lo: float, m_lo: int, b_hi: float, m_hi: int,
+                   rate: float) -> list[tuple[int, int]]:
+    """Positions for units (dicts with 'byte', 'end_byte', 'n', 'rel') in byte order:
+    (unit index, MCU index) for the ones kept.
+
+    Dense rot leaves an intact kilobyte between rotted sectors: dozens of short chains,
+    each too short to find its place alone (a stretch of sky fits anywhere). Their
+    order is known, though, and the bytes between them say roughly how many MCUs were
+    lost there. Every unit gets its best few positions by the thumbnail; a Viterbi pass
+    picks the combination where the units fit and the gaps agree with the lost bytes -
+    a unit that fits nowhere is left out (garbage that decoded)."""
+    if not units:
+        return []
+    span = max(1, m_hi - m_lo)
+    # expected start of every unit: count MCUs along, stretched to end at m_hi
+    exp = []
+    m, b = float(m_lo), float(b_lo)
+    for u in units:
+        m += max(0.0, u["byte"] - b) / rate
+        exp.append(m)
+        m += u["n"]
+        b = u["end_byte"]
+    m += max(0.0, b_hi - b) / rate
+    scale = span / max(1.0, m - m_lo)
+    if 0.5 < scale < 2.0:
+        exp = [m_lo + (e - m_lo) * scale for e in exp]
+    win = max(SEQ_MIN_WINDOW, int(SEQ_SPREAD * span))
+    cands, costs = [], []
+    for u, e in zip(units, exp):
+        lo, hi = max(m_lo, int(e) - win), min(m_hi, int(e) + win + u["n"])
+        cs, base = placer.costs(u["rel"], lo, hi)
+        if not len(cs) or not np.isfinite(cs).any():
+            cands.append(np.zeros(0, dtype=int))
+            costs.append(np.zeros(0))
+            continue
+        # local minima first: neighbouring positions of one fit are one candidate
+        order = np.argsort(cs)
+        keep: list[int] = []
+        for i in order:
+            if not np.isfinite(cs[i]) or cs[i] > 2 * SEQ_SKIP:
+                break
+            if all(abs(i - j) > 2 for j in keep):
+                keep.append(int(i))
+            if len(keep) >= SEQ_CANDS:
+                break
+        cands.append(np.array([base + i for i in keep], dtype=int))
+        costs.append(np.array([cs[i] for i in keep], dtype=float))
+    n_u = len(units)
+    # node 0: the start anchor; nodes per unit candidate; dp[j] best total ending with unit j at cand
+    INF = math.inf
+    best = [np.full(len(c), INF) for c in cands]
+    back: list[list[tuple[int, int]]] = [[(-1, -1)] * len(c) for c in cands]
+
+    def gap_cost(end_prev: np.ndarray, b_prev: float, n_skipped: int, j: int) -> np.ndarray:
+        """(len(end_prev), len(cands[j])) cost of the gap from an end MCU to unit j's starts."""
+        g_bytes = max(0.0, units[j]["byte"] - b_prev)
+        g_exp = g_bytes / rate + n_skipped
+        d = cands[j][None, :] - end_prev[:, None]
+        sig = SEQ_GAP_SIGMA[0] + SEQ_GAP_SIGMA[1] * g_exp
+        c = SEQ_WEIGHT * ((d - g_exp) / sig) ** 2
+        return np.where(d < 0, INF, c)
+
+    for j in range(n_u):
+        if not len(cands[j]):
+            continue
+        # from the start anchor (all units before skipped)
+        skipped = sum(units[k]["n"] for k in range(j))
+        tot = gap_cost(np.array([m_lo]), b_lo, skipped, j)[0] + costs[j] + SEQ_SKIP * j
+        best[j] = tot
+        back[j] = [(-1, -1)] * len(tot)
+        for k in range(max(0, j - SEQ_BACK), j):
+            if not len(cands[k]) or not np.isfinite(best[k]).any():
+                continue
+            skipped = sum(units[t]["n"] for t in range(k + 1, j))
+            g = gap_cost(cands[k] + units[k]["n"], units[k]["end_byte"], skipped, j)
+            tot = best[k][:, None] + g + SEQ_SKIP * (j - k - 1)
+            i_prev = np.argmin(tot, axis=0)
+            val = tot[i_prev, np.arange(tot.shape[1])] + costs[j]
+            better = val < best[j]
+            for c in np.flatnonzero(better):
+                best[j][c] = val[c]
+                back[j][c] = (k, int(i_prev[c]))
+    # close at the end anchor
+    fin, fin_at = SEQ_SKIP * n_u + 0.0, (-1, -1)
+    for j in range(n_u):
+        if not len(cands[j]) or not np.isfinite(best[j]).any():
+            continue
+        skipped = sum(units[t]["n"] for t in range(j + 1, n_u))
+        g_exp = max(0.0, b_hi - units[j]["end_byte"]) / rate + skipped
+        d = m_hi - (cands[j] + units[j]["n"])
+        sig = SEQ_GAP_SIGMA[0] + SEQ_GAP_SIGMA[1] * g_exp
+        tot = best[j] + np.where(d < 0, INF, SEQ_WEIGHT * ((d - g_exp) / sig) ** 2) + SEQ_SKIP * (n_u - j - 1)
+        i = int(np.argmin(tot))
+        if tot[i] < fin:
+            fin, fin_at = float(tot[i]), (j, i)
+    out = []
+    j, i = fin_at
+    while j >= 0:
+        if costs[j][i] <= SEQ_KEEP:
+            out.append((j, int(cands[j][i])))
+        j, i = back[j][i]
+    return out[::-1]
+
+
 @register
 class SegmentPlacement(Recipe):
     name = "segment_placement"
@@ -610,7 +731,7 @@ class SegmentPlacement(Recipe):
         pieces = []
         floor = job["m_lo"]
         # inside one restart interval the search is narrow, so short chains are safe to place
-        min_len = SHORT if job["dri"] else BLOCK
+        min_len = SHORT if job["dri"] else (SEQ_MIN if placer.thumb else BLOCK)
         segs = intact_segments(data, job["b_lo"], job["b_hi"], MIN_SEG if not job["dri"] else MIN_SEG // 2)
         # finding the parses is independent per stretch (compiled code, parallel threads);
         # placing them is sequential, every piece must come after the previous one
@@ -633,6 +754,9 @@ class SegmentPlacement(Recipe):
                 dn, _err, *_r, end_b, end_bit, _bs, dc = K.decode_mcus(data, s // 8, s % 8, c, pk, preds, len(bits),
                                                                        check_dc=False)
                 decoded.append((bits, c, dn, end_b * 8 + end_bit, dc[:dn]))
+        decoded_all = decoded
+        if not job["dri"]:  # short chains: only the sequence placement at the end takes them
+            decoded = [d for d in decoded if d[2] >= BLOCK]
         # counting MCUs chain by chain from the start must end about where the range ends; when it
         # does not (a tail placed wrongly, a foreign file in between) nothing is counted and the
         # rows are interpolated between the known points as before
@@ -694,7 +818,49 @@ class SegmentPlacement(Recipe):
                 # not placed, but its MCUs are known: only the bytes between chains are counted at a rate
                 e = prev[1] + scale * (max(0.0, s / 8.0 - prev[0]) / local_rate(prev[2], here_rate, med_rate) + dn)
                 prev = ((end_b * 8 + end_bit) / 8.0, int(round(e)), here_rate)
+        if not job["dri"] and placer.thumb and med_rate and len(decoded_all) >= SEQ_MIN_CHAINS:
+            pieces = self._fill_between(placer, job, decoded_all, med_rate, pieces)
         return pieces
+
+    @staticmethod
+    def _fill_between(placer: Placer, job: dict, decoded: list, rate: float, pieces: list[dict]) -> list[dict]:
+        """No restart markers: the chains left over between the pieces placed one by one
+        (and the range's ends) are placed as a sequence (place_sequence), each stretch
+        between two fixed points on its own. Nothing placed before moves."""
+        taken: dict[int, list[tuple[int, int]]] = {}
+        for p in pieces:
+            taken.setdefault(id(p["chain_bits"]), []).append((p["k"], p["k"] + p["n"]))
+        units = []
+        for bits, c, dn, end_bit_abs, dc in decoded:
+            rel = dc[:dn].astype(float) * placer.q[None, :]
+            used = taken.get(id(bits), [])
+            for k, bl in _blocks(dn, SEQ_MIN):
+                if any(a < k + bl and k < b for a, b in used) or not dc_in_range(dc[k : k + bl], placer.lim):
+                    continue
+                end_b = (bits[k + bl] / 8.0) if k + bl < dn else end_bit_abs / 8.0
+                units.append({"byte": float(bits[k]) / 8.0, "end_byte": float(end_b), "n": bl, "rel": rel[k : k + bl],
+                              "bits": bits, "k": k, "end": c})
+        if not units:
+            return pieces
+        fixed = [(float(job["b_lo"]), job["m_lo"])]
+        for p in pieces:
+            bits = p["chain_bits"]
+            k_end = p["k"] + p["n"]
+            fixed.append((float(bits[p["k"]]) / 8.0, p["m"]))
+            fixed.append((float(bits[k_end]) / 8.0 if k_end < len(bits) else float(bits[-1]) / 8.0, p["m"] + p["n"]))
+        fixed.append((float(job["b_hi"]), job["m_hi"]))
+        fixed.sort()
+        out = list(pieces)
+        for (b0, m0), (b1, m1) in zip(fixed, fixed[1:]):
+            sub = [u for u in units if b0 <= u["byte"] and u["end_byte"] <= b1]
+            if not sub or m1 - m0 < SEQ_MIN:
+                continue
+            for j, m in place_sequence(placer, sub, b0, m0, b1, m1, rate):
+                u = sub[j]
+                if m >= m0 and m + u["n"] <= m1:
+                    out.append({"chain_bits": u["bits"], "k": u["k"], "m": m, "n": u["n"], "end": u["end"]})
+        out.sort(key=lambda p: p["m"])
+        return out
 
     def fix(self, ctx: Context, got) -> None:
         parse, ft, sr = got
