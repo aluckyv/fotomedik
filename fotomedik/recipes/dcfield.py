@@ -253,15 +253,53 @@ def thumbnail_image(data: bytes, thumb_refs: list | None = None, landscape: bool
         try:
             im = Image.open(io.BytesIO(blob))
             im.load()
-            return np.asarray(im.convert("YCbCr")), None
+            img = np.asarray(im.convert("YCbCr"))
         except Exception:
-            pass
+            img = None
+        if img is not None:
+            # a thumbnail in rotted sectors still opens - from the damage on in wrong colours
+            real = _real_part(blob, img.shape[:2])
+            if real is None:
+                return img, None
+            if float(real.mean()) >= RESCUE_MIN:
+                return img, real
     if not thumb_refs:
         return None
     if landscape is not None:
         # a thumbnail header of the other orientation would decode the scan sheared
         thumb_refs = [r for r in thumb_refs if (r.width >= r.height) == landscape] or thumb_refs
     return _rescue_thumbnail(data, thumb_refs)
+
+
+def _real_part(blob: bytes, shape) -> np.ndarray | None:
+    """Mask (float, 1 = real) of the thumbnail's pixels from data that decodes cleanly, or
+    None when all of it does. The rows just before a decoding error are suspect too."""
+    from ..jpeg import markers as M
+    from ..jpeg.tables import FrameTables
+
+    try:
+        res = M.parse_segments(blob)
+        ft = FrameTables.from_parse(res)
+        sr = D.decode_scan(blob, res, ft)
+    except Exception:  # noqa: BLE001 - PIL opened it; nothing better to say
+        return None
+    if sr.error is None and all(iv.ok for iv in sr.intervals):
+        return None
+    _comps, per_row, _rows = D._scan_components(ft)
+    ok = sr.mcu_ok.copy()
+    for iv in sr.intervals:
+        if not iv.ok:
+            end = iv.mcu_first + iv.mcu_count
+            ok[max(iv.mcu_first, end - 2 * per_row) : end] = False
+            if iv.error is not None:
+                e = iv.error.mcu_index
+                ok[max(iv.mcu_first, e - 2 * per_row) : end] = False
+    mw, mh = 8 * ft.frame.hmax, 8 * ft.frame.vmax
+    real = np.zeros(shape, dtype=np.float32)
+    for m in np.flatnonzero(ok):
+        y, x = divmod(int(m), per_row)
+        real[y * mh : (y + 1) * mh, x * mw : (x + 1) * mw] = 1.0
+    return real
 
 
 class RescuedMask(np.ndarray):

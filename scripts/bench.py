@@ -136,7 +136,7 @@ DENSE_STAY = 0.5  # a rotted sector is followed by another one this often (runs 
 DENSE_BIT = 0.08  # bits flipped in a rotted sector (half of its FF00 pairs break, as on the real photos)
 
 
-def dense_rot(data: bytes, seed: int, spans: list | None = None) -> tuple[bytes, list[str]]:
+def dense_rot(data: bytes, seed: int, spans: list | None = None, head: bool = False) -> tuple[bytes, list[str]]:
     """Rot spread over the whole scan the way a dying memory card leaves it: about a
     quarter of the 512-byte sectors, in runs of one to a few, every bit of them wrong
     with a probability of 8 % (measured on the 2005 photos: 26 % of the sectors show
@@ -147,7 +147,7 @@ def dense_rot(data: bytes, seed: int, spans: list | None = None) -> tuple[bytes,
     share = float(rng.uniform(*DENSE_SHARE))
     p_in = share * (1 - DENSE_STAY) / (1 - share)  # good -> rotted, for that share in the long run
     buf = bytearray(data)
-    first = (s // SECTOR + 1) * SECTOR
+    first = 0 if head else (s // SECTOR + 1) * SECTOR
     bad = False
     n_bad = 0
     for a in range(first, len(buf) - 2, SECTOR):
@@ -217,7 +217,10 @@ def make(args) -> None:
         other = (out / "truth" / goods[(i + 1) % len(goods)]).read_bytes()
         for k in range(args.per):
             seed = 1000 * i + k
-            bad, what = dense_rot(data, seed) if args.kind == "dense" else damage(data, other, seed)
+            if args.kind in ("dense", "dense-head"):
+                bad, what = dense_rot(data, seed, head=args.kind == "dense-head")
+            else:
+                bad, what = damage(data, other, seed)
             case = f"{Path(name).stem}__{k}.jpg"
             (out / "damaged" / case).write_bytes(bad)
             manifest.append({"case": case, "truth": name, "damage": what, "seed": seed, "kind": args.kind})
@@ -452,8 +455,10 @@ def main() -> None:
     m.add_argument("bench")
     m.add_argument("--per", type=int, default=2)
     m.add_argument("--long", type=int, default=1600)
-    m.add_argument("--kind", choices=("mixed", "dense"), default="mixed",
-                   help="mixed: one or two kinds of damage per copy; dense: rot over the whole scan (a dying card)")
+    m.add_argument("--kind", choices=("mixed", "dense", "dense-head"), default="mixed",
+                   help="mixed: one or two kinds of damage per copy; dense: rot over the whole scan (a dying card); "
+                        "dense-head: the same from the first byte (header and thumbnail rot too; repair with the "
+                        "app's batch and judge with `score`)")
     r = sub.add_parser("run")
     r.add_argument("bench")
     r.add_argument("result")
