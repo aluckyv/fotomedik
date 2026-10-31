@@ -213,3 +213,17 @@ def test_thumbnail_enlarged_takes_rotted_stripes_from_the_thumbnail():
     assert np.abs(got[..., 0] - got[..., 1]).max() < 20  # gray again (the fake LaMa paints gray), not pink
     assert any("stripes" in d for d in done)
     assert np.array_equal(out[:72], arr[:72])  # the real picture above stays
+
+
+def test_spread_correction_is_smooth():
+    """Block averages dropped in a hole take a smooth correction from their neighbours,
+    not a checkerboard."""
+    from fotomedik.ai.enhance import _spread
+
+    known = np.zeros((20, 20), bool)
+    known[:, 0] = known[:, 19] = True
+    diff = np.zeros((20, 20, 3))
+    diff[:, 0], diff[:, 19] = 10, -10
+    row = _spread(diff, known, ~known)[10, :, 0]
+    assert np.all(np.diff(row) <= 1e-9)  # falls steadily from one side to the other
+    assert abs(row[9] + row[10]) < 1e-6

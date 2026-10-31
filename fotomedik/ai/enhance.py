@@ -600,8 +600,9 @@ def _spread(diff: np.ndarray, known: np.ndarray, todo: np.ndarray, rounds: int =
     for _ in range(rounds):
         pv = np.pad(val, ((1, 1), (1, 1), (0, 0)))
         pw = np.pad(w, 1)
-        sv = pv[:-2, 1:-1] + pv[2:, 1:-1] + pv[1:-1, :-2] + pv[1:-1, 2:]
-        sw = pw[:-2, 1:-1] + pw[2:, 1:-1] + pw[1:-1, :-2] + pw[1:-1, 2:]
+        # the block itself counts too: neighbours alone flip back and forth (a checkerboard)
+        sv = pv[:-2, 1:-1] + pv[2:, 1:-1] + pv[1:-1, :-2] + pv[1:-1, 2:] + val * w[..., None]
+        sw = pw[:-2, 1:-1] + pw[2:, 1:-1] + pw[1:-1, :-2] + pw[1:-1, 2:] + w
         got = todo & (sw > 0)
         val = np.where(got[..., None], sv / np.maximum(sw, 1e-9)[..., None], val)
         w = np.where(got, 1.0, w)
