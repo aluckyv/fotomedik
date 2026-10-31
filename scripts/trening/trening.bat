@@ -10,17 +10,23 @@ echo === FotoMedik: doucavanje FBCNN-a ===
 echo.
 
 rem --- 1. Python 3.12 -------------------------------------------------------
-py -3.12 -c "import sys" >nul 2>nul
-if errorlevel 1 (
-    echo Python 3.12 nije instaliran. Instaliram ga preko winget-a...
-    winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
-    py -3.12 -c "import sys" >nul 2>nul
-    if errorlevel 1 (
-        echo Python se nije instalirao. Instaliraj Python 3.12 sa python.org pa pokreni ponovo.
-        pause
-        exit /b 1
-    )
-)
+call :havepy
+if "%PYOK%"=="42" goto :pyready
+echo Python 3.12 nije instaliran. Instaliram ga...
+rem novi Python install manager ("py install"), pa winget kao rezerva
+py install 3.12 2>nul
+call :havepy
+if "%PYOK%"=="42" goto :pyready
+winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+call :havepy
+if "%PYOK%"=="42" goto :pyready
+echo.
+echo Python 3.12 se nije instalirao sam. Otvori Command Prompt i otkucaj:
+echo     py install 3.12
+echo pa pokreni ovaj fajl ponovo.
+pause
+exit /b 1
+:pyready
 
 rem --- 2. Okruzenje (prvi put ~3 GB: torch za NVIDIA karticu) ----------------
 if not exist venv\Scripts\python.exe (
@@ -61,6 +67,11 @@ if errorlevel 1 goto :fail
 echo.
 echo Gotovo. U FotoMediku ukljuci "JPEG clean-up" - koristi doucen model.
 pause
+exit /b 0
+
+:havepy
+set "PYOK="
+for /f "delims=" %%v in ('py -3.12 -c "print(42)" 2^>nul') do set "PYOK=%%v"
 exit /b 0
 
 :pairs
