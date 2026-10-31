@@ -28,6 +28,28 @@ SR = Model(
     67,
     "BSD-3-Clause (Real-ESRGAN, Xintao Wang et al.)",
 )
+_REL = "https://github.com/aluckyv/fotomedik/releases/download/models-sr/"
+# enlargers of the thumbnail step that invent less than Real-ESRGAN (exported by the
+# convert-models workflow from the authors' weights)
+SR_NET = Model(
+    "Real-ESRNet x4 (faithful super-resolution)",
+    "RealESRNet_x4plus.onnx",
+    (_REL + "RealESRNet_x4plus.onnx",),
+    "7fbbe2b5676438c30482a3996591258f3e74413c0bbe819662c776fa0005f559",
+    64,
+    "BSD-3-Clause (Real-ESRGAN project, Xintao Wang et al.)",
+)
+SR_SWIN = Model(
+    "SwinIR x4 (faithful super-resolution)",
+    "SwinIR-M_classical_x4.onnx",
+    (_REL + "SwinIR-M_classical_x4.onnx",),
+    "a2cfaae74b606e7510983f5a76c1a09695bfa51582b1cb2c890ba19b89219800",
+    55,
+    "Apache-2.0 (SwinIR, Jingyun Liang et al.)",
+)
+# the thumbnail step's enlarger, by the key the user picks
+ENLARGERS = {"esrgan": SR, "esrnet": SR_NET, "swinir": SR_SWIN}
+DEFAULT_ENLARGER = "swinir"
 INPAINT = Model(
     "LaMa (inpainting)",
     "lama_fp32.onnx",
@@ -91,7 +113,7 @@ STEP_MODELS = {
     "faces": (FACE_DET, FACE),
     "diffusion": (INPAINT, SR, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT, CLIP_VOCAB, CLIP_MERGES),  # SR enlarges the holes
 }
-ALL = tuple(m for ms in STEP_MODELS.values() for m in ms)
+ALL = tuple(m for ms in STEP_MODELS.values() for m in ms) + (SR_NET, SR_SWIN)
 
 
 def model_dir() -> Path:
@@ -112,17 +134,21 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def needed(steps) -> list[Model]:
+def needed(steps, enlarger: str | None = None) -> list[Model]:
+    """The models of `steps`; enlarger: the thumbnail step's enlarger (see ENLARGERS)."""
     out: list[Model] = []
     for st in steps:
-        for m in STEP_MODELS.get(st, ()):
+        ms = STEP_MODELS.get(st, ())
+        if st == "thumbsr":
+            ms = tuple(ENLARGERS.get(enlarger or DEFAULT_ENLARGER, SR) if m is SR else m for m in ms)
+        for m in ms:
             if m not in out:
                 out.append(m)
     return out
 
 
-def missing(steps=("ai",)) -> list[Model]:
-    return [m for m in needed(steps) if not (model_dir() / m.file).exists()]
+def missing(steps=("ai",), enlarger: str | None = None) -> list[Model]:
+    return [m for m in needed(steps, enlarger) if not (model_dir() / m.file).exists()]
 
 
 def ensure(model: Model, progress=None, stop=None) -> Path:

@@ -64,10 +64,11 @@ _ENGINE = None  # the Engine of this process, kept between runs
 _ENGINE_LOCK = threading.Lock()
 
 
-def engine_for(nets, say=None, stop=None, half: bool = True, out: Path | None = None):
+def engine_for(nets, say=None, stop=None, half: bool = True, out: Path | None = None,
+               enlarger: str | None = None):
     """The shared engine with the networks of `nets` loaded (downloaded first when
     needed), or None when they cannot be used here (the reason goes to say, unless
-    the run was stopped)."""
+    the run was stopped). enlarger: the thumbnail step's enlarger (models.ENLARGERS)."""
     global _ENGINE
     say = say or (lambda s: None)
     from . import runtime
@@ -87,9 +88,10 @@ def engine_for(nets, say=None, stop=None, half: bool = True, out: Path | None = 
 
     with _ENGINE_LOCK:
         eng = _ENGINE if _ENGINE is not None else Engine()
-        todo = [s for s in nets if not eng.has(s)]
+        want = enlarger if enlarger in models.ENLARGERS else models.DEFAULT_ENLARGER
+        todo = [s for s in nets if not eng.has(s) or (s == "thumbsr" and eng.enlarger != want)]
         if todo:
-            miss = models.missing(todo)
+            miss = models.missing(todo, enlarger)
             if miss:
                 mb = sum(m.size_mb for m in miss)
                 say(f"Downloading the AI models (about {mb} MB, only the first time)…")
@@ -98,7 +100,7 @@ def engine_for(nets, say=None, stop=None, half: bool = True, out: Path | None = 
                 say(f"Downloading {model.name}: {100 * done // max(1, total)} %")
 
             try:
-                eng.ensure(todo, progress, stop, half, say)
+                eng.ensure(todo, progress, stop, half, say, enlarger)
             except InterruptedError:
                 return None
             except Exception as e:
@@ -190,8 +192,10 @@ class Enhancer:
     on_done(report) is called (from the thread) as each copy is written."""
 
     def __init__(self, sources, out: Path, steps, say=None, stop=None, on_done=None, engine=None,
-                 quality: str | None = None, half: bool = True, prompt: str | None = None):
+                 quality: str | None = None, half: bool = True, prompt: str | None = None,
+                 enlarger: str | None = None):
         self.sources = list(sources)
+        self.enlarger = enlarger
         self.out = out
         user_say = say or (lambda s: None)
 
@@ -314,7 +318,7 @@ class Enhancer:
                         return
                     self.cond.wait(0.5)
             if not in_hand:  # loading overlaps with the repairs still running
-                engine = engine_for(nets, self.say, self.stop, self.half, self.out)
+                engine = engine_for(nets, self.say, self.stop, self.half, self.out, self.enlarger)
                 if self._stopped():
                     return
                 if engine is None:
@@ -418,11 +422,13 @@ class Enhancer:
 
 
 def run_extras(items: list[tuple[FileReport, Path | None]], out: Path, steps, say=None, stop=None,
-               on_done=None, engine=None, quality: str | None = None, prompt: str | None = None) -> str | None:
+               on_done=None, engine=None, quality: str | None = None, prompt: str | None = None,
+               enlarger: str | None = None) -> str | None:
     """Make the enhanced copy of every repaired photo that needs one, after the fact.
     items: (report, original path). Returns the device the networks ran on, "" when
     no network was needed, or None when nothing could be done (reasons go to say)."""
-    enh = Enhancer([src for _rep, src in items], out, steps, say, stop, on_done, engine, quality, prompt=prompt)
+    enh = Enhancer([src for _rep, src in items], out, steps, say, stop, on_done, engine, quality, prompt=prompt,
+                   enlarger=enlarger)
     if not enh.steps:
         return None
     enh.start()

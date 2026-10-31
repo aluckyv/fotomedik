@@ -132,6 +132,9 @@ class Engine:
         self.notes: list[str] = []
         self.loaded: set[str] = set()
         self.sr_batch = 1
+        self.thumb_sr = None  # the thumbnail step's enlarger (None: `sr`)
+        self.thumb_batch = 1
+        self.enlarger: str | None = None  # its key (models.ENLARGERS)
         self.paths: dict[str, object] = {}  # model name -> its file (for a fallback to the processor)
 
     @classmethod
@@ -141,10 +144,12 @@ class Engine:
     def has(self, step: str) -> bool:
         return step in self.loaded
 
-    def ensure(self, steps, progress=None, stop=None, half: bool = True, say=None) -> "Engine":
+    def ensure(self, steps, progress=None, stop=None, half: bool = True, say=None,
+               enlarger: str | None = None) -> "Engine":
         """Load the networks of `steps` that are not loaded yet (downloading them first).
         progress(done, total, model) follows the downloads, say(text) tells about slow
-        one-off work. half: fp16 copies of the fp32 networks on a graphics card (see .half)."""
+        one-off work. half: fp16 copies of the fp32 networks on a graphics card (see .half).
+        enlarger: the thumbnail step's enlarger (models.ENLARGERS key; None: the default)."""
         import onnxruntime as ort
 
         from . import models
@@ -194,10 +199,18 @@ class Engine:
                 self.notes.append(f"{model.name} runs on the processor: the graphics card refused it")
             return s
 
+        enlarger = enlarger if enlarger in models.ENLARGERS else models.DEFAULT_ENLARGER
+        if "thumbsr" in self.loaded and enlarger != self.enlarger:
+            self.loaded.discard("thumbsr")  # another enlarger picked since
         steps = set(steps) - self.loaded
         if "thumbsr" in steps:
-            if self.sr is None:
-                self.sr = session(models.SR)
+            if enlarger == "esrgan":
+                if self.sr is None:
+                    self.sr = session(models.SR)
+                self.thumb_sr = self.sr
+            else:
+                self.thumb_sr = session(models.ENLARGERS[enlarger])
+            self.enlarger = enlarger
             if self.inpaint_s is None:
                 self.inpaint_s = session(models.INPAINT)
         if "ai" in steps:
@@ -241,21 +254,24 @@ class Engine:
         on_gpu = [d for d in self.devices.values() if d != "CPU"]
         self.device = on_gpu[0] if on_gpu else "CPU"
         self.sr_batch = SR_BATCH if (self.sr is not None and on_gpu and _batch_dynamic(self.sr)) else 1
+        self.thumb_batch = SR_BATCH if (self.thumb_sr is not None and on_gpu and _batch_dynamic(self.thumb_sr)) else 1
         return self
 
     def enlarge4(self, tile: np.ndarray) -> np.ndarray:
         """float32 (h, w, 3) in 0..1 -> (4h, 4w, 3) in 0..1."""
         return self.enlarge4_many([tile])[0]
 
-    def enlarge4_many(self, tiles: list[np.ndarray]) -> list[np.ndarray]:
-        """enlarge4 of several same-sized tiles, `sr_batch` at a time in one network call."""
-        name = self.sr.get_inputs()[0].name
+    def enlarge4_many(self, tiles: list[np.ndarray], thumb: bool = False) -> list[np.ndarray]:
+        """enlarge4 of several same-sized tiles, `sr_batch` at a time in one network call.
+        thumb: with the thumbnail step's enlarger (thumb_sr, when one is loaded)."""
+        net, batch = (self.thumb_sr, self.thumb_batch) if thumb and self.thumb_sr is not None else (self.sr, self.sr_batch)
+        name = net.get_inputs()[0].name
         out: list[np.ndarray] = []
-        step = max(1, self.sr_batch)
+        step = max(1, batch)
         for k in range(0, len(tiles), step):
             group = tiles[k : k + step]
             x = np.ascontiguousarray(np.stack([t.transpose(2, 0, 1) for t in group]), dtype=np.float32)
-            y = self.sr.run(None, {name: x})[0]
+            y = net.run(None, {name: x})[0]
             out.extend(np.clip(yi.transpose(1, 2, 0), 0, 1) for yi in y)
         return out
 
@@ -397,7 +413,7 @@ def reduce(arr: np.ndarray, holes: np.ndarray, factor: int) -> tuple[np.ndarray,
 
 
 def enlarge_holes(lo: np.ndarray, need: np.ndarray, engine: Engine, factor: int = 4, progress=None,
-                  stop=None, stats: dict | None = None) -> np.ndarray:
+                  stop=None, stats: dict | None = None, thumb: bool = False) -> np.ndarray:
     """`lo` (uint8, reduced `factor` times) enlarged `factor` times: by Real-ESRGAN in the
     tiles that touch `need`, bicubic elsewhere. factor 2 or 4 (the network enlarges 4x;
     for 2 its output is halved). Returns float32 0..1, (factor*lh, factor*lw, 3)."""
@@ -411,11 +427,11 @@ def enlarge_holes(lo: np.ndarray, need: np.ndarray, engine: Engine, factor: int 
         stats["tiles"] = len(tiles)
     padded = np.pad(lof, ((PAD, PAD + TILE), (PAD, PAD + TILE), (0, 0)), mode="reflect")
     side = TILE + 2 * PAD
-    step = max(1, engine.sr_batch)
+    step = max(1, engine.thumb_batch if thumb and engine.thumb_sr is not None else engine.sr_batch)
     for k in range(0, len(tiles), step):
         _check(stop)
         group = tiles[k : k + step]
-        bigs = engine.enlarge4_many([padded[y : y + side, x : x + side] for y, x in group])
+        bigs = engine.enlarge4_many([padded[y : y + side, x : x + side] for y, x in group], thumb)
         for (y, x), big in zip(group, bigs):
             th, tw = min(TILE, lh - y), min(TILE, lw - x)
             big = big[4 * PAD : 4 * (PAD + th), 4 * PAD : 4 * (PAD + tw)]
@@ -486,9 +502,10 @@ THUMB_SR_SEAM = 12  # pixels along a hole's edge that LaMa blends into the real 
 
 
 def thumbnail_base(small: np.ndarray, shape, engine: "Engine", holes: np.ndarray | None = None) -> np.ndarray:
-    """The thumbnail enlarged by Real-ESRGAN (x4, twice when the photo is much larger) and
-    brought to `shape`: a sharp picture of the scene, its edges and textures invented by
-    the network from a 160-pixel image. Float RGB 0..255. The network runs tile by tile
+    """The thumbnail enlarged by the thumbnail step's enlarger (x4, twice when the photo is
+    much larger) and brought to `shape`: Real-ESRGAN gives a sharp picture whose edges and
+    textures the network invents from a 160-pixel image; Real-ESRNet and SwinIR invent
+    less (softer, closer to the real photo). Float RGB 0..255. The network runs tile by tile
     (a whole 640-pixel picture enlarged at once needs gigabytes), and on a second pass only
     where `holes` (the photo's, full size) need it."""
     h, w = shape[:2]
@@ -499,7 +516,7 @@ def thumbnail_base(small: np.ndarray, shape, engine: "Engine", holes: np.ndarray
         if holes is not None and cur is not small:
             m = np.asarray(Image.fromarray(holes).resize((cw, ch), Image.BOX))
             need = _grow(m > 0, 2)
-        cur = np.clip(np.rint(enlarge_holes(cur, need, engine, 4) * 255.0), 0, 255).astype(np.uint8)
+        cur = np.clip(np.rint(enlarge_holes(cur, need, engine, 4, thumb=True) * 255.0), 0, 255).astype(np.uint8)
     out = Image.fromarray(cur).resize((w, h), Image.LANCZOS)
     return np.asarray(out, dtype=np.float32)
 
@@ -786,7 +803,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                                       prompt)
             arr = keep_block_means(arr, before, holes, holes & ~unknown)
             done.append(f"holes repainted (Stable Diffusion, follows the thumbnail; {what}, {_took(t0)})")
-        elif "thumbsr" in steps and engine.sr is not None and thumb_small is not None:
+        elif "thumbsr" in steps and (engine.thumb_sr or engine.sr) is not None and thumb_small is not None:
             from .guard import date_stamp
 
             t0, st = time.perf_counter(), {}
@@ -814,7 +831,8 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                 notes.append("date stamp kept")
             if (faces & holes).any():
                 notes.append("faces only smoothly enlarged")
-            done.append(f"holes from the thumbnail enlarged by Real-ESRGAN, seams healed by LaMa "
+            net = {"esrnet": "Real-ESRNet", "swinir": "SwinIR"}.get(engine.enlarger or "", "Real-ESRGAN")
+            done.append(f"holes from the thumbnail enlarged by {net}, seams healed by LaMa "
                         f"({st.get('tiles', 0)} windows, {_took(t0)})" + "".join("; " + n for n in notes))
         elif ("ai" in steps or "thumbsr" in steps) and engine.inpaint_s is not None:
             # healing (also for "thumbsr" on a photo without a usable thumbnail): every hole filled from the real pixels around it at full size; where

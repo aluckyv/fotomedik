@@ -227,3 +227,31 @@ def test_spread_correction_is_smooth():
     row = _spread(diff, known, ~known)[10, :, 0]
     assert np.all(np.diff(row) <= 1e-9)  # falls steadily from one side to the other
     assert abs(row[9] + row[10]) < 1e-6
+
+
+def test_enlarger_choice():
+    """The thumbnail step uses the enlarger picked for it; the other steps keep Real-ESRGAN."""
+    from fotomedik.ai import models
+    from fotomedik.ai.enhance import enhance_steps
+
+    assert models.SR_SWIN in models.needed(["thumbsr"], "swinir")
+    assert models.SR not in models.needed(["thumbsr"], "esrnet")
+    assert models.SR in models.needed(["thumbsr", "ai"], "esrnet")
+    assert models.needed(["thumbsr"])[0] is models.ENLARGERS[models.DEFAULT_ENLARGER]
+
+    class Counting(FakeSR):
+        calls = 0
+
+        def run(self, out, feed):
+            Counting.calls += 1
+            return super().run(out, feed)
+
+    rng = np.random.default_rng(0)
+    arr = rng.integers(60, 200, (128, 160, 3), dtype=np.uint8)
+    holes = np.zeros((128, 160), bool)
+    holes[40:88, :] = True
+    eng = Engine(FakeSR(), FakeLama())
+    eng.thumb_sr, eng.enlarger = Counting(), "swinir"
+    out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["thumbsr"],
+                              thumb_small=rng.integers(60, 200, (8, 10, 3), dtype=np.uint8))
+    assert Counting.calls > 0 and any("SwinIR" in d for d in done)

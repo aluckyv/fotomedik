@@ -292,10 +292,9 @@ class MainWindow(QMainWindow):
             "ai": "Heal the holes from the real pixels around them, like a healing brush (LaMa, at\n"
                   "full size): lines and blurred parts get the structure running through them;\n"
                   "colours follow the thumbnail where there is one. Invented detail. ~275 MB once.",
-            "thumbsr": "Fill the holes from the photo's thumbnail enlarged by AI (Real-ESRGAN), in the colours\n"
-                       "the repair gave them, and heal the seams with LaMa: sharp edges and textures instead of\n"
-                       "a smooth blur. The detail is invented from a 160-pixel picture. Used instead of AI healing;\n"
-                       "photos without a usable thumbnail are healed as usual. ~340 MB once.",
+            "thumbsr": "Fill the holes from the photo's thumbnail enlarged by AI (pick the network next to it),\n"
+                       "in the colours the repair gave them, and heal the seams with LaMa. Used instead of AI\n"
+                       "healing; photos without a usable thumbnail are healed as usual. ~330 MB once.",
             "faces": "Restore faces (GFPGAN, ~340 MB once). Can make a face look like someone else.",
             "diffusion": "Maximum quality: holes repainted by Stable Diffusion following the thumbnail.\n"
                          "Needs a graphics card (minutes per photo on the processor). ~2.1 GB once.",
@@ -309,6 +308,18 @@ class MainWindow(QMainWindow):
             self.steps[key] = cb
         self.steps["burst"].setChecked(True)
         self.ai = self.steps["ai"]  # older name (smoke test)
+        self.enlarger = QComboBox()
+        for key, label in (("swinir", "SwinIR (faithful)"), ("esrnet", "Real-ESRNet (faithful)"),
+                           ("esrgan", "Real-ESRGAN (sharp)")):
+            self.enlarger.addItem(label, key)
+        self.enlarger.setToolTip("The network that enlarges the thumbnail for \"thumbnail enlarged by AI\".\n"
+                                 "SwinIR: closest to the real photo, softer; slower on the processor.\n"
+                                 "Real-ESRNet: close to the real photo too, and faster than SwinIR.\n"
+                                 "Real-ESRGAN: sharpest, but it invents edges and textures (odd stripes, eyes).\n"
+                                 "Each network is downloaded once (55-65 MB).")
+        self.enlarger.setEnabled(False)
+        self.steps["thumbsr"].toggled.connect(self.enlarger.setEnabled)
+        ext.insertWidget(ext.indexOf(self.steps["thumbsr"]) + 1, self.enlarger)
         self.quality = QComboBox()
         for key, label in (("fast", "Fast"), ("balanced", "Balanced"), ("full", "Full size")):
             self.quality.addItem(label, key)
@@ -499,7 +510,7 @@ class MainWindow(QMainWindow):
         steps = [k for k, cb in self.steps.items() if cb.isChecked()]
         return {"mark_holes": self.mark.isChecked(), "write_reports": self.reports.isChecked(),
                 "twins": self.twins.isChecked(),
-                "enhance": steps, "quality": self.quality.currentData(),
+                "enhance": steps, "quality": self.quality.currentData(), "enlarger": self.enlarger.currentData(),
                 "prompt": self.scene.text().strip() or None}
 
     def _launch(self, paths: list[Path], out: Path, options: dict, total: int) -> None:
