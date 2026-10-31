@@ -68,11 +68,11 @@ def make_variants(path: Path, per: int, long: int, seed: int) -> list[tuple[np.n
         else:
             im.save(b, "JPEG", quality=90, exif=exif_with_thumbnail(im))
         good = b.getvalue()
-        if kind == "mixed":
-            bad, _what = damage(good, good, seed * 100 + k)
-        else:
-            bad, _what = dense_rot(good, seed * 100 + k)
         try:
+            if kind == "mixed":
+                bad, _what = damage(good, good, seed * 100 + k)
+            else:
+                bad, _what = dense_rot(good, seed * 100 + k)
             ctx, _rep = repair_bytes(bad, path.name, {"time_budget": 2.0})
         except Exception:  # noqa: BLE001 - a crash is no pair (and is the bench's business)
             continue

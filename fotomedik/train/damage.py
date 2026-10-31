@@ -53,6 +53,7 @@ def damage(data: bytes, other: bytes, seed: int, spans: list | None = None) -> t
             spans.append((a + shift, b + shift))
 
     for k in chosen:
+        end = len(buf) - 2  # a fragment cut out or a truncation before shortens what is left
         span = end - s
         at = s + int(rng.uniform(0.1, 0.85) * span)
         if k == "rot":  # a stretch where ~30 % of the bytes have one bit wrong

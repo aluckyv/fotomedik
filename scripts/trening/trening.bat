@@ -41,7 +41,9 @@ if errorlevel 1 (
     %PY% -m pip install torch --index-url https://download.pytorch.org/whl/cu124 || goto :fail
 )
 echo Osvezavam FotoMedik kod...
-%PY% -m pip install --upgrade --quiet onnx onnxscript "fotomedik @ https://github.com/aluckyv/fotomedik/archive/refs/heads/main.zip" || goto :fail
+%PY% -m pip install --upgrade --quiet onnx onnxscript numpy pillow click || goto :fail
+rem uvek najnoviji kod (ista oznaka verzije, pa bez --force-reinstall pip ne bi zamenio stari)
+%PY% -m pip install --quiet --force-reinstall --no-deps "fotomedik @ https://github.com/aluckyv/fotomedik/archive/refs/heads/main.zip" || goto :fail
 %PY% -c "import torch; print('Graficka:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NEMA - radice na procesoru (sporo)')"
 
 rem --- 3. Parovi za ucenje --------------------------------------------------

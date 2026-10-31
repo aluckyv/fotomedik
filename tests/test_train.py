@@ -27,3 +27,20 @@ def test_patches_come_from_the_damage_and_skip_bare_holes():
         right = (np.abs(x.astype(int) - y).max(axis=2) < 24).mean()
         assert right >= 0.25  # never a patch that is (nearly) all hole
     assert sum(not np.array_equal(x, y) for x, y in zip(a, b)) >= len(a) // 2  # mostly where it is damaged
+
+
+def test_damage_after_a_cut_stays_inside_the_file():
+    """Bit flips chosen after a fragment was cut out land in what is left of the file."""
+    import io
+
+    from PIL import Image
+
+    from fotomedik.train.damage import damage
+
+    rng = np.random.default_rng(0)
+    b = io.BytesIO()
+    Image.fromarray(rng.integers(0, 255, (240, 320, 3), dtype=np.uint8)).save(b, "JPEG", quality=90)
+    good = b.getvalue()
+    for seed in range(300):  # every pair of kinds, cuts before flips among them
+        bad, what = damage(good, good, seed)
+        assert bad[:2] == b"\xff\xd8" and what
