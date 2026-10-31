@@ -149,8 +149,17 @@ def main(argv=None) -> None:
         net.load_state_dict(st["net"])
         opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"])
-        start, best = st["iter"], st["best"]
-        print(f"resumed at iteration {start} (best {best:.2f} dB)")
+        start = st["iter"]
+        # the patches may be new (made again, more photos): the best so far is measured anew on
+        # today's check patches, or no new state could ever beat a number from other patches
+        p_now, p_in = psnr_of(net, va_in, va_tgt, device)
+        best_state = torch.load(a.out / "best.pt", map_location="cpu", weights_only=True)
+        cur_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+        net.load_state_dict(best_state)
+        best, _ = psnr_of(net, va_in, va_tgt, device)
+        net.load_state_dict(cur_state)
+        print(f"resumed at iteration {start}: now {p_now:.2f} dB, best so far {best:.2f} dB "
+              f"(repair as it is {p_in:.2f} dB, on today's check patches)")
         if start >= sched.T_max:  # more iterations asked for than the last run had: a new, gentler schedule
             lr = a.lr * 0.5
             for g in opt.param_groups:
