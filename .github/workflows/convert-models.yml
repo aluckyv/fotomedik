@@ -34,7 +34,13 @@ jobs:
       - name: SwinIR architecture
         run: git clone --depth 1 https://github.com/JingyunLiang/SwinIR.git swinir
       - name: Export
-        run: python scripts/export_sr.py w onnx swinir 2>&1 | tee export.log; ls onnx || true
+        continue-on-error: true
+        run: |
+          set +e +o pipefail
+          python scripts/export_sr.py w onnx swinir > export.log 2>&1
+          cat export.log
+          ls onnx
+          true
       - name: Check
         if: always()
         run: |
