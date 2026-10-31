@@ -519,6 +519,70 @@ def thumbnail_picture(data: bytes, shape) -> np.ndarray | None:
     return np.asarray(Image.fromarray(small).resize((w, h), Image.BICUBIC))
 
 
+def thumbnail_rescued(data: bytes, arr: np.ndarray, holes: np.ndarray, kept: tuple | None = None
+                      ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """(thumbnail RGB, where it is a witness (thumbnail-sized bool) or None when all of it
+    is) - also for a thumbnail that rotted in part, which thumbnail_rgb refuses. Its real
+    part is kept (one pixel in from the damage: the first rotted pixels are off already);
+    the rest is taken from the photo itself, made small, where the photo is decoded there.
+    Where neither the thumbnail nor the photo knows, nothing is a witness: the holes there
+    are healed from the picture around them (enhance_steps). (None, None): no thumbnail, or
+    one of another shape. kept: (RGB, real mask or None) of the thumbnail the repair
+    rescued with the set's healthy thumbnails (FileReport.thumb), used when the file's own
+    gives none."""
+    whole = thumbnail_rgb(data)
+    if whole is not None:
+        return whole, None
+    if kept is not None:
+        rgb, mask = kept
+        if mask is None or float(np.mean(mask)) >= 0.95:
+            return (rgb, None) if rescue_small(rgb, np.ones(rgb.shape[:2], bool), arr, holes)[0] is not None \
+                else (None, None)
+        return rescue_small(rgb, np.asarray(mask, bool), arr, holes)
+    try:
+        from ..recipes.dcfield import _crop_black_bars, thumbnail_image
+
+        got = thumbnail_image(data)
+        if got is None:
+            return None, None
+        img, mask = _crop_black_bars(got[0], got[1])
+        if mask is None:
+            return None, None
+        rgb = np.asarray(Image.fromarray(np.ascontiguousarray(img), "YCbCr").convert("RGB"))
+    except Exception:  # noqa: BLE001
+        return None, None
+    return rescue_small(rgb, mask.astype(bool), arr, holes)
+
+
+THUMB_FROM_PHOTO = 0.25  # a thumbnail pixel is taken from the photo when less than this share of it is hole
+
+
+def rescue_small(rgb: np.ndarray, real: np.ndarray, arr: np.ndarray, holes: np.ndarray
+                 ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """See thumbnail_rescued: the thumbnail's rotted pixels (~real) from the photo where it
+    is decoded. Returns (RGB, witness mask)."""
+    h, w = arr.shape[:2]
+    th, tw = rgb.shape[:2]
+    if abs((tw / th) / (w / h) - 1.0) > 0.03 or real.shape != (th, tw):
+        return None, None
+    real = real & ~_grow(~real, 1)
+    photo = np.asarray(Image.fromarray(arr).resize((tw, th), Image.BOX))
+    share = np.asarray(Image.fromarray((holes * 255).astype(np.uint8)).resize((tw, th), Image.BOX)) / 255.0
+    from_photo = ~real & (share < THUMB_FROM_PHOTO)
+    small = np.where(real[..., None], rgb, photo).astype(np.uint8)
+    return small, real | from_photo
+
+
+def thumbnail_full(small: np.ndarray | None, shape) -> np.ndarray | None:
+    """thumbnail_picture of an already decoded (or rescued) thumbnail."""
+    if small is None:
+        return None
+    h, w = shape[:2]
+    if abs((small.shape[1] / small.shape[0]) / (w / h) - 1.0) > 0.03:
+        return None
+    return np.asarray(Image.fromarray(small).resize((w, h), Image.BICUBIC))
+
+
 THUMB_SR_SEAM = 12  # pixels along a hole's edge that LaMa blends into the real picture
 
 
@@ -816,14 +880,17 @@ def rotted_stripes(before: np.ndarray, holes: np.ndarray, known: np.ndarray, thu
 def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
                   burst=None, progress=None, quality: str | None = None, stop=None,
                   prompt: str | None = None, thumb: np.ndarray | None = None,
-                  thumb_small: np.ndarray | None = None) -> tuple[np.ndarray, list[str]]:
+                  thumb_small: np.ndarray | None = None, thumb_seen: np.ndarray | None = None
+                  ) -> tuple[np.ndarray, list[str]]:
     """The enhanced copy, step by step. Returns (rgb, what was done, with the time it took).
 
     burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots.
     progress(done, total, what) reports the tiles or windows of the slow steps.
     quality: diffusion preset (see diffusion.PRESETS); prompt: what the scene shows, for
     the diffusion (None: a generic prompt); thumb: the photo's thumbnail at full size (see
-    thumbnail_picture) - stripes it shows too are picture. Raises Stopped when `stop` is set."""
+    thumbnail_picture) - stripes it shows too are picture; thumb_seen: where thumb_small is
+    a witness, for a thumbnail that rotted in part (see thumbnail_rescued; None: all of it).
+    Raises Stopped when `stop` is set."""
     steps = set(steps)
     done: list[str] = []
     real = arr.copy()
@@ -843,7 +910,9 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
     _check(stop)
     if "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
-        arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small)
+        # the guided network learnt on whole thumbnails only
+        arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes,
+                      thumb_small if thumb_seen is None else None)
         real = arr.copy()  # the cleaned picture is the base from here on
         file = engine.deblock_model.file if engine.deblock_model is not None else ""
         which = {"fbcnn-fotomedik.onnx": "FBCNN fine-tuned on your photos, ",
@@ -882,6 +951,15 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             arr, n_seam = heal_on_thumbnail(arr, holes, unknown, thumb_small, engine,
                                             report("LaMa window"), stop, st, faces, known & ~stripes)
             notes = []
+            if thumb_seen is not None:  # the thumbnail rotted in part: where it saw nothing, heal as usual
+                h, w = holes.shape
+                seen = np.asarray(Image.fromarray((thumb_seen * 255).astype(np.uint8)).resize((w, h), Image.NEAREST)) > 0
+                blind = holes & ~seen
+                if blind.any() and engine.inpaint_s is not None:
+                    arr = heal_holes(arr, blind, engine, report("LaMa window"), stop, st)
+                    arr = keep_block_means(arr, before, blind, blind & known & ~stripes)
+                notes.append(f"thumbnail rotted in part, rescued; {100 * blind.sum() / max(1, holes.sum()):.0f} % "
+                             "of the holes, where it saw nothing, healed from the picture around them")
             if n_rot:
                 notes.append(f"{n_rot} block(s) of wrongly coloured stripes "
                              "taken from the thumbnail")

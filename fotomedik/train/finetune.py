@@ -17,6 +17,13 @@ are, so it can take colours and shapes from the thumbnail and keep the decoded d
 It starts from the fine-tuned network when --init gives one (e.g. izlaz/best.pt), with the
 new inputs weighted zero, i.e. exactly where the plain network stands.
 
+--sharp W adds, with weight W, a penalty for lost edges and texture to the average error:
+the average error alone pulls towards blur (a soft guess is never far off). The edge part
+compares the picture's slopes (differences of neighbouring pixels), the texture part the
+strength of its fine patterns (Fourier amplitudes), so the network keeps detail it has
+without inventing any. The best state is then chosen by that same combined error on the
+val patches, not by PSNR (which prefers soft). Start it from a trained network (--init).
+
 A graphics card (CUDA) is used when torch sees one; on the processor it works, slowly.
 Stop it any time (Ctrl+C): the best state so far is exported. --resume continues.
 """
@@ -142,6 +149,43 @@ def psnr_of(net, d: dict, device, guided: bool = False, chunk: int = 16) -> tupl
     return 10 * np.log10(n / max(se_out, 1e-12)), 10 * np.log10(n / max(se_in, 1e-12))
 
 
+def edge_loss(out, y):
+    """Lost edges and texture: L1 of the neighbour differences (slopes) plus L1 of the
+    Fourier amplitudes, both 0 when out has y's detail; blur and invented detail both
+    cost. float32 tensors (N, 3, H, W)."""
+    import torch
+
+    e = (out[..., :, 1:] - out[..., :, :-1] - (y[..., :, 1:] - y[..., :, :-1])).abs().mean() + \
+        (out[..., 1:, :] - out[..., :-1, :] - (y[..., 1:, :] - y[..., :-1, :])).abs().mean()
+    fo = torch.fft.rfft2(out, norm="ortho").abs()
+    fy = torch.fft.rfft2(y, norm="ortho").abs()
+    return e + 0.1 * (fo - fy).abs().mean()
+
+
+def detail_of(net, d: dict, device, guided: bool = False, sharp: float = 0.0, chunk: int = 16) -> tuple[float, float]:
+    """(combined val error L1 + sharp * edge_loss, share of the photo's edge strength the
+    output keeps, %), over all patches."""
+    import torch
+
+    err = kept = ref = 0.0
+    k_n = 0
+    size = d["inp"].shape[1]
+    net.eval()
+    with torch.no_grad():
+        for k in range(0, len(d["inp"]), chunk):
+            idx = np.arange(k, min(k + chunk, len(d["inp"])))
+            xs, y = _tensors(d, idx, [(0, 0)] * len(idx), [False] * len(idx), guided, size)
+            xs = tuple(t.to(device) for t in xs)
+            y = y.to(device)
+            out = net(*xs)[0].float().clamp(0, 1)
+            err += float((out - y).abs().mean() + sharp * edge_loss(out, y)) * len(idx)
+            k_n += len(idx)
+            kept += float((out[..., :, 1:] - out[..., :, :-1]).abs().sum())
+            ref += float((y[..., :, 1:] - y[..., :, :-1]).abs().sum())
+    net.train()
+    return err / max(k_n, 1), 100 * kept / max(ref, 1e-12)
+
+
 def export_onnx(net, path: Path, guided: bool = False) -> None:
     """The network as the program runs it: "input" (N, 3, H, W) in 0..1, H and W multiples
     of 8 (guided: also "guide" (N, 3, H/4, W/4), "has_guide" (N, 1), "holes" (N, 1, H/8,
@@ -183,6 +227,8 @@ def main(argv=None) -> None:
     ap.add_argument("--cpu", action="store_true", help="do not use the graphics card")
     ap.add_argument("--guided", action="store_true", help="train the guided network (sees the thumbnail and the holes)")
     ap.add_argument("--init", type=Path, help="start from this state (a best.pt of the plain fine-tuning)")
+    ap.add_argument("--sharp", type=float, default=0.0,
+                    help="weight of the lost-edges-and-texture penalty (e.g. 0.5; 0 = average error only)")
     a = ap.parse_args(argv)
 
     import torch
@@ -225,6 +271,16 @@ def main(argv=None) -> None:
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.iters, eta_min=a.lr * 0.1)
     start, best = 0, -1.0
     last = a.out / "last.pt"
+
+    def score(n) -> float:
+        """What "best" means: PSNR, or with --sharp the combined error (negated: higher is better)."""
+        if a.sharp > 0:
+            return -detail_of(n, va, device, a.guided, a.sharp)[0]
+        return psnr_of(n, va, device, a.guided)[0]
+
+    def fmt(s: float) -> str:
+        return f"error {-s:.5f}" if a.sharp > 0 else f"{s:.2f} dB"
+
     if a.resume and last.exists():
         st = torch.load(last, map_location="cpu", weights_only=False)
         net.load_state_dict(st["net"])
@@ -237,9 +293,9 @@ def main(argv=None) -> None:
         best_state = torch.load(a.out / "best.pt", map_location="cpu", weights_only=True)
         cur_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
         net.load_state_dict(best_state)
-        best, _ = psnr_of(net, va, device, a.guided)
+        best = score(net)
         net.load_state_dict(cur_state)
-        print(f"resumed at iteration {start}: now {p_now:.2f} dB, best so far {best:.2f} dB "
+        print(f"resumed at iteration {start}: now {p_now:.2f} dB, best so far {fmt(best)} "
               f"(repair as it is {p_in:.2f} dB, on today's check patches)")
         if start >= sched.T_max:  # more iterations asked for than the last run had: a new, gentler schedule
             lr = a.lr * 0.5
@@ -251,6 +307,10 @@ def main(argv=None) -> None:
         p_net, p_in = psnr_of(net, va, device, a.guided)
         print(f"before training: repair as it is {p_in:.2f} dB, the network as it starts {p_net:.2f} dB")
         best = p_net
+        if a.sharp > 0:
+            best, kept = detail_of(net, va, device, a.guided, a.sharp)
+            best = -best
+            print(f"  combined {fmt(best)}, edges kept {kept:.1f} % of the photo's")
         torch.save(net.state_dict(), a.out / "best.pt")
 
     use_amp = device.type == "cuda"
@@ -268,6 +328,8 @@ def main(argv=None) -> None:
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 out = net(*xs)[0]
                 loss = l1(out.float(), y)
+            if a.sharp > 0:  # outside autocast: the Fourier transform in float32
+                loss = loss + a.sharp * edge_loss(out.float(), y)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -280,12 +342,16 @@ def main(argv=None) -> None:
                       flush=True)
             if it % a.check == 0 or it == a.iters:
                 p_net, p_in = psnr_of(net, va, device, a.guided)
+                s, extra = p_net, ""
+                if a.sharp > 0:
+                    err, kept = detail_of(net, va, device, a.guided, a.sharp)
+                    s, extra = -err, f", {fmt(-err)}, edges kept {kept:.1f} %"
                 mark = ""
-                if p_net > best:
-                    best = p_net
+                if s > best:
+                    best = s
                     torch.save(net.state_dict(), a.out / "best.pt")
                     mark = "  <- best so far"
-                print(f"check at {it}: {p_net:.2f} dB (repair as it is {p_in:.2f} dB){mark}", flush=True)
+                print(f"check at {it}: {p_net:.2f} dB (repair as it is {p_in:.2f} dB){extra}{mark}", flush=True)
                 torch.save({"net": net.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
                             "iter": it, "best": best}, last)
     except KeyboardInterrupt:
@@ -295,7 +361,7 @@ def main(argv=None) -> None:
     name = ONNX_GUIDED if a.guided else ONNX_NAME
     onnx_path = a.out / name
     export_onnx(net, onnx_path, a.guided)
-    print(f"best: {best:.2f} dB -> {onnx_path}")
+    print(f"best: {fmt(best)} -> {onnx_path}")
     if a.install:
         dst = model_dir() / name
         dst.parent.mkdir(parents=True, exist_ok=True)

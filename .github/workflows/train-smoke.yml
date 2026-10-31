@@ -46,6 +46,8 @@ jobs:
         run: python -m fotomedik.train.finetune pairs out --iters 4 --check 2 --batch 2 --cpu
       - name: Guided, starting from that
         run: python -m fotomedik.train.finetune pairs out_g --guided --init out/best.pt --iters 4 --check 2 --batch 2 --cpu
+      - name: Against softness (edges and texture), from that
+        run: python -m fotomedik.train.finetune pairs out_s --guided --init out_g/best.pt --sharp 0.5 --iters 4 --check 2 --batch 2 --cpu
       - name: The program runs the exported networks
         run: |
           python - <<'EOF'

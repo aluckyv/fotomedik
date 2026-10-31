@@ -56,6 +56,8 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
     w, h = _dims(ctx.data)
     rep = FileReport.from_context(ctx, findings_before=[f.to_dict() for f in diag.findings], width=w, height=h)
     rep.unknown = _unknown_holes(ctx)
+    if rep.holes and ctx.fallback is None:
+        rep.thumb = _rescued_thumbnail(ctx, w, h)
     if ctx.memo.get("reference_used") and options.get("reference"):
         rep.reference = Path(str(options["reference"])).name
     if ctx.memo.get("twin_used"):
@@ -67,6 +69,28 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
         else:
             rep.recovered_pct = round(100 * diag.recovered_fraction, 1) if not diag.findings or diag.openable else None
     return ctx, rep
+
+
+def _rescued_thumbnail(ctx: Context, w, h) -> tuple | None:
+    """(RGB, real-pixel mask or None) of the thumbnail the repair could rescue (with the
+    set's healthy thumbnails), when the repaired file alone gives no whole thumbnail."""
+    try:
+        import numpy as np
+        from PIL import Image
+
+        from .ai.enhance import thumbnail_rgb
+        from .recipes.dcfield import _crop_black_bars, thumbnail_image
+
+        if thumbnail_rgb(ctx.data) is not None:
+            return None
+        got = thumbnail_image(ctx.original, ctx.options.get("thumb_refs"), None if not (w and h) else w >= h)
+        if got is None:
+            return None
+        img, mask = _crop_black_bars(got[0], got[1])
+        rgb = np.asarray(Image.fromarray(np.ascontiguousarray(img), "YCbCr").convert("RGB"))
+        return rgb, None if mask is None else np.asarray(mask) > 0.5
+    except Exception:  # noqa: BLE001 - only an extra for the AI copy
+        return None
 
 
 def _unknown_holes(ctx: Context) -> list[tuple[int, int]]:

@@ -277,3 +277,43 @@ def test_batch_only_when_tiles_stay_apart():
     assert not _batch_ok(Mixing())
     assert _batch_ok(Clean())
     assert not _batch_ok(FakeSR())  # a fixed batch of one
+
+
+def test_thumbnail_rotted_in_part_is_rescued_from_the_photo():
+    """A thumbnail whose bottom rotted: its real part stays, the rest comes from the photo
+    where the photo is decoded; where neither knows, nothing is a witness."""
+    from fotomedik.ai.enhance import rescue_small
+
+    rng = np.random.default_rng(3)
+    arr = rng.integers(60, 200, (160, 120, 3), dtype=np.uint8)
+    holes = np.zeros((160, 120), bool)
+    holes[120:, :60] = True  # bottom left lost in the photo
+    rgb = np.full((40, 30, 3), 90, np.uint8)
+    real = np.ones((40, 30), bool)
+    real[30:] = False  # the bottom quarter of the thumbnail rotted
+    small, seen = rescue_small(rgb, real, arr, holes)
+    assert small[10, 10, 0] == 90 and seen[:29].all()  # the real part (one row in from the damage)
+    assert seen[35, 25] and not seen[35, 5]  # bottom right from the photo; bottom left: no witness
+    assert abs(int(small[35, 25, 0]) - int(arr[140:144, 100:104, 0].mean())) <= 2
+    assert rescue_small(rgb, real, arr[:, :60], holes[:, :60]) == (None, None)  # another shape
+
+
+def test_holes_the_rescued_thumbnail_never_saw_are_healed_from_the_picture():
+    from fotomedik.ai.enhance import enhance_steps
+
+    rng = np.random.default_rng(4)
+    arr = rng.integers(60, 200, (128, 160, 3), dtype=np.uint8)
+    holes = np.zeros((128, 160), bool)
+    holes[40:56, :] = True  # seen by the thumbnail
+    holes[96:120, :] = True  # where the thumbnail rotted and the photo is lost: no witness
+    small = rng.integers(60, 200, (8, 10, 3), dtype=np.uint8)
+    seen = np.ones((8, 10), bool)
+    seen[6:] = False
+    unknown = np.zeros_like(holes)
+    unknown[96:120] = True  # the repair had no colours there either
+    eng = Engine(FakeSR(), FakeLama())
+    out, done = enhance_steps(arr, holes, unknown, eng, ["thumbsr"], thumb_small=small, thumb_seen=seen)
+    assert np.array_equal(out[~holes], arr[~holes])
+    assert any("rescued" in d for d in done)
+    assert (out[100:116, 8:150] == 200).all()  # FakeLama's fill where the thumbnail saw nothing
+    assert not (out[44:52, 8:150] == 200).all()  # the thumbnail's where it saw
