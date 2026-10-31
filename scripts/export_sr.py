@@ -172,13 +172,6 @@ def _swinir(wdir: Path, odir: Path, repo: str):  # with the architecture from it
                      upsampler="pixelshuffle", resi_connection="1conv")
         net.load_state_dict(_swin_state(p), strict=False)
         export(Padded(net), odir / "SwinIR-M_classical_x4.onnx", SWIN_TILE, fixed=True)
-    p = wdir / "003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_PSNR.pth"
-    if p.exists():
-        net = SwinIR(upscale=4, in_chans=3, img_size=SWIN_TILE, window_size=8, img_range=1.0,
-                     depths=[6] * 9, embed_dim=240, num_heads=[8] * 9, mlp_ratio=2,
-                     upsampler="nearest+conv", resi_connection="3conv")
-        net.load_state_dict(_swin_state(p), strict=False)
-        export(Padded(net), odir / "SwinIR-L_real_x4_PSNR.onnx", SWIN_TILE, fixed=True)
 
 
 if __name__ == "__main__":
