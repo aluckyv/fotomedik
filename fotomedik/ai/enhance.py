@@ -132,6 +132,7 @@ class Engine:
         self.notes: list[str] = []
         self.loaded: set[str] = set()
         self.sr_batch = 1
+        self.deblock_model = None  # which FBCNN (models.DEBLOCK or the fine-tuned one)
         self.thumb_sr = None  # the thumbnail step's enlarger (None: `sr`)
         self.thumb_batch = 1
         self.enlarger: str | None = None  # its key (models.ENLARGERS)
@@ -219,7 +220,8 @@ class Engine:
             if self.inpaint_s is None:
                 self.inpaint_s = session(models.INPAINT)
         if "deblock" in steps:
-            self.deblock_s = session(models.DEBLOCK)
+            self.deblock_model = models.deblocker()
+            self.deblock_s = session(self.deblock_model)
         if ({"ai", "thumbsr"} & steps) and self.face_det is None:  # small; the healing keeps away from faces
             try:
                 self.face_det = str(models.ensure(models.FACE_DET, progress, stop))
@@ -790,7 +792,9 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         t0, st = time.perf_counter(), {}
         arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st)
         real = arr.copy()  # the cleaned picture is the base from here on
-        done.append(f"JPEG blocks and noise removed ({st.get('tiles', 0)} tiles, {_took(t0)})")
+        tuned = engine.deblock_model is not None and engine.deblock_model.file == "fbcnn-fotomedik.onnx"
+        done.append(f"JPEG blocks and noise removed ({'FBCNN fine-tuned on your photos, ' if tuned else ''}"
+                    f"{st.get('tiles', 0)} tiles, {_took(t0)})")
     if holes.any():
         before = arr
         if "diffusion" in steps and engine.sd is not None:

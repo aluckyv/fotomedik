@@ -67,6 +67,23 @@ DEBLOCK = Model(
     288,
     "Apache-2.0 (FBCNN, Jiang, Zhang, Timofte)",
 )
+# FBCNN fine-tuned on the user's own photos (fotomedik.train.finetune --install puts it
+# here); never downloaded: when the file is in the model folder, JPEG clean-up uses it
+DEBLOCK_TUNED = Model(
+    "FBCNN fine-tuned on your photos (JPEG clean-up)",
+    "fbcnn-fotomedik.onnx",
+    (),
+    None,
+    288,
+    "Apache-2.0 (FBCNN, Jiang, Zhang, Timofte), fine-tuned locally",
+)
+
+
+def deblocker() -> Model:
+    """The JPEG clean-up network: the fine-tuned one when it is installed."""
+    return DEBLOCK_TUNED if (model_dir() / DEBLOCK_TUNED.file).exists() else DEBLOCK
+
+
 FACE_DET = Model(
     "YuNet (face detection)",
     "face_detection_yunet_2023mar.onnx",
@@ -113,7 +130,7 @@ STEP_MODELS = {
     "faces": (FACE_DET, FACE),
     "diffusion": (INPAINT, SR, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT, CLIP_VOCAB, CLIP_MERGES),  # SR enlarges the holes
 }
-ALL = tuple(m for ms in STEP_MODELS.values() for m in ms) + (SR_NET, SR_SWIN)
+ALL = tuple(m for ms in STEP_MODELS.values() for m in ms) + (SR_NET, SR_SWIN, DEBLOCK_TUNED)
 
 
 def model_dir() -> Path:
@@ -139,6 +156,8 @@ def needed(steps, enlarger: str | None = None) -> list[Model]:
     out: list[Model] = []
     for st in steps:
         ms = STEP_MODELS.get(st, ())
+        if st == "deblock":
+            ms = (deblocker(),)
         if st == "thumbsr":
             ms = tuple(ENLARGERS.get(enlarger or DEFAULT_ENLARGER, SR) if m is SR else m for m in ms)
         for m in ms:

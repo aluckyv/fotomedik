@@ -1,0 +1,55 @@
+name: train-smoke
+
+# The deblocker's fine-tuning runs on the user's computer; here it is tried on a few
+# made-up patches (CPU, a handful of iterations) so a change cannot break it unseen.
+on:
+  push:
+    paths:
+      - "fotomedik/train/**"
+      - ".github/workflows/train-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install onnx onnxscript onnxruntime .
+      - name: Pairs from a made-up photo
+        run: |
+          python - <<'EOF'
+          import numpy as np
+          from pathlib import Path
+          from fotomedik.train.pairs import _Shards, cut_patches
+          rng = np.random.default_rng(0)
+          out = Path("pairs"); out.mkdir()
+          for prefix in ("train", "val"):
+              sh = _Shards(out, prefix)
+              for k in range(3):
+                  good = rng.integers(0, 255, (256, 320, 3), dtype=np.uint8)
+                  rep = good.copy(); rep[64:128, 64:256] = 128
+                  a, b = cut_patches(rep, good, 8, rng)
+                  sh.add(a, b)
+              sh.flush()
+          print(sorted(p.name for p in out.iterdir()))
+          EOF
+      - name: Fine-tune a few iterations and export
+        run: python -m fotomedik.train.finetune pairs out --iters 4 --check 2 --batch 2 --cpu
+      - name: The program runs the exported network
+        run: |
+          python - <<'EOF'
+          import numpy as np, onnxruntime as ort
+          from fotomedik.ai.enhance import Engine, deblock
+          s = ort.InferenceSession("out/fbcnn-fotomedik.onnx", providers=["CPUExecutionProvider"])
+          eng = Engine(deblock=s)
+          arr = np.random.default_rng(1).integers(0, 255, (200, 300, 3), dtype=np.uint8)
+          out = deblock(arr, eng)
+          assert out.shape == arr.shape, out.shape
+          print("ok", out.shape, float(np.abs(out.astype(int) - arr).mean()))
+          EOF
