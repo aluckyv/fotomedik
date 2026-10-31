@@ -686,25 +686,59 @@ DEBLOCK_TILE = 512
 DEBLOCK_PAD = 16
 
 
-def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: dict | None = None) -> np.ndarray:
-    """Remove JPEG blocking and ringing from the whole picture (FBCNN), tile by tile."""
+def quarter_guide(small: np.ndarray | None, shape) -> np.ndarray | None:
+    """The thumbnail at a quarter of the picture's size (h/4, w/4, RGB uint8), the way the
+    guided clean-up network sees it (in training too), or None (no thumbnail, or one of
+    another shape than the photo)."""
+    if small is None:
+        return None
+    h, w = shape[:2]
+    if abs((small.shape[1] / small.shape[0]) / (w / h) - 1.0) > 0.03:
+        return None
+    return np.asarray(Image.fromarray(small).resize((max(1, w // 4), max(1, h // 4)), Image.LANCZOS))
+
+
+def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: dict | None = None,
+            holes: np.ndarray | None = None, thumb_small: np.ndarray | None = None) -> np.ndarray:
+    """Remove JPEG blocking and ringing from the whole picture (FBCNN), tile by tile. The
+    guided network (fine-tuned with the thumbnail, four inputs) also gets the thumbnail at a
+    quarter size and the holes per 8x8 block, and rebuilds the holes from them."""
     s = engine.deblock_s
-    name = s.get_inputs()[0].name
+    ins = s.get_inputs()
+    name = ins[0].name
+    guided = len(ins) >= 4
     h, w = arr.shape[:2]
     x = arr.astype(np.float32) / 255.0
     out = np.empty_like(x)
     p = DEBLOCK_PAD
-    padded = np.pad(x, ((p, p + DEBLOCK_TILE), (p, p + DEBLOCK_TILE), (0, 0)), mode="reflect")
-    tiles = [(y, x0) for y in range(0, h, DEBLOCK_TILE) for x0 in range(0, w, DEBLOCK_TILE)]
+    T = DEBLOCK_TILE
+    padded = np.pad(x, ((p, p + T), (p, p + T), (0, 0)), mode="reflect")
+    if guided:
+        g = quarter_guide(thumb_small, arr.shape)
+        has = 0.0 if g is None else 1.0
+        gq = np.zeros((h // 4, w // 4, 3), np.float32) if g is None else g.astype(np.float32) / 255.0
+        gq = np.pad(gq, ((p // 4, (p + T) // 4 + 2), (p // 4, (p + T) // 4 + 2), (0, 0)), mode="edge")
+        hb = np.zeros((h // 8, w // 8), np.float32)
+        if holes is not None and holes.any():
+            hm = holes[: h // 8 * 8, : w // 8 * 8]
+            hb = hm.reshape(h // 8, 8, w // 8, 8).any(axis=(1, 3)).astype(np.float32)
+        hb = np.pad(hb, ((p // 8, (p + T) // 8 + 2), (p // 8, (p + T) // 8 + 2)), mode="edge")
+    tiles = [(y, x0) for y in range(0, h, T) for x0 in range(0, w, T)]
     if stats is not None:
         stats["tiles"] = len(tiles)
     for i, (y, x0) in enumerate(tiles):
         _check(stop)
-        th, tw = min(DEBLOCK_TILE, h - y), min(DEBLOCK_TILE, w - x0)
+        th, tw = min(T, h - y), min(T, w - x0)
         ph, pw = -(-(th + 2 * p) // 8) * 8, -(-(tw + 2 * p) // 8) * 8  # the network halves 3 times
         tile = padded[y : y + ph, x0 : x0 + pw]
-        inp = np.ascontiguousarray(tile.transpose(2, 0, 1)[None], dtype=np.float32)
-        res = [r for r in s.run(None, {name: inp}) if getattr(r, "ndim", 0) == 4][0][0].transpose(1, 2, 0)
+        feeds = {name: np.ascontiguousarray(tile.transpose(2, 0, 1)[None], dtype=np.float32)}
+        if guided:
+            gt = gq[y // 4 : y // 4 + ph // 4, x0 // 4 : x0 // 4 + pw // 4]
+            mt = hb[y // 8 : y // 8 + ph // 8, x0 // 8 : x0 // 8 + pw // 8]
+            feeds[ins[1].name] = np.ascontiguousarray(gt.transpose(2, 0, 1)[None], dtype=np.float32)
+            feeds[ins[2].name] = np.array([[has]], np.float32)
+            feeds[ins[3].name] = np.ascontiguousarray(mt[None, None], dtype=np.float32)
+        res = [r for r in s.run(None, feeds) if getattr(r, "ndim", 0) == 4][0][0].transpose(1, 2, 0)
         out[y : y + th, x0 : x0 + tw] = res[p : p + th, p : p + tw]
         if progress:
             progress(i + 1, len(tiles))
@@ -809,11 +843,12 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
     _check(stop)
     if "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
-        arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st)
+        arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small)
         real = arr.copy()  # the cleaned picture is the base from here on
-        tuned = engine.deblock_model is not None and engine.deblock_model.file == "fbcnn-fotomedik.onnx"
-        done.append(f"JPEG blocks and noise removed ({'FBCNN fine-tuned on your photos, ' if tuned else ''}"
-                    f"{st.get('tiles', 0)} tiles, {_took(t0)})")
+        file = engine.deblock_model.file if engine.deblock_model is not None else ""
+        which = {"fbcnn-fotomedik.onnx": "FBCNN fine-tuned on your photos, ",
+                 "fbcnn-fotomedik-guided.onnx": "FBCNN guided by the thumbnail, fine-tuned on your photos, "}.get(file, "")
+        done.append(f"JPEG blocks and noise removed ({which}{st.get('tiles', 0)} tiles, {_took(t0)})")
     if holes.any():
         before = arr
         if "diffusion" in steps and engine.sd is not None:

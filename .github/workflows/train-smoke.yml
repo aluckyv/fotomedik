@@ -26,7 +26,7 @@ jobs:
           python - <<'EOF'
           import numpy as np
           from pathlib import Path
-          from fotomedik.train.pairs import _Shards, cut_patches
+          from fotomedik.train.pairs import _Shards, cut_patches, extras_at
           rng = np.random.default_rng(0)
           out = Path("pairs"); out.mkdir()
           for prefix in ("train", "val"):
@@ -34,22 +34,29 @@ jobs:
               for k in range(3):
                   good = rng.integers(0, 255, (256, 320, 3), dtype=np.uint8)
                   rep = good.copy(); rep[64:128, 64:256] = 128
-                  a, b = cut_patches(rep, good, 8, rng)
-                  sh.add(a, b)
+                  holes = np.zeros((32, 40), bool); holes[8:16, 8:32] = True
+                  v = {"guide": good[::4, ::4].copy() if k else None, "holes": holes}
+                  places = []
+                  a, b = cut_patches(rep, good, 8, rng, places_out=places)
+                  sh.add(a, b, *extras_at(v, places))
               sh.flush()
           print(sorted(p.name for p in out.iterdir()))
           EOF
       - name: Fine-tune a few iterations and export
         run: python -m fotomedik.train.finetune pairs out --iters 4 --check 2 --batch 2 --cpu
-      - name: The program runs the exported network
+      - name: Guided, starting from that
+        run: python -m fotomedik.train.finetune pairs out_g --guided --init out/best.pt --iters 4 --check 2 --batch 2 --cpu
+      - name: The program runs the exported networks
         run: |
           python - <<'EOF'
           import numpy as np, onnxruntime as ort
           from fotomedik.ai.enhance import Engine, deblock
-          s = ort.InferenceSession("out/fbcnn-fotomedik.onnx", providers=["CPUExecutionProvider"])
-          eng = Engine(deblock=s)
-          arr = np.random.default_rng(1).integers(0, 255, (200, 300, 3), dtype=np.uint8)
-          out = deblock(arr, eng)
-          assert out.shape == arr.shape, out.shape
-          print("ok", out.shape, float(np.abs(out.astype(int) - arr).mean()))
+          rng = np.random.default_rng(1)
+          arr = rng.integers(0, 255, (200, 300, 3), dtype=np.uint8)
+          holes = np.zeros((200, 300), bool); holes[40:80] = True
+          for f in ("out/fbcnn-fotomedik.onnx", "out_g/fbcnn-fotomedik-guided.onnx"):
+              s = ort.InferenceSession(f, providers=["CPUExecutionProvider"])
+              out = deblock(arr, Engine(deblock=s), holes=holes, thumb_small=arr[::8, ::8].copy())
+              assert out.shape == arr.shape, out.shape
+              print("ok", f, out.shape, float(np.abs(out.astype(int) - arr).mean()))
           EOF

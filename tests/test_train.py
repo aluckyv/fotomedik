@@ -44,3 +44,43 @@ def test_damage_after_a_cut_stays_inside_the_file():
     for seed in range(300):  # every pair of kinds, cuts before flips among them
         bad, what = damage(good, good, seed)
         assert bad[:2] == b"\xff\xd8" and what
+
+
+def test_guided_deblocker_gets_thumbnail_and_holes_in_step_with_the_tiles(tmp_path, monkeypatch):
+    """The guided network gets, for every tile, the thumbnail at a quarter and the holes per
+    8x8 block, cut at the same place as the tile; and it is preferred when installed."""
+    from fotomedik.ai import models
+    from fotomedik.ai.enhance import Engine, deblock
+
+    class In:
+        def __init__(self, name):
+            self.name = name
+
+    seen = []
+
+    class Guided:
+        def get_inputs(self):
+            return [In("input"), In("guide"), In("has_guide"), In("holes")]
+
+        def run(self, _o, feeds):
+            x, g, hv, m = feeds["input"], feeds["guide"], feeds["has_guide"], feeds["holes"]
+            assert g.shape[2:] == (x.shape[2] // 4, x.shape[3] // 4)
+            assert m.shape[2:] == (x.shape[2] // 8, x.shape[3] // 8)
+            seen.append((float(hv[0, 0]), float(m.mean())))
+            return [x, np.zeros((1, 1), np.float32)]
+
+    rng = np.random.default_rng(0)
+    arr = rng.integers(0, 255, (600, 700, 3), dtype=np.uint8)
+    holes = np.zeros((600, 700), bool)
+    holes[96:160] = True
+    small = rng.integers(0, 255, (137, 160, 3), dtype=np.uint8)  # the photo's 7:6 shape
+    out = deblock(arr, Engine(deblock=Guided()), holes=holes, thumb_small=small)
+    assert np.abs(out.astype(int) - arr).max() <= 1  # the stand-in gives the picture back
+    assert all(hv == 1.0 for hv, _m in seen) and any(m > 0 for _hv, m in seen)
+    deblock(arr, Engine(deblock=Guided()), holes=holes, thumb_small=None)
+    assert seen[-1][0] == 0.0  # no thumbnail: the network is told so
+
+    monkeypatch.setenv("FOTOMEDIK_MODELS", str(tmp_path))
+    (tmp_path / models.DEBLOCK_TUNED.file).write_bytes(b"x")
+    (tmp_path / models.DEBLOCK_GUIDED.file).write_bytes(b"x")
+    assert models.needed(["deblock"]) == [models.DEBLOCK_GUIDED]

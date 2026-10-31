@@ -79,9 +79,23 @@ DEBLOCK_TUNED = Model(
 )
 
 
+# FBCNN fine-tuned with the thumbnail and the holes as inputs (finetune --guided --install)
+DEBLOCK_GUIDED = Model(
+    "FBCNN guided by the thumbnail, fine-tuned on your photos (JPEG clean-up)",
+    "fbcnn-fotomedik-guided.onnx",
+    (),
+    None,
+    288,
+    "Apache-2.0 (FBCNN, Jiang, Zhang, Timofte), fine-tuned locally",
+)
+
+
 def deblocker() -> Model:
-    """The JPEG clean-up network: the fine-tuned one when it is installed."""
-    return DEBLOCK_TUNED if (model_dir() / DEBLOCK_TUNED.file).exists() else DEBLOCK
+    """The JPEG clean-up network: the guided one, else the fine-tuned one, when installed."""
+    for m in (DEBLOCK_GUIDED, DEBLOCK_TUNED):
+        if (model_dir() / m.file).exists():
+            return m
+    return DEBLOCK
 
 
 FACE_DET = Model(
@@ -130,7 +144,7 @@ STEP_MODELS = {
     "faces": (FACE_DET, FACE),
     "diffusion": (INPAINT, SR, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT, CLIP_VOCAB, CLIP_MERGES),  # SR enlarges the holes
 }
-ALL = tuple(m for ms in STEP_MODELS.values() for m in ms) + (SR_NET, SR_SWIN, DEBLOCK_TUNED)
+ALL = tuple(m for ms in STEP_MODELS.values() for m in ms) + (SR_NET, SR_SWIN, DEBLOCK_TUNED, DEBLOCK_GUIDED)
 
 
 def model_dir() -> Path:
