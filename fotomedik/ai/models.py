@@ -49,7 +49,7 @@ SR_SWIN = Model(
 )
 # the thumbnail step's enlarger, by the key the user picks
 ENLARGERS = {"esrgan": SR, "esrnet": SR_NET, "swinir": SR_SWIN}
-DEFAULT_ENLARGER = "esrgan"  # sharpest; on the 2005 photos it looked best (faces are guarded)
+DEFAULT_ENLARGER = "swinir"  # invents least; on the 2005 photos the best balance (Real-ESRGAN: sharper, adds lines)
 INPAINT = Model(
     "LaMa (inpainting)",
     "lama_fp32.onnx",

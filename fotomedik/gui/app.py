@@ -309,8 +309,8 @@ class MainWindow(QMainWindow):
         self.steps["burst"].setChecked(True)
         self.ai = self.steps["ai"]  # older name (smoke test)
         self.enlarger = QComboBox()
-        for key, label in (("esrgan", "Real-ESRGAN (sharp)"), ("esrnet", "Real-ESRNet (soft)"),
-                           ("swinir", "SwinIR (faithful)")):
+        for key, label in (("swinir", "SwinIR (faithful)"), ("esrgan", "Real-ESRGAN (sharp)"),
+                           ("esrnet", "Real-ESRNet (soft)")):
             self.enlarger.addItem(label, key)
         self.enlarger.setToolTip("The network that enlarges the thumbnail for \"thumbnail enlarged by AI\".\n"
                                  "SwinIR: closest to the real photo, softer; slower on the processor.\n"
