@@ -129,7 +129,11 @@ def hole_coefficients(dc: np.ndarray, holes: np.ndarray, quant: np.ndarray) -> n
     return out
 
 
-BRIDGE_MAX = 40  # pixels: gaps up to this tall are bridged from the real pixels above and below
+# pixels: gaps up to this tall would be bridged from the real pixels above and below, column
+# by column. Off: in texture (hair, foliage) the columns become vertical streaks cut into
+# 8x8 blocks, and on the bench the smooth surface fits the real photo better (structural
+# similarity in the holes 0.715 against 0.706 with 40-pixel bridges, 96 photos).
+BRIDGE_MAX = 0
 
 
 def component_planes(data: bytes, ft, comps) -> dict | None:
@@ -285,7 +289,7 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None, junk_mcus: 
             dcg = np.where(holes, dc_ref, dcg)
         else:
             ac = hole_coefficients(arr, holes, quant)
-            if planes_ok:
+            if planes_ok and BRIDGE_MAX > 0:
                 bridged, good = bridge_coefficients(planes[c.cid], holes, quant)
                 ac = np.where(good[..., None], bridged, ac)
         grids[c.cid] = (dcg, ac, np.rint(sr.dc[c.cid]).astype(np.int32))
