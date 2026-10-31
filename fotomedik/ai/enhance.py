@@ -445,6 +445,7 @@ STRIPE_RUN = 3  # blocks side by side that make a stripe
 JUNK_TOL = (50.0, 18.0)  # the same for decoded blocks next to a hole (the end of a rotted stretch)
 JUNK_NEAR = 16  # pixels from a hole within which decoded blocks are checked
 STRIPE_EDGE = 48  # pixels above and below a rotted stripe where hole blocks off the thumbnail join it (thumbsr)
+LIGHT_LUMA = 200.0  # block brightness of a lamp or window, where the stripe test is not used (thumbsr)
 EDGE_AGREE = (10.0, 6.0)  # off the thumbnail by more than this (luma, chroma): still the stripe's edge
 JUNK_BLEND = 4  # pixels around a rotted stripe also replaced when the thumbnail fills it (thumbsr)
 
@@ -513,7 +514,7 @@ def heal_on_thumbnail(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, s
         soft = _smooth_thumbnail(small, arr.shape)
         f = _soft(faces, 6.0)[..., None]
         base = base * (1 - f) + soft * f
-    base = keep_block_means(np.clip(np.rint(base), 0, 255).astype(np.uint8), before, holes, known)
+    base = keep_block_means(np.clip(np.rint(base), 0, 255).astype(np.uint8), before, holes, known, spread=True)
     a = _soft(holes, 2.0)[..., None]
     out = np.clip(np.rint(before * (1 - a) + base.astype(np.float32) * a), 0, 255).astype(np.uint8)
     seam = holes & _grow(~holes, THUMB_SR_SEAM)
@@ -587,9 +588,36 @@ def colour_stripes(ref: np.ndarray, known: np.ndarray, tol=STRIPE_TOL, thumb: np
     return np.repeat(np.repeat(keep, 8, 0), 8, 1)[:h, :w]
 
 
-def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray) -> np.ndarray:
+def _spread(diff: np.ndarray, known: np.ndarray, todo: np.ndarray, rounds: int = 40) -> np.ndarray:
+    """`diff` (block grid, 3 channels) filled in the `todo` blocks from the known ones
+    around them by repeated neighbour averaging; blocks with no known block in reach
+    keep 0."""
+    if not todo.any() or not known.any():
+        return diff
+    val = np.where(known[..., None], diff, 0.0)
+    w = known.astype(np.float64)
+    out = diff.copy()
+    for _ in range(rounds):
+        pv = np.pad(val, ((1, 1), (1, 1), (0, 0)))
+        pw = np.pad(w, 1)
+        sv = pv[:-2, 1:-1] + pv[2:, 1:-1] + pv[1:-1, :-2] + pv[1:-1, 2:]
+        sw = pw[:-2, 1:-1] + pw[2:, 1:-1] + pw[1:-1, :-2] + pw[1:-1, 2:]
+        got = todo & (sw > 0)
+        val = np.where(got[..., None], sv / np.maximum(sw, 1e-9)[..., None], val)
+        w = np.where(got, 1.0, w)
+        w = np.where(known, 1.0, w)
+        val = np.where(known[..., None], diff, val)
+    reached = todo & (w > 0)
+    out[reached] = val[reached]
+    return out
+
+
+def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray,
+                     spread: bool = False) -> np.ndarray:
     """Give every 8x8 block of `out` the average it has in `ref` where `known`, through
-    a smooth correction (no steps between blocks). Only pixels inside holes move."""
+    a smooth correction (no steps between blocks). Only pixels inside holes move.
+    spread: hole blocks that are not known take the correction of the known blocks
+    around them instead of none, so they do not stand out as patches."""
     from ..recipes.r12_smooth import surface
 
     h, w = holes.shape
@@ -600,6 +628,9 @@ def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known:
     k = np.pad(known, pad[:2], mode="edge").reshape(bh, 8, bw, 8).any(axis=(1, 3))
     diff = (r - o).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
     diff[~k] = 0.0
+    if spread:
+        hb = np.pad(holes, pad[:2], mode="edge").reshape(bh, 8, bw, 8).any(axis=(1, 3))
+        diff = _spread(diff, k, hb & ~k)
     corr = np.stack([surface(diff[..., c]) for c in range(3)], axis=-1)[:h, :w]
     res = out.astype(np.float32) + corr * holes[..., None]
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)
@@ -637,6 +668,21 @@ def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: di
 def _took(t0: float) -> str:
     s = time.perf_counter() - t0
     return f"{s:.1f} s" if s < 10 else f"{s:.0f} s"
+
+
+def _lights(before: np.ndarray, thumb: np.ndarray) -> np.ndarray:
+    """Pixels of blocks (grown by a block) that are near white in the thumbnail: lamps,
+    windows, the sun. (Not the picture: a rotted stripe is often bright itself.)"""
+    h, w = before.shape[:2]
+    bh, bw = -(-h // 8), -(-w // 8)
+    lum = _block_ycc(thumb, bh, bw)[..., 0]
+    b = lum > LIGHT_LUMA
+    g = b.copy()
+    g[1:] |= b[:-1]
+    g[:-1] |= b[1:]
+    g[:, 1:] |= b[:, :-1]
+    g[:, :-1] |= b[:, 1:]
+    return np.repeat(np.repeat(g, 8, 0), 8, 1)[:h, :w]
 
 
 def _stripe_edges(before: np.ndarray, thumb: np.ndarray, holes: np.ndarray, rot: np.ndarray) -> np.ndarray:
@@ -740,6 +786,10 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             faces = thumbnail_faces(before, thumb_small, engine.face_det) & ~stamp
             known = holes & ~unknown
             stripes, junk = rotted_stripes(before, holes, known, thumb, faces, stamp)
+            if thumb is not None:  # lamps and windows: the small thumbnail blurs them, they are no stripes
+                lights = _lights(before, thumb)
+                stripes &= ~lights
+                junk &= ~lights
             if thumb is not None and (stripes | junk).any():
                 stripes |= _stripe_edges(before, thumb, holes & ~faces, stripes | junk)
             n_rot = int((junk | (stripes & holes)).sum()) // 64
