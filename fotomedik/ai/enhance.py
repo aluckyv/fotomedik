@@ -444,6 +444,9 @@ STRIPE_TOL = (40.0, 12.0)  # gray levels (luma, chroma) a block may differ from 
 STRIPE_RUN = 3  # blocks side by side that make a stripe
 JUNK_TOL = (50.0, 18.0)  # the same for decoded blocks next to a hole (the end of a rotted stretch)
 JUNK_NEAR = 16  # pixels from a hole within which decoded blocks are checked
+STRIPE_EDGE = 48  # pixels above and below a rotted stripe where hole blocks off the thumbnail join it (thumbsr)
+EDGE_AGREE = (10.0, 6.0)  # off the thumbnail by more than this (luma, chroma): still the stripe's edge
+JUNK_BLEND = 4  # pixels around a rotted stripe also replaced when the thumbnail fills it (thumbsr)
 
 
 THUMB_AGREE = (30.0, 14.0)  # block average this close (luma, chroma) to the thumbnail's: no stripe
@@ -495,25 +498,28 @@ def thumbnail_base(small: np.ndarray, shape, engine: "Engine") -> np.ndarray:
 
 def heal_on_thumbnail(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, small: np.ndarray,
                       engine: "Engine", progress=None, stop=None, stats: dict | None = None,
-                      faces: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+                      faces: np.ndarray | None = None, known: np.ndarray | None = None) -> tuple[np.ndarray, int]:
     """Holes filled from the thumbnail enlarged by Real-ESRGAN (thumbnail_base), in the
     colours the repair gave them (block averages kept), and the seams along every hole's
     edge healed by LaMa. On faces the thumbnail is only enlarged smoothly: Real-ESRGAN
     invents eyes and ears from a few pixels, and an invented eye looks wrong at once.
-    Returns (rgb, seam pixels healed)."""
+    known: hole pixels whose block averages the repair got right (default: the holes
+    the thumbnail coloured, holes & ~unknown). Returns (rgb, seam pixels healed)."""
     before = arr
+    if known is None:
+        known = holes & ~unknown
     base = thumbnail_base(small, arr.shape, engine)
     if faces is not None and faces.any():
         soft = _smooth_thumbnail(small, arr.shape)
         f = _soft(faces, 6.0)[..., None]
         base = base * (1 - f) + soft * f
-    base = keep_block_means(np.clip(np.rint(base), 0, 255).astype(np.uint8), before, holes, holes & ~unknown)
+    base = keep_block_means(np.clip(np.rint(base), 0, 255).astype(np.uint8), before, holes, known)
     a = _soft(holes, 2.0)[..., None]
     out = np.clip(np.rint(before * (1 - a) + base.astype(np.float32) * a), 0, 255).astype(np.uint8)
     seam = holes & _grow(~holes, THUMB_SR_SEAM)
     if seam.any() and engine.inpaint_s is not None:
         out = heal_holes(out, seam, engine, progress, stop, stats)
-        out = keep_block_means(out, before, seam, seam & ~unknown)
+        out = keep_block_means(out, before, seam, seam & known)
     return out, int(seam.sum())
 
 
@@ -633,6 +639,54 @@ def _took(t0: float) -> str:
     return f"{s:.1f} s" if s < 10 else f"{s:.0f} s"
 
 
+def _stripe_edges(before: np.ndarray, thumb: np.ndarray, holes: np.ndarray, rot: np.ndarray) -> np.ndarray:
+    """Hole blocks above and below a rotted stripe (`rot`) whose average colour is still
+    off the thumbnail's, grown block row by block row (up to STRIPE_EDGE pixels): the
+    stripe's fading edges, which the stripe test misses because they change gradually."""
+    h, w = holes.shape
+    bh, bw = -(-h // 8), -(-w // 8)
+
+    def blocks(m):
+        return np.pad(m, ((0, bh * 8 - h), (0, bw * 8 - w))).reshape(bh, 8, bw, 8).any(axis=(1, 3))
+
+    d = np.abs(_block_ycc(before, bh, bw) - _block_ycc(thumb, bh, bw))
+    off = (d[..., 0] > EDGE_AGREE[0]) | (d[..., 1:].max(axis=-1) > EDGE_AGREE[1])
+    hb = np.pad(holes, ((0, bh * 8 - h), (0, bw * 8 - w))).reshape(bh, 8, bw, 8).all(axis=(1, 3))
+    cand = off & hb
+    got = blocks(rot)
+    edge = np.zeros_like(got)
+    for _ in range(STRIPE_EDGE // 8):
+        grow = np.zeros_like(got)
+        grow[:-1] |= got[1:]
+        grow[1:] |= got[:-1]
+        new = grow & cand & ~got
+        if not new.any():
+            break
+        edge |= new
+        got |= new
+    return np.repeat(np.repeat(edge, 8, 0), 8, 1)[:h, :w] & holes
+
+
+def rotted_stripes(before: np.ndarray, holes: np.ndarray, known: np.ndarray, thumb, faces: np.ndarray,
+                   stamp: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(stripes, junk): thin stripes of wrong colour among the holes' block averages
+    (`known`), and decoded stripes of wrong colour at the edge of a hole - rotted data the
+    repair kept - with the rows right above and below, where a stripe's edge bleeds.
+    Faces (eyes, mouths) and the date stamp are left out; stripes the thumbnail shows
+    too are picture."""
+    from .guard import outside_only
+
+    stripes = outside_only(colour_stripes(before, known, thumb=thumb), faces)
+    junk = colour_stripes(before, _grow(holes, JUNK_NEAR) & ~holes, JUNK_TOL, thumb)
+    if junk.any():
+        edge = junk.copy()
+        edge[:-8] |= junk[8:]
+        edge[8:] |= junk[:-8]
+        junk = edge & ~holes
+    junk = outside_only(junk, faces) & ~stamp
+    return stripes, junk
+
+
 def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
                   burst=None, progress=None, quality: str | None = None, stop=None,
                   prompt: str | None = None, thumb: np.ndarray | None = None,
@@ -684,15 +738,30 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             t0, st = time.perf_counter(), {}
             stamp = date_stamp(before)
             faces = thumbnail_faces(before, thumb_small, engine.face_det) & ~stamp
-            arr, n_seam = heal_on_thumbnail(arr, holes & ~stamp, unknown, thumb_small, engine, report("LaMa window"),
-                                            stop, st, faces)
+            known = holes & ~unknown
+            stripes, junk = rotted_stripes(before, holes, known, thumb, faces, stamp)
+            if thumb is not None and (stripes | junk).any():
+                stripes |= _stripe_edges(before, thumb, holes & ~faces, stripes | junk)
+            n_rot = int((junk | (stripes & holes)).sum()) // 64
+            if junk.any():  # a few pixels more: the blend into the real picture must not bring the stripe back
+                junk = _grow(junk, JUNK_BLEND) & ~holes & ~faces
+            holes = (holes | junk) & ~stamp
+            arr, n_seam = heal_on_thumbnail(arr, holes, unknown, thumb_small, engine,
+                                            report("LaMa window"), stop, st, faces, known & ~stripes)
+            notes = []
+            if n_rot:
+                notes.append(f"{n_rot} block(s) of wrongly coloured stripes "
+                             "taken from the thumbnail")
+            if stamp.any():
+                notes.append("date stamp kept")
+            if (faces & holes).any():
+                notes.append("faces only smoothly enlarged")
             done.append(f"holes from the thumbnail enlarged by Real-ESRGAN, seams healed by LaMa "
-                        f"({st.get('tiles', 0)} windows, {_took(t0)})" + ("; date stamp kept" if stamp.any() else "")
-                        + ("; faces only smoothly enlarged" if (faces & holes).any() else ""))
+                        f"({st.get('tiles', 0)} windows, {_took(t0)})" + "".join("; " + n for n in notes))
         elif ("ai" in steps or "thumbsr" in steps) and engine.inpaint_s is not None:
             # healing (also for "thumbsr" on a photo without a usable thumbnail): every hole filled from the real pixels around it at full size; where
             # the thumbnail knows a hole's block averages, they are given back afterwards
-            from .guard import date_stamp, face_mask, outside_only
+            from .guard import date_stamp, face_mask
 
             t0, st = time.perf_counter(), {}
             # kept as the repair left it: the camera's date (the healing would invent digits)
@@ -700,15 +769,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             # faces: eyes, brows and mouths are not rotted stripes
             faces = face_mask(before, engine.face_det) & ~stamp
             known = holes & ~unknown
-            stripes = outside_only(colour_stripes(before, known, thumb=thumb), faces)
-            # decoded stripes of wrong colour at the edge of a hole: rotted data the repair kept
-            junk = colour_stripes(before, _grow(holes, JUNK_NEAR) & ~holes, JUNK_TOL, thumb)
-            if junk.any():  # and the rows right above and below, where a stripe's edge bleeds
-                edge = junk.copy()
-                edge[:-8] |= junk[8:]
-                edge[8:] |= junk[:-8]
-                junk = edge & ~holes
-            junk = outside_only(junk, faces) & ~stamp
+            stripes, junk = rotted_stripes(before, holes, known, thumb, faces, stamp)
             holes = (holes | junk) & ~stamp
             arr = heal_holes(arr, holes, engine, report("LaMa window"), stop, st)
             arr = keep_block_means(arr, before, holes, known & ~stripes)

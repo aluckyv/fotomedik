@@ -195,3 +195,21 @@ def test_thumbnail_enlarged_leaves_faces_smooth():
     def rough(m):
         return float(np.abs(out[m].astype(np.float32) - soft[m]).mean())
     assert rough(inner) < 0.5 * rough(other)
+
+
+def test_thumbnail_enlarged_takes_rotted_stripes_from_the_thumbnail():
+    """A pink stripe of rotted data at a hole's edge is replaced from the thumbnail too."""
+    from fotomedik.ai.enhance import enhance_steps
+
+    arr = np.full((192, 256, 3), 120, np.uint8)
+    holes = np.zeros((192, 256), bool)
+    holes[96:160, :] = True
+    arr[88:96, 32:224] = (250, 40, 200)  # decoded stripe right above the hole
+    small = np.full((12, 16, 3), 120, np.uint8)
+    thumb = np.full_like(arr, 120)
+    eng = Engine(FakeSR(), FakeLama())
+    out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["thumbsr"], thumb=thumb, thumb_small=small)
+    got = out[88:96, 64:192].astype(int)
+    assert np.abs(got[..., 0] - got[..., 1]).max() < 20  # gray again (the fake LaMa paints gray), not pink
+    assert any("stripes" in d for d in done)
+    assert np.array_equal(out[:72], arr[:72])  # the real picture above stays
