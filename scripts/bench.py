@@ -207,7 +207,10 @@ def make(args) -> None:
         im = im.convert("RGB")
         im.thumbnail((args.long, args.long), Image.LANCZOS)
         b = io.BytesIO()
-        im.save(b, "JPEG", quality=90, exif=exif_with_thumbnail(im))
+        if args.kind == "dense-nothumb":
+            im.save(b, "JPEG", quality=90)  # no thumbnail: the photos whose thumbnail rotted away
+        else:
+            im.save(b, "JPEG", quality=90, exif=exif_with_thumbnail(im))
         name = p.stem + ".jpg"
         (out / "truth" / name).write_bytes(b.getvalue())
         goods.append(name)
@@ -217,7 +220,7 @@ def make(args) -> None:
         other = (out / "truth" / goods[(i + 1) % len(goods)]).read_bytes()
         for k in range(args.per):
             seed = 1000 * i + k
-            if args.kind in ("dense", "dense-head"):
+            if args.kind in ("dense", "dense-head", "dense-nothumb"):
                 bad, what = dense_rot(data, seed, head=args.kind == "dense-head")
             else:
                 bad, what = damage(data, other, seed)
@@ -455,10 +458,10 @@ def main() -> None:
     m.add_argument("bench")
     m.add_argument("--per", type=int, default=2)
     m.add_argument("--long", type=int, default=1600)
-    m.add_argument("--kind", choices=("mixed", "dense", "dense-head"), default="mixed",
+    m.add_argument("--kind", choices=("mixed", "dense", "dense-head", "dense-nothumb"), default="mixed",
                    help="mixed: one or two kinds of damage per copy; dense: rot over the whole scan (a dying card); "
                         "dense-head: the same from the first byte (header and thumbnail rot too; repair with the "
-                        "app's batch and judge with `score`)")
+                        "app's batch and judge with `score`); dense-nothumb: dense, photos without a thumbnail")
     r = sub.add_parser("run")
     r.add_argument("bench")
     r.add_argument("result")
