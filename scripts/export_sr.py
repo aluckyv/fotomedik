@@ -94,6 +94,9 @@ def _state(path: Path):
     return sd
 
 
+SWIN_TILE = 144  # the enlarger's tile side in the program (TILE + 2 * PAD)
+
+
 class Padded(nn.Module):
     """SwinIR needs sides that are a multiple of its window: pad (reflect) and crop."""
 
@@ -110,12 +113,15 @@ class Padded(nn.Module):
         return y[:, :, : h * self.scale, : w * self.scale]
 
 
-def export(net: nn.Module, out: Path, size=64):
+def export(net: nn.Module, out: Path, size=64, fixed=False):
+    """fixed: the side is always `size` (SwinIR computes its attention masks for one size;
+    the program feeds the enlarger tiles of one size anyway)."""
     net.eval()
     x = torch.rand(1, 3, size, size)
+    axes = {"input": {0: "n"}, "output": {0: "n"}} if fixed else \
+        {"input": {0: "n", 2: "h", 3: "w"}, "output": {0: "n", 2: "h4", 3: "w4"}}
     torch.onnx.export(net, x, str(out), input_names=["input"], output_names=["output"], opset_version=17,
-                      dynamic_axes={"input": {0: "n", 2: "h", 3: "w"}, "output": {0: "n", 2: "h4", 3: "w4"}},
-                      dynamo=False)
+                      dynamic_axes=axes, dynamo=False)
     print("wrote", out, out.stat().st_size // 1024, "KB")
 
 
@@ -151,24 +157,22 @@ def _rrdb_and_compact(wdir: Path, odir: Path):
 
 
 def _swinir(wdir: Path, odir: Path, repo: str):  # with the architecture from its repository
-    if True:
-        sys.path.insert(0, repo)
-        from models.network_swinir import SwinIR
-
-        p = wdir / "001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
-        if p.exists():
-            net = SwinIR(upscale=4, in_chans=3, img_size=64, window_size=8, img_range=1.0,
-                         depths=[6] * 6, embed_dim=180, num_heads=[6] * 6, mlp_ratio=2,
-                         upsampler="pixelshuffle", resi_connection="1conv")
-            net.load_state_dict(_state(p), strict=True)
-            export(Padded(net), odir / "SwinIR-M_classical_x4.onnx")
-        p = wdir / "003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_PSNR.pth"
-        if p.exists():
-            net = SwinIR(upscale=4, in_chans=3, img_size=64, window_size=8, img_range=1.0,
-                         depths=[6] * 9, embed_dim=240, num_heads=[8] * 9, mlp_ratio=2,
-                         upsampler="nearest+conv", resi_connection="3conv")
-            net.load_state_dict(_state(p), strict=True)
-            export(Padded(net), odir / "SwinIR-L_real_x4_PSNR.onnx")
+    sys.path.insert(0, repo)
+    from models.network_swinir import SwinIR  # noqa: PLC0415
+    p = wdir / "001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
+    if p.exists():
+        net = SwinIR(upscale=4, in_chans=3, img_size=SWIN_TILE, window_size=8, img_range=1.0,
+                     depths=[6] * 6, embed_dim=180, num_heads=[6] * 6, mlp_ratio=2,
+                     upsampler="pixelshuffle", resi_connection="1conv")
+        net.load_state_dict(_state(p), strict=True)
+        export(Padded(net), odir / "SwinIR-M_classical_x4.onnx", SWIN_TILE, fixed=True)
+    p = wdir / "003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_PSNR.pth"
+    if p.exists():
+        net = SwinIR(upscale=4, in_chans=3, img_size=SWIN_TILE, window_size=8, img_range=1.0,
+                     depths=[6] * 9, embed_dim=240, num_heads=[8] * 9, mlp_ratio=2,
+                     upsampler="nearest+conv", resi_connection="3conv")
+        net.load_state_dict(_state(p), strict=True)
+        export(Padded(net), odir / "SwinIR-L_real_x4_PSNR.onnx", SWIN_TILE, fixed=True)
 
 
 if __name__ == "__main__":
