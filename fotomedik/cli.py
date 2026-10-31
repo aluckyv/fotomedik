@@ -403,7 +403,7 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 @click.option("--quality", default="balanced", show_default=True, type=click.Choice(["fast", "balanced", "full"]),
               help="diffusion preset: the photo is repainted at quarter, half or full size")
 @click.option("--scene", default="", help="what the photos show, for the diffusion (e.g. 'people on a square')")
-@click.option("--enlarger", default="swinir", show_default=True, type=click.Choice(["swinir", "esrnet", "esrgan"]),
+@click.option("--enlarger", default="esrgan", show_default=True, type=click.Choice(["esrgan", "esrnet", "swinir"]),
               help="network that enlarges the thumbnail for thumbsr: swinir and esrnet stay close to the photo "
                    "(softer), esrgan is sharpest but invents edges and textures")
 @click.option("--reference", type=click.Path(exists=True, path_type=Path),
@@ -451,7 +451,7 @@ def learn(good: Path, out: Path):
 @click.option("--quality", default="balanced", show_default=True, type=click.Choice(["fast", "balanced", "full"]),
               help="diffusion preset: the photo is repainted at quarter, half or full size")
 @click.option("--scene", default="", help="what the photos show, for the diffusion (e.g. 'people on a square')")
-@click.option("--enlarger", default="swinir", show_default=True, type=click.Choice(["swinir", "esrnet", "esrgan"]),
+@click.option("--enlarger", default="esrgan", show_default=True, type=click.Choice(["esrgan", "esrnet", "swinir"]),
               help="network that enlarges the thumbnail for thumbsr: swinir and esrnet stay close to the photo "
                    "(softer), esrgan is sharpest but invents edges and textures")
 @click.option("--reference", type=click.Path(exists=True, path_type=Path),

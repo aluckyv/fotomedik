@@ -93,6 +93,25 @@ DEVICE_NAMES = {"DmlExecutionProvider": "GPU (DirectML)", "CUDAExecutionProvider
 SR_BATCH = 4  # tiles enlarged in one go on a graphics card (when the model allows a batch)
 
 
+def _batch_ok(session) -> bool:
+    """Whether the network can enlarge several tiles in one call: a symbolic batch size,
+    and two tiles together giving what each gives alone. (The SwinIR export takes a batch
+    but mixes the tiles' attention windows: scan-line noise all over the holes.)"""
+    if not _batch_dynamic(session):
+        return False
+    try:
+        name = session.get_inputs()[0].name
+        side = TILE + 2 * PAD
+        rng = np.random.default_rng(0)
+        a = rng.random((1, 3, side, side), dtype=np.float32)
+        b = rng.random((1, 3, side, side), dtype=np.float32)
+        one = session.run(None, {name: a})[0][0]
+        two = session.run(None, {name: np.concatenate([a, b])})[0][0]
+        return float(np.abs(one - two).max()) < 1e-2
+    except Exception:  # noqa: BLE001 - one tile at a time always works
+        return False
+
+
 def _batch_dynamic(session) -> bool:
     """Whether the network takes more than one picture at a time (a symbolic batch size)."""
     try:
@@ -255,8 +274,8 @@ class Engine:
         self.loaded |= steps
         on_gpu = [d for d in self.devices.values() if d != "CPU"]
         self.device = on_gpu[0] if on_gpu else "CPU"
-        self.sr_batch = SR_BATCH if (self.sr is not None and on_gpu and _batch_dynamic(self.sr)) else 1
-        self.thumb_batch = SR_BATCH if (self.thumb_sr is not None and on_gpu and _batch_dynamic(self.thumb_sr)) else 1
+        self.sr_batch = SR_BATCH if (self.sr is not None and on_gpu and _batch_ok(self.sr)) else 1
+        self.thumb_batch = SR_BATCH if (self.thumb_sr is not None and on_gpu and _batch_ok(self.thumb_sr)) else 1
         return self
 
     def enlarge4(self, tile: np.ndarray) -> np.ndarray:

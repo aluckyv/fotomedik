@@ -255,3 +255,25 @@ def test_enlarger_choice():
     out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["thumbsr"],
                               thumb_small=rng.integers(60, 200, (8, 10, 3), dtype=np.uint8))
     assert Counting.calls > 0 and any("SwinIR" in d for d in done)
+
+
+def test_batch_only_when_tiles_stay_apart():
+    """A network whose batch mixes the tiles (SwinIR's export) enlarges one tile at a time."""
+    from fotomedik.ai.enhance import _batch_ok
+
+    class Mixing(FakeSR):
+        def get_inputs(self):
+            return [_In("input", ["n", 3, "h", "w"])]
+
+        def run(self, out, feed):
+            x = feed["input"]
+            y = super().run(out, {"input": x})[0]
+            return [y + y.mean(axis=0, keepdims=True) * (len(x) > 1)]  # the batch leaks into every tile
+
+    class Clean(FakeSR):
+        def get_inputs(self):
+            return [_In("input", ["n", 3, "h", "w"])]
+
+    assert not _batch_ok(Mixing())
+    assert _batch_ok(Clean())
+    assert not _batch_ok(FakeSR())  # a fixed batch of one
