@@ -4,6 +4,8 @@ repaired photo is made, one photo at a time, with the steps chosen:
   burst      holes filled with real pixels from a neighbouring shot of the scene
   deblock    JPEG blocks and noise removed from the whole picture (FBCNN)
   ai         holes healed from the picture around them (LaMa, full size)
+  thumbsr    holes from the thumbnail enlarged by Real-ESRGAN, seams healed by LaMa
+             (instead of "ai")
   diffusion  holes repainted by Stable Diffusion (instead of "ai"; graphics card)
   faces      faces restored (GFPGAN)
 
@@ -32,15 +34,16 @@ from PIL import Image
 from .. import errlog
 from ..report.report import FileReport
 
-STEPS = ("burst", "deblock", "ai", "diffusion", "faces")
+STEPS = ("burst", "deblock", "ai", "thumbsr", "diffusion", "faces")
 STEP_NAMES = {
     "burst": "similar shots",
     "deblock": "JPEG clean-up",
     "ai": "AI healing",
+    "thumbsr": "thumbnail enlarged by AI",
     "diffusion": "maximum quality (diffusion)",
     "faces": "faces",
 }
-NETWORK_STEPS = {"deblock", "ai", "diffusion", "faces"}
+NETWORK_STEPS = {"deblock", "ai", "thumbsr", "diffusion", "faces"}
 NEAR_FILES = 10  # photos this close in the list may be the same scene when their time is unknown
 PROGRESS_EVERY = 1.0  # seconds between progress lines of a slow step
 RESTARTS = 3  # times the enhanced copies start again after an unexpected error
@@ -206,6 +209,10 @@ class Enhancer:
         steps = [s for s in STEPS if s in set(steps)]
         if "diffusion" in steps and "ai" in steps:
             steps.remove("ai")  # diffusion does the holes
+        if "diffusion" in steps and "thumbsr" in steps:
+            steps.remove("thumbsr")
+        if "thumbsr" in steps and "ai" in steps:
+            steps.remove("ai")  # LaMa heals the seams over the enlarged thumbnail
         self.steps = steps
         self.device: str | None = None
         self.made = 0
@@ -351,7 +358,7 @@ class Enhancer:
         return True
 
     def _enhance(self, i: int, engine, steps, photos: _Photos) -> None:
-        from .enhance import Stopped, enhance_steps, photo_masks, save_jpeg, thumbnail_picture
+        from .enhance import Stopped, enhance_steps, photo_masks, save_jpeg, thumbnail_picture, thumbnail_rgb
 
         rep = self.repaired[i]
         name = Path(rep.output_name).name
@@ -374,7 +381,7 @@ class Enhancer:
             holes, unknown = photo_masks(data, rep.holes, rep.unknown)
             burst = photos.burst_for(i, self.say) if "burst" in steps else None
             new, done = enhance_steps(arr, holes, unknown, engine, steps, burst, progress, self.quality, self.stop,
-                                      self.prompt, thumbnail_picture(data, arr.shape))
+                                      self.prompt, thumbnail_picture(data, arr.shape), thumbnail_rgb(data))
         except Stopped:
             return
         except Exception as e:  # one photo must not stop the rest

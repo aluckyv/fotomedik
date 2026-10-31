@@ -397,8 +397,8 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 @click.option("--reports", is_flag=True, help="also write a .report.json next to every repaired photo")
 @click.option("--ai", is_flag=True, help="same as --enhance burst,ai")
 @click.option("--enhance", default="", help="enhanced copy (_enhanced.jpg) with these steps, comma separated: "
-              "burst (similar shots), deblock (JPEG clean-up), ai (sharpen and fill), diffusion (max quality), "
-              "faces. Network steps invent detail.")
+              "burst (similar shots), deblock (JPEG clean-up), ai (sharpen and fill), thumbsr (holes from the "
+              "thumbnail enlarged by AI), diffusion (max quality), faces. Network steps invent detail.")
 @click.option("--quality", default="balanced", show_default=True, type=click.Choice(["fast", "balanced", "full"]),
               help="diffusion preset: the photo is repainted at quarter, half or full size")
 @click.option("--scene", default="", help="what the photos show, for the diffusion (e.g. 'people on a square')")
@@ -442,8 +442,8 @@ def learn(good: Path, out: Path):
 @click.option("--reports", is_flag=True, help="also write a .report.json next to every repaired photo")
 @click.option("--ai", is_flag=True, help="same as --enhance burst,ai")
 @click.option("--enhance", default="", help="enhanced copy (_enhanced.jpg) with these steps, comma separated: "
-              "burst (similar shots), deblock (JPEG clean-up), ai (sharpen and fill), diffusion (max quality), "
-              "faces. Network steps invent detail.")
+              "burst (similar shots), deblock (JPEG clean-up), ai (sharpen and fill), thumbsr (holes from the "
+              "thumbnail enlarged by AI), diffusion (max quality), faces. Network steps invent detail.")
 @click.option("--quality", default="balanced", show_default=True, type=click.Choice(["fast", "balanced", "full"]),
               help="diffusion preset: the photo is repainted at quarter, half or full size")
 @click.option("--scene", default="", help="what the photos show, for the diffusion (e.g. 'people on a square')")

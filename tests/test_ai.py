@@ -148,3 +148,20 @@ def test_errors_go_to_a_file_in_the_output_folder(tmp_path):
     text = (tmp_path / errlog.LOG_NAME).read_text(encoding="utf-8")
     assert "enhanced copy of x.jpg" in text and "ValueError: boom" in text and "Traceback" in text
     assert errlog.count(tmp_path) == 1
+
+
+def test_thumbnail_enlarged_fills_holes_and_keeps_real_pixels():
+    from fotomedik.ai.enhance import enhance_steps
+
+    rng = np.random.default_rng(0)
+    arr = rng.integers(60, 200, (128, 160, 3), dtype=np.uint8)
+    holes = np.zeros((128, 160), bool)
+    holes[40:88, :] = True
+    small = rng.integers(60, 200, (8, 10, 3), dtype=np.uint8)  # a tiny "thumbnail"
+    eng = Engine(FakeSR(), FakeLama())
+    out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["thumbsr"], thumb_small=small)
+    assert np.array_equal(out[~holes], arr[~holes])
+    assert any("Real-ESRGAN" in d for d in done)
+    # without a thumbnail it heals as usual
+    out2, done2 = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["thumbsr"], thumb_small=None)
+    assert any("LaMa" in d for d in done2) and np.array_equal(out2[~holes], arr[~holes])

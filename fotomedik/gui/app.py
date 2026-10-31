@@ -292,13 +292,17 @@ class MainWindow(QMainWindow):
             "ai": "Heal the holes from the real pixels around them, like a healing brush (LaMa, at\n"
                   "full size): lines and blurred parts get the structure running through them;\n"
                   "colours follow the thumbnail where there is one. Invented detail. ~275 MB once.",
+            "thumbsr": "Fill the holes from the photo's thumbnail enlarged by AI (Real-ESRGAN), in the colours\n"
+                       "the repair gave them, and heal the seams with LaMa: sharp edges and textures instead of\n"
+                       "a smooth blur. The detail is invented from a 160-pixel picture. Used instead of AI healing;\n"
+                       "photos without a usable thumbnail are healed as usual. ~340 MB once.",
             "faces": "Restore faces (GFPGAN, ~340 MB once). Can make a face look like someone else.",
             "diffusion": "Maximum quality: holes repainted by Stable Diffusion following the thumbnail.\n"
                          "Needs a graphics card (minutes per photo on the processor). ~2.1 GB once.",
         }
         from ..ai.run import STEP_NAMES
 
-        for key in ("burst", "deblock", "ai", "faces", "diffusion"):
+        for key in ("burst", "deblock", "ai", "thumbsr", "faces", "diffusion"):
             cb = QCheckBox(STEP_NAMES[key].capitalize())
             cb.setToolTip(tips[key])
             ext.addWidget(cb)

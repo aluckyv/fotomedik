@@ -87,6 +87,7 @@ SD_TEXT = Model("Stable Diffusion (text encoder)", "sd15inp_text_encoder.onnx", 
 STEP_MODELS = {
     "ai": (SR, INPAINT, FACE_DET),
     "deblock": (DEBLOCK,),
+    "thumbsr": (SR, INPAINT),
     "faces": (FACE_DET, FACE),
     "diffusion": (INPAINT, SR, SD_UNET, SD_VAE_ENC, SD_VAE_DEC, SD_TEXT, CLIP_VOCAB, CLIP_MERGES),  # SR enlarges the holes
 }

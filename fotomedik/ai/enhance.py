@@ -195,6 +195,11 @@ class Engine:
             return s
 
         steps = set(steps) - self.loaded
+        if "thumbsr" in steps:
+            if self.sr is None:
+                self.sr = session(models.SR)
+            if self.inpaint_s is None:
+                self.inpaint_s = session(models.INPAINT)
         if "ai" in steps:
             if self.sr is None:
                 self.sr = session(models.SR)
@@ -444,23 +449,65 @@ JUNK_NEAR = 16  # pixels from a hole within which decoded blocks are checked
 THUMB_AGREE = (30.0, 14.0)  # block average this close (luma, chroma) to the thumbnail's: no stripe
 
 
-def thumbnail_picture(data: bytes, shape) -> np.ndarray | None:
-    """The photo's embedded thumbnail (RGB) brought to `shape` (h, w), or None. It only
-    says where colours are: a stripe the thumbnail shows too is part of the picture."""
+def thumbnail_rgb(data: bytes) -> np.ndarray | None:
+    """The photo's embedded thumbnail (RGB, black bars cropped) as it is stored, or None.
+    A thumbnail damaged itself is None unless most of it is real."""
     try:
         from ..recipes.dcfield import _crop_black_bars, thumbnail_image
 
         got = thumbnail_image(data)
         if got is None:
             return None
-        img, _mask = _crop_black_bars(got[0], None)
-        h, w = shape[:2]
-        if abs((img.shape[1] / img.shape[0]) / (w / h) - 1.0) > 0.03:
-            return None
-        rgb = Image.fromarray(np.ascontiguousarray(img), "YCbCr").convert("RGB")
-        return np.asarray(rgb.resize((w, h), Image.BICUBIC))
-    except Exception:  # noqa: BLE001 - without it the stripe check just trusts the colours less
+        img, mask = _crop_black_bars(got[0], got[1])
+        if mask is not None and float(np.mean(mask)) < 0.95:
+            return None  # partly rotted: its colours below the damage are wrong
+        return np.asarray(Image.fromarray(np.ascontiguousarray(img), "YCbCr").convert("RGB"))
+    except Exception:  # noqa: BLE001
         return None
+
+
+def thumbnail_picture(data: bytes, shape) -> np.ndarray | None:
+    """The photo's embedded thumbnail (RGB) brought to `shape` (h, w), or None. It only
+    says where colours are: a stripe the thumbnail shows too is part of the picture."""
+    small = thumbnail_rgb(data)
+    if small is None:
+        return None
+    h, w = shape[:2]
+    if abs((small.shape[1] / small.shape[0]) / (w / h) - 1.0) > 0.03:
+        return None
+    return np.asarray(Image.fromarray(small).resize((w, h), Image.BICUBIC))
+
+
+THUMB_SR_SEAM = 12  # pixels along a hole's edge that LaMa blends into the real picture
+
+
+def thumbnail_base(small: np.ndarray, shape, engine: "Engine") -> np.ndarray:
+    """The thumbnail enlarged by Real-ESRGAN (x4, twice when the photo is much larger) and
+    brought to `shape`: a sharp picture of the scene, its edges and textures invented by
+    the network from a 160-pixel image. Float RGB 0..255."""
+    h, w = shape[:2]
+    x = small.astype(np.float32) / 255.0
+    while x.shape[1] * 2 < w:  # ESRGAN until the next step would overshoot by more than 2x
+        x = engine.enlarge4(x)
+    out = Image.fromarray(np.clip(np.rint(x * 255.0), 0, 255).astype(np.uint8)).resize((w, h), Image.LANCZOS)
+    return np.asarray(out, dtype=np.float32)
+
+
+def heal_on_thumbnail(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, small: np.ndarray,
+                      engine: "Engine", progress=None, stop=None, stats: dict | None = None) -> tuple[np.ndarray, int]:
+    """Holes filled from the thumbnail enlarged by Real-ESRGAN (thumbnail_base), in the
+    colours the repair gave them (block averages kept), and the seams along every hole's
+    edge healed by LaMa. Returns (rgb, seam pixels healed)."""
+    before = arr
+    base = thumbnail_base(small, arr.shape, engine)
+    base = keep_block_means(np.clip(np.rint(base), 0, 255).astype(np.uint8), before, holes, holes & ~unknown)
+    a = _soft(holes, 2.0)[..., None]
+    out = np.clip(np.rint(before * (1 - a) + base.astype(np.float32) * a), 0, 255).astype(np.uint8)
+    seam = holes & _grow(~holes, THUMB_SR_SEAM)
+    if seam.any() and engine.inpaint_s is not None:
+        out = heal_holes(out, seam, engine, progress, stop, stats)
+        out = keep_block_means(out, before, seam, seam & ~unknown)
+    return out, int(seam.sum())
 
 
 def _block_ycc(a: np.ndarray, bh: int, bw: int) -> np.ndarray:
@@ -565,7 +612,8 @@ def _took(t0: float) -> str:
 
 def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
                   burst=None, progress=None, quality: str | None = None, stop=None,
-                  prompt: str | None = None, thumb: np.ndarray | None = None) -> tuple[np.ndarray, list[str]]:
+                  prompt: str | None = None, thumb: np.ndarray | None = None,
+                  thumb_small: np.ndarray | None = None) -> tuple[np.ndarray, list[str]]:
     """The enhanced copy, step by step. Returns (rgb, what was done, with the time it took).
 
     burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots.
@@ -607,8 +655,17 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                                       prompt)
             arr = keep_block_means(arr, before, holes, holes & ~unknown)
             done.append(f"holes repainted (Stable Diffusion, follows the thumbnail; {what}, {_took(t0)})")
-        elif "ai" in steps and engine.inpaint_s is not None:
-            # healing: every hole filled from the real pixels around it at full size; where
+        elif "thumbsr" in steps and engine.sr is not None and thumb_small is not None:
+            from .guard import date_stamp
+
+            t0, st = time.perf_counter(), {}
+            stamp = date_stamp(before)
+            arr, n_seam = heal_on_thumbnail(arr, holes & ~stamp, unknown, thumb_small, engine, report("LaMa window"),
+                                            stop, st)
+            done.append(f"holes from the thumbnail enlarged by Real-ESRGAN, seams healed by LaMa "
+                        f"({st.get('tiles', 0)} windows, {_took(t0)})" + ("; date stamp kept" if stamp.any() else ""))
+        elif ("ai" in steps or "thumbsr" in steps) and engine.inpaint_s is not None:
+            # healing (also for "thumbsr" on a photo without a usable thumbnail): every hole filled from the real pixels around it at full size; where
             # the thumbnail knows a hole's block averages, they are given back afterwards
             from .guard import date_stamp, face_mask, outside_only
 
