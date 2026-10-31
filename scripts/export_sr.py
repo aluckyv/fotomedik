@@ -156,6 +156,12 @@ def _rrdb_and_compact(wdir: Path, odir: Path):
             export(net, odir / f"{name}.onnx")
 
 
+def _swin_state(p: Path):
+    """SwinIR weights without the attention masks (they belong to the training size;
+    the network computes them for SWIN_TILE)."""
+    return {k: v for k, v in _state(p).items() if "attn_mask" not in k}
+
+
 def _swinir(wdir: Path, odir: Path, repo: str):  # with the architecture from its repository
     sys.path.insert(0, repo)
     from models.network_swinir import SwinIR  # noqa: PLC0415
@@ -164,14 +170,14 @@ def _swinir(wdir: Path, odir: Path, repo: str):  # with the architecture from it
         net = SwinIR(upscale=4, in_chans=3, img_size=SWIN_TILE, window_size=8, img_range=1.0,
                      depths=[6] * 6, embed_dim=180, num_heads=[6] * 6, mlp_ratio=2,
                      upsampler="pixelshuffle", resi_connection="1conv")
-        net.load_state_dict(_state(p), strict=True)
+        net.load_state_dict(_swin_state(p), strict=False)
         export(Padded(net), odir / "SwinIR-M_classical_x4.onnx", SWIN_TILE, fixed=True)
     p = wdir / "003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_PSNR.pth"
     if p.exists():
         net = SwinIR(upscale=4, in_chans=3, img_size=SWIN_TILE, window_size=8, img_range=1.0,
                      depths=[6] * 9, embed_dim=240, num_heads=[8] * 9, mlp_ratio=2,
                      upsampler="nearest+conv", resi_connection="3conv")
-        net.load_state_dict(_state(p), strict=True)
+        net.load_state_dict(_swin_state(p), strict=False)
         export(Padded(net), odir / "SwinIR-L_real_x4_PSNR.onnx", SWIN_TILE, fixed=True)
 
 
