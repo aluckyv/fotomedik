@@ -485,15 +485,22 @@ def thumbnail_picture(data: bytes, shape) -> np.ndarray | None:
 THUMB_SR_SEAM = 12  # pixels along a hole's edge that LaMa blends into the real picture
 
 
-def thumbnail_base(small: np.ndarray, shape, engine: "Engine") -> np.ndarray:
+def thumbnail_base(small: np.ndarray, shape, engine: "Engine", holes: np.ndarray | None = None) -> np.ndarray:
     """The thumbnail enlarged by Real-ESRGAN (x4, twice when the photo is much larger) and
     brought to `shape`: a sharp picture of the scene, its edges and textures invented by
-    the network from a 160-pixel image. Float RGB 0..255."""
+    the network from a 160-pixel image. Float RGB 0..255. The network runs tile by tile
+    (a whole 640-pixel picture enlarged at once needs gigabytes), and on a second pass only
+    where `holes` (the photo's, full size) need it."""
     h, w = shape[:2]
-    x = small.astype(np.float32) / 255.0
-    while x.shape[1] * 2 < w:  # ESRGAN until the next step would overshoot by more than 2x
-        x = engine.enlarge4(x)
-    out = Image.fromarray(np.clip(np.rint(x * 255.0), 0, 255).astype(np.uint8)).resize((w, h), Image.LANCZOS)
+    cur = small
+    while cur.shape[1] * 2 < w:  # ESRGAN until the next step would overshoot by more than 2x
+        ch, cw = cur.shape[:2]
+        need = np.ones((ch, cw), dtype=bool)
+        if holes is not None and cur is not small:
+            m = np.asarray(Image.fromarray(holes).resize((cw, ch), Image.BOX))
+            need = _grow(m > 0, 2)
+        cur = np.clip(np.rint(enlarge_holes(cur, need, engine, 4) * 255.0), 0, 255).astype(np.uint8)
+    out = Image.fromarray(cur).resize((w, h), Image.LANCZOS)
     return np.asarray(out, dtype=np.float32)
 
 
@@ -509,7 +516,7 @@ def heal_on_thumbnail(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, s
     before = arr
     if known is None:
         known = holes & ~unknown
-    base = thumbnail_base(small, arr.shape, engine)
+    base = thumbnail_base(small, arr.shape, engine, holes)
     if faces is not None and faces.any():
         soft = _smooth_thumbnail(small, arr.shape)
         f = _soft(faces, 6.0)[..., None]
