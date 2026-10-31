@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install torch (CPU)
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install onnx onnxruntime timm numpy
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install onnx onnxscript onnxruntime timm numpy
       - name: Download weights
         run: |
           mkdir -p w
@@ -34,8 +34,9 @@ jobs:
       - name: SwinIR architecture
         run: git clone --depth 1 https://github.com/JingyunLiang/SwinIR.git swinir
       - name: Export
-        run: python scripts/export_sr.py w onnx swinir
+        run: python scripts/export_sr.py w onnx swinir 2>&1 | tee export.log; ls onnx || true
       - name: Check
+        if: always()
         run: |
           python - <<'EOF'
           import numpy as np, onnxruntime as ort, glob
@@ -45,8 +46,9 @@ jobs:
               print(f, y.shape, float(y.min()), float(y.max()))
           EOF
       - name: Publish
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view models-sr >/dev/null 2>&1 || gh release create models-sr --title "Super-resolution models (ONNX)" --notes "Exported by the convert-models workflow from the authors' published weights (Real-ESRGAN: BSD-3-Clause; SwinIR: Apache-2.0)."
-          gh release upload models-sr onnx/*.onnx --clobber
+          gh release upload models-sr onnx/*.onnx export.log --clobber

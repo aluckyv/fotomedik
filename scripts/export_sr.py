@@ -122,6 +122,20 @@ def export(net: nn.Module, out: Path, size=64):
 def main():
     wdir, odir = Path(sys.argv[1]), Path(sys.argv[2])
     odir.mkdir(parents=True, exist_ok=True)
+    import traceback
+
+    def safe(fn):
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 - one network failing must not stop the others
+            traceback.print_exc()
+
+    safe(lambda: _rrdb_and_compact(wdir, odir))
+    if len(sys.argv) > 3:
+        safe(lambda: _swinir(wdir, odir, sys.argv[3]))
+
+
+def _rrdb_and_compact(wdir: Path, odir: Path):
     for name in ("RealESRNet_x4plus", "RealESRGAN_x4plus"):
         p = wdir / f"{name}.pth"
         if p.exists():
@@ -134,8 +148,11 @@ def main():
             net = SRVGGNetCompact()
             net.load_state_dict(_state(p), strict=True)
             export(net, odir / f"{name}.onnx")
-    if len(sys.argv) > 3:  # SwinIR, with the architecture from its repository
-        sys.path.insert(0, sys.argv[3])
+
+
+def _swinir(wdir: Path, odir: Path, repo: str):  # with the architecture from its repository
+    if True:
+        sys.path.insert(0, repo)
         from models.network_swinir import SwinIR
 
         p = wdir / "001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
