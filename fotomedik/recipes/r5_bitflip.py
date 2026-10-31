@@ -325,7 +325,7 @@ def thumbnail_divergence(data: bytes, ft: FrameTables, sr: D.ScanResult, thumb_r
             ok = np.isfinite(d)
             r = (np.where(ok, d, 0.0).sum(axis=(1, 3)) / np.maximum(ok.sum(axis=(1, 3)), 1)).ravel()[:e]
             n = len(r)
-            if n < 2 * per_row:
+            if n <= 2 * per_row:  # no step position with a row on each side
                 continue
             cs = np.cumsum(r)
             k = np.arange(per_row, n - per_row)  # a step with at least a row on each side
