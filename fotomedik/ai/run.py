@@ -298,7 +298,8 @@ class Enhancer:
                         seen.add(i)
                         rep = self.repaired[i]
                         photos.add(i, rep, self.sources[i])
-                        if (rep.output_name and rep.fallback is None and not is_lost(rep)
+                        if (rep.output_name and rep.fallback is None
+                                and (not is_lost(rep) or self._thumbnail_rescues(rep))
                                 and (rep.holes or (whole_picture and rep.findings))):
                             pending.append(i)
                     ready = None
@@ -338,6 +339,18 @@ class Enhancer:
                 continue
             self.device = engine.device if nets else ""
             self._enhance(ready, engine, steps, photos)
+
+    def _thumbnail_rescues(self, rep: FileReport) -> bool:
+        """A photo mostly lost still gets the copy built on its thumbnail ("thumbsr") when
+        the thumbnail is whole: it shows the scene the holes cut away."""
+        if "thumbsr" not in self.steps or not rep.holes:
+            return False
+        try:
+            from .enhance import thumbnail_rgb
+
+            return thumbnail_rgb((self.out / rep.output_name).read_bytes()) is not None
+        except Exception:  # noqa: BLE001
+            return False
 
     def _eligible(self, i: int) -> bool:
         """Whether every other shot of photo i's scene (a possible burst donor) is repaired."""

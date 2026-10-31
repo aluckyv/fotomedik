@@ -207,7 +207,7 @@ class Engine:
                 self.inpaint_s = session(models.INPAINT)
         if "deblock" in steps:
             self.deblock_s = session(models.DEBLOCK)
-        if "ai" in steps and self.face_det is None:  # small; the healing keeps away from faces
+        if ({"ai", "thumbsr"} & steps) and self.face_det is None:  # small; the healing keeps away from faces
             try:
                 self.face_det = str(models.ensure(models.FACE_DET, progress, stop))
             except InterruptedError:
@@ -494,12 +494,19 @@ def thumbnail_base(small: np.ndarray, shape, engine: "Engine") -> np.ndarray:
 
 
 def heal_on_thumbnail(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, small: np.ndarray,
-                      engine: "Engine", progress=None, stop=None, stats: dict | None = None) -> tuple[np.ndarray, int]:
+                      engine: "Engine", progress=None, stop=None, stats: dict | None = None,
+                      faces: np.ndarray | None = None) -> tuple[np.ndarray, int]:
     """Holes filled from the thumbnail enlarged by Real-ESRGAN (thumbnail_base), in the
     colours the repair gave them (block averages kept), and the seams along every hole's
-    edge healed by LaMa. Returns (rgb, seam pixels healed)."""
+    edge healed by LaMa. On faces the thumbnail is only enlarged smoothly: Real-ESRGAN
+    invents eyes and ears from a few pixels, and an invented eye looks wrong at once.
+    Returns (rgb, seam pixels healed)."""
     before = arr
     base = thumbnail_base(small, arr.shape, engine)
+    if faces is not None and faces.any():
+        soft = _smooth_thumbnail(small, arr.shape)
+        f = _soft(faces, 6.0)[..., None]
+        base = base * (1 - f) + soft * f
     base = keep_block_means(np.clip(np.rint(base), 0, 255).astype(np.uint8), before, holes, holes & ~unknown)
     a = _soft(holes, 2.0)[..., None]
     out = np.clip(np.rint(before * (1 - a) + base.astype(np.float32) * a), 0, 255).astype(np.uint8)
@@ -508,6 +515,22 @@ def heal_on_thumbnail(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, s
         out = heal_holes(out, seam, engine, progress, stop, stats)
         out = keep_block_means(out, before, seam, seam & ~unknown)
     return out, int(seam.sum())
+
+
+def _smooth_thumbnail(small: np.ndarray, shape) -> np.ndarray:
+    """The thumbnail enlarged to `shape` without inventing anything (Lanczos). Float RGB."""
+    h, w = shape[:2]
+    return np.asarray(Image.fromarray(small).resize((w, h), Image.LANCZOS), dtype=np.float32)
+
+
+def thumbnail_faces(before: np.ndarray, small: np.ndarray, model_path) -> np.ndarray:
+    """Faces of the photo, found in the repaired picture and in the smoothly enlarged
+    thumbnail (which shows the faces the holes cut away)."""
+    from .guard import face_mask
+
+    faces = face_mask(before, model_path)
+    whole = np.clip(np.rint(_smooth_thumbnail(small, before.shape)), 0, 255).astype(np.uint8)
+    return faces | face_mask(whole, model_path)
 
 
 def _block_ycc(a: np.ndarray, bh: int, bw: int) -> np.ndarray:
@@ -660,10 +683,12 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
 
             t0, st = time.perf_counter(), {}
             stamp = date_stamp(before)
+            faces = thumbnail_faces(before, thumb_small, engine.face_det) & ~stamp
             arr, n_seam = heal_on_thumbnail(arr, holes & ~stamp, unknown, thumb_small, engine, report("LaMa window"),
-                                            stop, st)
+                                            stop, st, faces)
             done.append(f"holes from the thumbnail enlarged by Real-ESRGAN, seams healed by LaMa "
-                        f"({st.get('tiles', 0)} windows, {_took(t0)})" + ("; date stamp kept" if stamp.any() else ""))
+                        f"({st.get('tiles', 0)} windows, {_took(t0)})" + ("; date stamp kept" if stamp.any() else "")
+                        + ("; faces only smoothly enlarged" if (faces & holes).any() else ""))
         elif ("ai" in steps or "thumbsr" in steps) and engine.inpaint_s is not None:
             # healing (also for "thumbsr" on a photo without a usable thumbnail): every hole filled from the real pixels around it at full size; where
             # the thumbnail knows a hole's block averages, they are given back afterwards

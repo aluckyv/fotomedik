@@ -165,3 +165,33 @@ def test_thumbnail_enlarged_fills_holes_and_keeps_real_pixels():
     # without a thumbnail it heals as usual
     out2, done2 = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["thumbsr"], thumb_small=None)
     assert any("LaMa" in d for d in done2) and np.array_equal(out2[~holes], arr[~holes])
+
+
+def test_thumbnail_enlarged_leaves_faces_smooth():
+    """On a face the thumbnail is only enlarged smoothly: Real-ESRGAN would invent eyes."""
+    from fotomedik.ai.enhance import _smooth_thumbnail, heal_on_thumbnail
+
+    class NoisySR(FakeSR):  # an "enlarger" that invents detail
+        def run(self, _names, feeds):
+            y = super().run(_names, feeds)[0]
+            noise = np.random.default_rng(1).uniform(-0.3, 0.3, y.shape).astype(y.dtype)
+            return [np.clip(y + noise, 0, 1)]
+
+    rng = np.random.default_rng(0)
+    arr = rng.integers(60, 200, (256, 256, 3), dtype=np.uint8)
+    holes = np.zeros((256, 256), bool)
+    holes[64:192, :] = True
+    small = rng.integers(60, 200, (16, 16, 3), dtype=np.uint8)
+    faces = np.zeros_like(holes)
+    faces[96:160, 32:96] = True
+    eng = Engine(NoisySR(), None)
+    out, _ = heal_on_thumbnail(arr, holes, np.zeros_like(holes), small, eng, faces=faces)
+    soft = _smooth_thumbnail(small, arr.shape)
+    inner = np.zeros_like(holes)
+    inner[112:144, 48:80] = True  # well inside the face
+    other = np.zeros_like(holes)
+    other[112:144, 160:192] = True  # a hole away from the face
+
+    def rough(m):
+        return float(np.abs(out[m].astype(np.float32) - soft[m]).mean())
+    assert rough(inner) < 0.5 * rough(other)
