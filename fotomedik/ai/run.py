@@ -303,7 +303,7 @@ class Enhancer:
                         rep = self.repaired[i]
                         photos.add(i, rep, self.sources[i])
                         if (rep.output_name and rep.fallback is None
-                                and (not is_lost(rep) or self._thumbnail_rescues(rep))
+                                and (not is_lost(rep) or self._lost_but_worth_it(rep))
                                 and (rep.holes or (whole_picture and rep.findings))):
                             pending.append(i)
                     ready = None
@@ -344,9 +344,13 @@ class Enhancer:
             self.device = engine.device if nets else ""
             self._enhance(ready, engine, steps, photos)
 
-    def _thumbnail_rescues(self, rep: FileReport) -> bool:
-        """A photo mostly lost still gets the copy built on its thumbnail ("thumbsr") when
-        the thumbnail is whole: it shows the scene the holes cut away."""
+    def _lost_but_worth_it(self, rep: FileReport) -> bool:
+        """A photo mostly lost still gets a copy when JPEG clean-up is on (the fine-tuned
+        FBCNN learnt on exactly such photos: rotted blocks and bands between the holes), or
+        when the copy is built on its thumbnail ("thumbsr") and the thumbnail is whole: it
+        shows the scene the holes cut away."""
+        if "deblock" in self.steps:
+            return True
         if "thumbsr" not in self.steps or not rep.holes:
             return False
         try:

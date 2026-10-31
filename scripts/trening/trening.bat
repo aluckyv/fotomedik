@@ -63,8 +63,13 @@ echo.
 echo Ucenje pocinje. Moze da se prekine sa Ctrl+C - najbolje stanje se cuva i ubacuje u program.
 echo Ponovno pokretanje nastavlja gde je stalo.
 set RESUME=
-if exist izlaz\last.pt set RESUME=--resume
-%PY% -m fotomedik.train.finetune podaci izlaz --install %RESUME% %*
+set "KORACI=20000"
+if exist izlaz\last.pt (
+    set RESUME=--resume
+    echo Ucenje je vec radjeno. Za nastavak upisi veci broj koraka od proslog puta, npr. 40000.
+    set /p KORACI="Do koliko koraka da uci (Enter = 20000): "
+)
+%PY% -m fotomedik.train.finetune podaci izlaz --install --iters %KORACI% %RESUME% %*
 if errorlevel 1 goto :fail
 echo.
 echo Gotovo. U FotoMediku ukljuci "JPEG clean-up" - koristi doucen model.

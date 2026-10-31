@@ -151,6 +151,12 @@ def main(argv=None) -> None:
         sched.load_state_dict(st["sched"])
         start, best = st["iter"], st["best"]
         print(f"resumed at iteration {start} (best {best:.2f} dB)")
+        if start >= sched.T_max:  # more iterations asked for than the last run had: a new, gentler schedule
+            lr = a.lr * 0.5
+            for g in opt.param_groups:
+                g["lr"] = g["initial_lr"] = lr
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, a.iters - start), eta_min=lr * 0.1)
+            print(f"continuing to iteration {a.iters} with learning rate {lr:g}")
     else:
         p_net, p_in = psnr_of(net, va_in, va_tgt, device)
         print(f"before training: repair as it is {p_in:.2f} dB, original FBCNN {p_net:.2f} dB")
