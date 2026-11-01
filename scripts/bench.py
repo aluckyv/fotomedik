@@ -71,6 +71,8 @@ def make(args) -> None:
         b = io.BytesIO()
         if args.kind == "dense-nothumb":
             im.save(b, "JPEG", quality=90)  # no thumbnail: the photos whose thumbnail rotted away
+        elif args.kind == "dense-rst":  # a restart marker after every block row, as Kodaks write
+            im.save(b, "JPEG", quality=90, exif=exif_with_thumbnail(im), restart_marker_rows=1)
         else:
             im.save(b, "JPEG", quality=90, exif=exif_with_thumbnail(im))
         name = p.stem + ".jpg"
@@ -82,7 +84,7 @@ def make(args) -> None:
         other = (out / "truth" / goods[(i + 1) % len(goods)]).read_bytes()
         for k in range(args.per):
             seed = 1000 * i + k
-            if args.kind in ("dense", "dense-head", "dense-nothumb"):
+            if args.kind in ("dense", "dense-head", "dense-nothumb", "dense-rst"):
                 bad, what = dense_rot(data, seed, head=args.kind == "dense-head")
             else:
                 bad, what = damage(data, other, seed)
@@ -320,10 +322,11 @@ def main() -> None:
     m.add_argument("bench")
     m.add_argument("--per", type=int, default=2)
     m.add_argument("--long", type=int, default=1600)
-    m.add_argument("--kind", choices=("mixed", "dense", "dense-head", "dense-nothumb"), default="mixed",
+    m.add_argument("--kind", choices=("mixed", "dense", "dense-head", "dense-nothumb", "dense-rst"), default="mixed",
                    help="mixed: one or two kinds of damage per copy; dense: rot over the whole scan (a dying card); "
                         "dense-head: the same from the first byte (header and thumbnail rot too; repair with the "
-                        "app's batch and judge with `score`); dense-nothumb: dense, photos without a thumbnail")
+                        "app's batch and judge with `score`); dense-nothumb: dense, photos without a thumbnail; "
+                        "dense-rst: dense, photos with a restart marker after every block row (the jigsaw)")
     r = sub.add_parser("run")
     r.add_argument("bench")
     r.add_argument("result")
