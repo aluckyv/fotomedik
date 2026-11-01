@@ -218,31 +218,38 @@ def test_skipped_photos_still_lend_their_pixels(tmp_path, photos, monkeypatch):
     assert sorted(seen["names"]) == ["a.jpg", "b.jpg", "c.JPG"] and seen["skip"] == ["a.jpg"]
 
 
-def test_connect_to_claude_keeps_the_other_settings(tmp_path, monkeypatch):
-    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
-    # no Claude settings anywhere yet: they are made where the usual install keeps them
-    assert claude_connect.config_paths() == [tmp_path / "Roaming" / "Claude" / "claude_desktop_config.json"]
-    cfg = tmp_path / "Roaming" / "Claude" / "claude_desktop_config.json"
-    cfg.parent.mkdir(parents=True)
-    cfg.write_text('﻿{"mcpServers": {"bridge-after": {"command": "x.exe"}}, "theme": "dark"}', encoding="utf-8")
-    assert not claude_connect.is_connected()
-    done = claude_connect.connect()
-    data = json.loads(cfg.read_text(encoding="utf-8"))
-    assert data["theme"] == "dark" and data["mcpServers"]["bridge-after"] == {"command": "x.exe"}
-    entry = data["mcpServers"]["fotomedik"]
-    assert entry["args"][-1] in ("--mcp", "fotomedik.mcp_server")
-    backups = list(cfg.parent.glob("claude_desktop_config.json.bak-fotomedik-*"))
-    assert len(backups) == 1 and "bridge-after" in backups[0].read_text(encoding="utf-8")
-    assert any(d.startswith("connected:") for d in done) and claude_connect.is_connected()
-    # the Store app keeps its settings in its own package folder
-    store = tmp_path / "Local" / "Packages" / "Claude_abc123" / "LocalCache" / "Roaming" / "Claude"
-    store.mkdir(parents=True)
-    (store / "claude_desktop_config.json").write_text("{}", encoding="utf-8")
-    assert len(claude_connect.config_paths()) == 2
-    cfg.write_text("{broken", encoding="utf-8")
-    with pytest.raises(ValueError, match="not valid JSON"):
-        claude_connect.connect()
+def test_connect_to_claude_makes_an_extension(home, tmp_path):
+    import shutil
+    import zipfile
+
+    done = claude_connect.connect(open_it=False)
+    pkg = home / "FotoMedik.mcpb"
+    assert pkg.exists() and any("Settings > Extensions" in d for d in done)
+    with zipfile.ZipFile(pkg) as z:
+        assert sorted(z.namelist()) == ["manifest.json", "server/index.js"]
+        man = json.loads(z.read("manifest.json"))
+        js = z.read("server/index.js").decode()
+    assert man["manifest_version"] == "0.3" and man["name"] == "fotomedik"
+    assert man["server"]["type"] == "node" and man["server"]["entry_point"] == "server/index.js"
+    assert man["server"]["mcp_config"]["args"] == ["${__dirname}/server/index.js"]
+    assert {t["name"] for t in man["tools"]} == {t["name"] for t in mcp_server.TOOLS}
+    assert '"--mcp"' in js and "FOTOMEDIK_EXE" in js
+    node = shutil.which("node")
+    if node is None:
+        return
+    # the extension's script hands Claude's connection to the server as it is
+    root = tmp_path / "ext"
+    with zipfile.ZipFile(pkg) as z:
+        z.extractall(root)
+    env = dict(os.environ, PYTHONPATH=str(ROOT), FOTOMEDIK_EXE=sys.executable,
+               FOTOMEDIK_ARGS=json.dumps(["-m", "fotomedik.mcp_server"]))
+    p = subprocess.run([node, str(root / "server" / "index.js")], env=env, timeout=60, capture_output=True,
+                       input=(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n").encode())
+    assert p.returncode == 0, p.stderr
+    assert {t["name"] for t in json.loads(p.stdout)["result"]["tools"]} == {t["name"] for t in mcp_server.TOOLS}
+    p = subprocess.run([node, str(root / "server" / "index.js")], timeout=60, capture_output=True,
+                       env=dict(os.environ, FOTOMEDIK_EXE=str(tmp_path / "nope.exe")), input=b"")
+    assert p.returncode == 1 and b"not installed" in p.stderr
 
 
 def test_the_program_picks_its_mode(monkeypatch, capsys):

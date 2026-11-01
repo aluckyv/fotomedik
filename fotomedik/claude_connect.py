@@ -1,121 +1,115 @@
-"""Connect FotoMedik to Claude's desktop app: add the FotoMedik MCP server to its settings
-(claude_desktop_config.json, a backup copy is kept) and restart the app on request, so
-Claude can repair folders on this computer (see fotomedik.mcp_server)."""
+"""Connect FotoMedik to Claude's desktop app as a desktop extension (FotoMedik.mcpb).
+
+Claude reads its list of MCP servers only when it starts, and while it runs it writes its
+settings file back from memory, so a server written into that file by someone else gets
+lost. An extension is installed by Claude itself: FotoMedik makes the package and opens
+it, Claude shows its Install window, one click, and FotoMedik is in Claude's tools at once,
+without closing Claude. The package holds a few lines of JavaScript that Claude runs with
+its own Node.js; they start this program as the MCP server (FotoMedik.exe --mcp, see
+fotomedik.mcp_server) and hand it Claude's connection as it is.
+"""
 
 from __future__ import annotations
 
+import io
 import json
 import os
-import shutil
 import subprocess
 import sys
-from datetime import datetime
+import zipfile
 from pathlib import Path
 
 from . import install
 
-SERVER = "fotomedik"
-CONFIG = "claude_desktop_config.json"
+NAME = "fotomedik"
+PACKAGE = "FotoMedik.mcpb"
 
+INDEX_JS = r"""// FotoMedik for Claude: start the FotoMedik program of this computer as the MCP server
+// (FotoMedik.exe --mcp) and hand it Claude's connection (stdin/stdout) as it is.
+const { spawn } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
-def config_paths() -> list[Path]:
-    """Where Claude's desktop app keeps its settings: the usual install and the Microsoft
-    Store one (its own folder under Packages); the ones that exist, else the likely one."""
-    appdata = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-    local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    places = [appdata / "Claude"]
-    pk = local / "Packages"
-    if pk.is_dir():
-        places += [p / "LocalCache" / "Roaming" / "Claude" for p in sorted(pk.glob("Claude_*"))]
-    found = [p / CONFIG for p in places if (p / CONFIG).exists()]
-    if found:
-        return found
-    dirs = [p for p in places if p.is_dir()]
-    if dirs:
-        return [d / CONFIG for d in dirs]
-    store = [p for p in places[1:] if p.parent.parent.is_dir()]  # the Store app, its settings not made yet
-    return [(store or places)[0] / CONFIG]
-
-
-def server_entry() -> dict:
-    if getattr(sys, "frozen", False):
-        exe = install.app_exe() if install.is_folder_app() else Path(sys.executable)
-        return {"command": str(exe), "args": ["--mcp"]}
-    return {"command": sys.executable, "args": ["-m", "fotomedik.mcp_server"],
-            "env": {"PYTHONPATH": str(Path(__file__).resolve().parent.parent)}}
-
-
-def connect(paths: list[Path] | None = None) -> list[str]:
-    """Write the FotoMedik server into the settings; returns what was done, line by line.
-    Other servers and settings stay as they are; the file before the change is copied
-    to claude_desktop_config.json.bak-fotomedik-<time>."""
-    done = []
-    for path in paths or config_paths():
-        data: dict = {}
-        if path.exists():
-            text = path.read_text(encoding="utf-8-sig")
-            try:
-                data = json.loads(text) if text.strip() else {}
-            except ValueError as e:
-                raise ValueError(f"{path} is not valid JSON ({e}); fix it or remove it first") from None
-            if not isinstance(data, dict):
-                raise ValueError(f"{path} does not hold settings (an object)")
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup = path.with_name(f"{CONFIG}.bak-fotomedik-{stamp}")
-            shutil.copy2(path, backup)
-            done.append(f"backup: {backup}")
-        servers = data.get("mcpServers")
-        if not isinstance(servers, dict):
-            servers = {}
-        servers[SERVER] = server_entry()
-        data["mcpServers"] = servers
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-        done.append(f"connected: {path}")
-    return done
-
-
-def is_connected() -> bool:
-    for path in config_paths():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and SERVER in (data.get("mcpServers") or {}):
-            return True
-    return False
-
-
-# Claude's desktop app is claude.exe; so is Claude Code in a terminal, which must not be touched:
-# only processes of the desktop install (the one with a window, or a known install folder) are restarted.
-RESTART_PS = r"""
-$ErrorActionPreference = 'SilentlyContinue'
-Start-Sleep -Seconds 2
-$all = Get-Process -Name claude
-$main = $all | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-$paths = @()
-if ($main) { $paths += $main.Path }
-$paths += ($all | Where-Object { $_.Path -like '*\AnthropicClaude\*' -or $_.Path -like '*\WindowsApps\Claude_*' -or $_.Path -like '*\Programs\Claude\*' } | ForEach-Object { $_.Path })
-$paths = $paths | Where-Object { $_ } | Select-Object -Unique
-if (-not $paths) { exit 1 }
-$all | Where-Object { $paths -contains $_.Path } | Stop-Process -Force
-Start-Sleep -Seconds 4
-$app = Get-StartApps | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1
-if ($app) { Start-Process ('shell:AppsFolder\' + $app.AppID) } else { Start-Process $paths[0] }
+const local = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+const exe = process.env.FOTOMEDIK_EXE || path.join(local, "FotoMedik", "app", "base", "FotoMedik.exe");
+const args = process.env.FOTOMEDIK_ARGS ? JSON.parse(process.env.FOTOMEDIK_ARGS) : ["--mcp"];
+if (!fs.existsSync(exe)) {
+  process.stderr.write("FotoMedik is not installed here (" + exe + "): start FotoMedik once.\n");
+  process.exit(1);
+}
+const child = spawn(exe, args, { stdio: "inherit", windowsHide: true });
+child.on("error", (e) => {
+  process.stderr.write("FotoMedik did not start: " + e.message + "\n");
+  process.exit(1);
+});
+child.on("exit", (code) => process.exit(code === null ? 1 : code));
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => child.kill());
 """
 
 
-def restart_claude() -> bool:
-    """Close Claude's desktop app and start it again (in a process of its own, a couple
-    of seconds later, so this program can answer first). False when not on Windows."""
+def manifest() -> dict:
+    from . import _build
+    from .mcp_server import TOOLS
+
+    env = {}
+    if getattr(sys, "frozen", False) and install.is_folder_app():
+        env["FOTOMEDIK_EXE"] = str(install.app_exe())  # also when FotoMedik lives somewhere else
+    return {
+        "manifest_version": "0.3",
+        "name": NAME,
+        "display_name": "FotoMedik",
+        "version": f"1.0.{_build.BUILD}",
+        "description": "Repair damaged JPEG photos on this computer: Claude queues folders, follows "
+                       "the repairs and stops them. Originals are never changed.",
+        "author": {"name": "FotoMedik"},
+        "server": {
+            "type": "node",
+            "entry_point": "server/index.js",
+            "mcp_config": {"command": "node", "args": ["${__dirname}/server/index.js"], "env": env},
+        },
+        "tools": [{"name": t["name"], "description": t["description"]} for t in TOOLS],
+        "compatibility": {"platforms": ["win32"]},
+    }
+
+
+def build_extension(dest: Path | None = None) -> Path:
+    """Write the extension package (a zip: manifest.json + server/index.js)."""
+    dest = dest or install.home() / PACKAGE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", json.dumps(manifest(), indent=2, ensure_ascii=False))
+        z.writestr("server/index.js", INDEX_JS)
+    tmp = dest.with_suffix(".tmp")
+    tmp.write_bytes(buf.getvalue())
+    os.replace(tmp, dest)
+    return dest
+
+
+def _open(path: Path) -> bool:
+    """Open the package with the program Windows has for it (Claude); False when none."""
     if sys.platform != "win32":
         return False
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    cmd = ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", RESTART_PS]
     try:
-        subprocess.Popen(cmd, creationflags=flags | 0x01000000, close_fds=True)  # out of any job object
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return True
     except OSError:
-        subprocess.Popen(cmd, creationflags=flags, close_fds=True)
-    return True
+        try:  # no program for .mcpb: show the file, to be dragged into Claude
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        except OSError:
+            pass
+        return False
+
+
+def connect(open_it: bool = True) -> list[str]:
+    """Make the extension and open it in Claude; returns what was done, line by line."""
+    path = build_extension()
+    lines = [f"extension: {path}"]
+    if open_it and _open(path):
+        lines.append("Claude shows the FotoMedik extension: click Install. FotoMedik is in Claude's "
+                     "tools right away, Claude keeps running.")
+    else:
+        lines.append("In Claude open Settings > Extensions and drag this file there (or double-click "
+                     "the file), then click Install.")
+    return lines

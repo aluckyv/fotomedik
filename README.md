@@ -20,9 +20,11 @@ From source: `pip install -e . pyside6`, then `python -m fotomedik.gui`.
 
 ### Claude (MCP)
 
-**Connect to Claude…** (top right) adds FotoMedik to Claude's desktop app as an MCP
-server (`FotoMedik.exe --mcp`; the old settings file is kept as a backup) and can
-restart Claude. Claude can then queue folders for repair on this computer
+**Connect to Claude…** (top right) makes FotoMedik's Claude extension (`FotoMedik.mcpb`)
+and opens it in Claude's desktop app: click **Install** there and FotoMedik's MCP server
+(`FotoMedik.exe --mcp`) is in Claude's tools at once, without closing Claude (a server
+written into Claude's settings file by hand needs Claude to be closed while the file is
+edited, because Claude writes that file back while it runs). Claude can then queue folders for repair on this computer
 (`start_job`), follow them (`job_status`, `list_jobs`), stop them (`stop_job`) and
 see what the program has (`app_info`). The jobs run one after another in processes
 of their own, on this computer's graphics card, and go on when Claude is closed;

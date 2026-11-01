@@ -708,19 +708,14 @@ class MainWindow(QMainWindow):
         ans = _connect_dialog(self)
         if ans is None:
             return
-        protected, restart = ans
         try:
-            jobs.save_settings(protected)
+            jobs.save_settings(ans)
             done = claude_connect.connect()
         except Exception as e:  # noqa: BLE001  (shown to the person)
             QMessageBox.warning(self, "Connect to Claude", f"It did not work: {type(e).__name__}: {e}")
             return
         prot = jobs.settings()["protected"]
         done.append("protected: " + (", ".join(prot) if prot else "nothing listed"))
-        if restart and claude_connect.restart_claude():
-            done.append("Claude is restarting; FotoMedik is in its tools afterwards.")
-        elif not restart:
-            done.append("Restart Claude (quit it from the tray and start it again) so it sees FotoMedik.")
         QMessageBox.information(self, "Connect to Claude", "\n".join(done))
 
     def _open_output(self) -> None:
@@ -822,8 +817,8 @@ class MainWindow(QMainWindow):
         super().closeEvent(e)
 
 
-def _connect_dialog(parent) -> tuple[list[str], bool] | None:
-    """Ask for the protected places and whether to restart Claude; None when cancelled."""
+def _connect_dialog(parent) -> list[str] | None:
+    """Ask for the protected places; None when cancelled."""
     from PySide6.QtWidgets import QDialog, QDialogButtonBox
 
     from .. import jobs
@@ -833,15 +828,14 @@ def _connect_dialog(parent) -> tuple[list[str], bool] | None:
     lay = QVBoxLayout(dlg)
     lay.addWidget(QLabel("Claude (the desktop app) will be able to repair folders on this computer: queue them,\n"
                          "follow the repairs and stop them. Originals are never changed, nothing is deleted,\n"
-                         "and nothing is written into the places listed below."))
+                         "and nothing is written into the places listed below.\n\n"
+                         "FotoMedik opens its Claude extension: click Install in Claude. It works right away,\n"
+                         "Claude does not have to be closed."))
     lay.addWidget(QLabel("Folders and drives Claude must never write into, one per line (e.g. F:\\):"))
     box = QPlainTextEdit("\n".join(jobs.settings()["protected"]))
     box.setObjectName("protected")
     box.setFixedHeight(90)
     lay.addWidget(box)
-    restart = QCheckBox("Restart Claude now (needed once, so it sees FotoMedik)")
-    restart.setChecked(True)
-    lay.addWidget(restart)
     bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
     bb.button(QDialogButtonBox.StandardButton.Ok).setText("Connect")
     bb.accepted.connect(dlg.accept)
@@ -849,7 +843,7 @@ def _connect_dialog(parent) -> tuple[list[str], bool] | None:
     lay.addWidget(bb)
     if dlg.exec() != QDialog.DialogCode.Accepted:
         return None
-    return box.toPlainText().splitlines(), restart.isChecked()
+    return box.toPlainText().splitlines()
 
 
 def main(argv: list[str] | None = None) -> int:
