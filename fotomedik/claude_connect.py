@@ -1,9 +1,10 @@
 """Connect FotoMedik to Claude's desktop app, with one click and no questions.
 
 FotoMedik's MCP server (FotoMedik.exe --mcp, see fotomedik.mcp_server) reaches Claude as a
-desktop extension (FotoMedik.mcpb): a small MCP server in JavaScript that Claude runs with
-its own Node.js; it answers Claude itself and does each tool call with this program
-(FotoMedik.exe --mcp-call <tool>).
+desktop extension (FotoMedik.mcpb) of the "binary" kind: Claude starts the installed program
+directly. (A server run by Claude's own Node.js never got Claude's messages on Windows; the
+small JavaScript server, which does each call with FotoMedik.exe --mcp-call, stays for runs
+from source.)
 "Connect to Claude" brings an installed extension up to date in place (Claude uses it the
 next time it starts the server), sees a FotoMedik entry in Claude's settings file as
 connected too, and otherwise writes the package and shows it, to be dragged into Claude's
@@ -149,13 +150,34 @@ def index_js() -> str:
             .replace("__VERSION__", json.dumps(str(_build.BUILD))))
 
 
-def manifest() -> dict:
+README = """FotoMedik for Claude
+
+Claude starts the FotoMedik program of this computer directly as the MCP server
+(FotoMedik.exe --mcp), the same way as a server written into Claude's settings.
+"""
+
+
+def program() -> Path | None:
+    """The installed FotoMedik program the extension starts, None when run from source."""
+    if getattr(sys, "frozen", False):
+        return install.app_exe() if install.is_folder_app() else Path(sys.executable)
+    return None
+
+
+def manifest(exe: Path | None = None) -> dict:
+    """The extension's manifest. With the installed program (exe), Claude starts it directly
+    ("binary": the way that works on Windows, while a server run by Claude's own Node.js
+    never gets Claude's messages); from source, the small JavaScript server does the calls."""
     from . import _build
     from .mcp_server import TOOLS
 
-    env = {}
-    if getattr(sys, "frozen", False) and install.is_folder_app():
-        env["FOTOMEDIK_EXE"] = str(install.app_exe())  # also when FotoMedik lives somewhere else
+    exe = exe or program()
+    if exe is not None:
+        server = {"type": "binary", "entry_point": "server/README.txt",
+                  "mcp_config": {"command": str(exe), "args": ["--mcp"], "env": {}}}
+    else:
+        server = {"type": "node", "entry_point": "server/index.js",
+                  "mcp_config": {"command": "node", "args": ["${__dirname}/server/index.js"], "env": {}}}
     return {
         "manifest_version": "0.3",
         "name": NAME,
@@ -164,24 +186,28 @@ def manifest() -> dict:
         "description": "Repair damaged JPEG photos on this computer: Claude queues folders, follows "
                        "the repairs and stops them. Originals are never changed.",
         "author": {"name": "FotoMedik"},
-        "server": {
-            "type": "node",
-            "entry_point": "server/index.js",
-            "mcp_config": {"command": "node", "args": ["${__dirname}/server/index.js"], "env": env},
-        },
+        "server": server,
         "tools": [{"name": t["name"], "description": t["description"]} for t in TOOLS],
         "compatibility": {"platforms": ["win32"]},
     }
 
 
-def build_extension(dest: Path | None = None) -> Path:
-    """Write the extension package (a zip: manifest.json + server/index.js)."""
+def _files(exe: Path | None = None) -> dict[str, str]:
+    man = manifest(exe)
+    files = {"manifest.json": json.dumps(man, indent=2, ensure_ascii=False), "server/README.txt": README}
+    if man["server"]["type"] == "node":
+        files["server/index.js"] = index_js()
+    return files
+
+
+def build_extension(dest: Path | None = None, exe: Path | None = None) -> Path:
+    """Write the extension package (a zip: manifest.json and server/...)."""
     dest = dest or install.home() / PACKAGE
     dest.parent.mkdir(parents=True, exist_ok=True)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("manifest.json", json.dumps(manifest(), indent=2, ensure_ascii=False))
-        z.writestr("server/index.js", index_js())
+        for name, text in _files(exe).items():
+            z.writestr(name, text)
     tmp = dest.with_suffix(".tmp")
     tmp.write_bytes(buf.getvalue())
     os.replace(tmp, dest)
@@ -227,15 +253,16 @@ def in_settings() -> bool:
 def connect() -> tuple[bool, str]:
     """(connected, one line for the status bar). Nothing is asked and no window opens; only
     when FotoMedik is not in Claude at all the package is written and shown in Explorer."""
+    path = build_extension()  # always the current package, for a new install
     ext = installed_extensions()
-    for d in ext:  # bring the installed script up to date in place
+    for d in ext:  # bring the installed extension up to date in place
         (d / "server").mkdir(exist_ok=True)
-        (d / "server" / "index.js").write_text(index_js(), encoding="utf-8")
+        for name, text in _files().items():
+            (d / name).write_text(text, encoding="utf-8")
     if ext:
         return True, "Connected to Claude (FotoMedik extension, up to date)."
     if in_settings():
         return True, "Connected to Claude (Claude's settings)."
-    path = build_extension()
     if sys.platform == "win32":
         try:
             subprocess.Popen(["explorer", "/select,", str(path)])

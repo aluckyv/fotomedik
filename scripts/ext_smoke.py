@@ -23,6 +23,20 @@ def main() -> int:
     from fotomedik import claude_connect
 
     tmp = Path(tempfile.mkdtemp())
+    # the extension of the installed program: Claude runs its command directly
+    with zipfile.ZipFile(claude_connect.build_extension(tmp / "bin.mcpb", Path(exe))) as z:
+        server = json.loads(z.read("manifest.json"))["server"]
+    assert server["type"] == "binary", server
+    cfg = server["mcp_config"]
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}
+    call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "app_info", "arguments": {}}}
+    p = subprocess.run([cfg["command"], *cfg["args"]], timeout=120, capture_output=True,
+                       input=(json.dumps(init) + "\n" + json.dumps(call) + "\n").encode())
+    replies = {r["id"]: r for r in map(json.loads, p.stdout.decode().splitlines())}
+    if not replies.get(2, {}).get("result", {}).get("structuredContent", {}).get("packaged"):
+        print("binary extension:", p.stdout[-1000:], p.stderr[-1000:])
+        return 1
+    print("::notice title=Extension smoke::the binary extension's command answered")
     pkg = claude_connect.build_extension(tmp / "FotoMedik.mcpb")
     with zipfile.ZipFile(pkg) as z:
         z.extractall(tmp / "ext")

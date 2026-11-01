@@ -229,9 +229,17 @@ def test_connect_to_claude_asks_nothing(home, tmp_path, monkeypatch):
     pkg = home / "FotoMedik.mcpb"
     assert not ok and "Settings > Extensions" in text and pkg.exists()
     with zipfile.ZipFile(pkg) as z:
-        assert sorted(z.namelist()) == ["manifest.json", "server/index.js"]
+        assert sorted(z.namelist()) == ["manifest.json", "server/README.txt", "server/index.js"]
         man = json.loads(z.read("manifest.json"))
     assert man["manifest_version"] == "0.3" and man["name"] == "fotomedik"
+    # the installed program: Claude starts it directly
+    exe = tmp_path / "FotoMedik.exe"
+    binary = claude_connect.manifest(exe)["server"]
+    assert binary == {"type": "binary", "entry_point": "server/README.txt",
+                      "mcp_config": {"command": str(exe), "args": ["--mcp"], "env": {}}}
+    with zipfile.ZipFile(claude_connect.build_extension(tmp_path / "b.mcpb", exe)) as z:
+        assert sorted(z.namelist()) == ["manifest.json", "server/README.txt"]
+    # from source: the small JavaScript server
     assert man["server"]["type"] == "node" and man["server"]["entry_point"] == "server/index.js"
     assert man["server"]["mcp_config"]["args"] == ["${__dirname}/server/index.js"]
     assert {t["name"] for t in man["tools"]} == {t["name"] for t in mcp_server.TOOLS}
