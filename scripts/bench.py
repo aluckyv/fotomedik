@@ -71,7 +71,7 @@ def make(args) -> None:
         b = io.BytesIO()
         if args.kind == "dense-nothumb":
             im.save(b, "JPEG", quality=90)  # no thumbnail: the photos whose thumbnail rotted away
-        elif args.kind == "dense-rst":  # a restart marker after every block row, as Kodaks write
+        elif args.kind in ("dense-rst", "dense-rst-lost"):  # a restart marker after every block row, as Kodaks write
             im.save(b, "JPEG", quality=90, exif=exif_with_thumbnail(im), restart_marker_rows=1)
         else:
             im.save(b, "JPEG", quality=90, exif=exif_with_thumbnail(im))
@@ -84,8 +84,11 @@ def make(args) -> None:
         other = (out / "truth" / goods[(i + 1) % len(goods)]).read_bytes()
         for k in range(args.per):
             seed = 1000 * i + k
-            if args.kind in ("dense", "dense-head", "dense-nothumb", "dense-rst"):
+            if args.kind in ("dense", "dense-head", "dense-nothumb", "dense-rst", "dense-rst-lost"):
                 bad, what = dense_rot(data, seed, head=args.kind == "dense-head")
+                if args.kind == "dense-rst-lost":
+                    bad, lost = lose_sectors(bad, seed)
+                    what = what + [lost]
             else:
                 bad, what = damage(data, other, seed)
             case = f"{Path(name).stem}__{k}.jpg"
@@ -94,6 +97,21 @@ def make(args) -> None:
             print(f"{case}: {', '.join(what)}")
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     print(f"{len(goods)} good photos, {len(manifest)} damaged copies")
+
+
+def lose_sectors(data: bytes, seed: int, runs=(2, 6), length=(1, 12)) -> tuple[bytes, str]:
+    """A few runs of 512-byte sectors cut out of the scan (a recovery that missed them): all
+    that follows moves up, so the repair has to guess how many block rows were lost."""
+    rng = np.random.default_rng(seed + 77)
+    s = (scan_start(data) // SECTOR + 1) * SECTOR
+    n_sec = (len(data) - 2 - s) // SECTOR
+    cut = set()
+    for _ in range(int(rng.integers(runs[0], runs[1] + 1))):
+        a = int(rng.integers(0, max(1, n_sec - 12)))
+        cut.update(range(a, a + int(rng.integers(length[0], length[1] + 1))))
+    keep = [data[:s]] + [data[s + i * SECTOR : s + (i + 1) * SECTOR] for i in range(n_sec) if i not in cut]
+    keep.append(data[s + n_sec * SECTOR :])
+    return b"".join(keep), f"{len(cut)} sectors missing"
 
 
 # ---------------------------------------------------------------- scoring
@@ -322,11 +340,12 @@ def main() -> None:
     m.add_argument("bench")
     m.add_argument("--per", type=int, default=2)
     m.add_argument("--long", type=int, default=1600)
-    m.add_argument("--kind", choices=("mixed", "dense", "dense-head", "dense-nothumb", "dense-rst"), default="mixed",
+    m.add_argument("--kind", choices=("mixed", "dense", "dense-head", "dense-nothumb", "dense-rst", "dense-rst-lost"), default="mixed",
                    help="mixed: one or two kinds of damage per copy; dense: rot over the whole scan (a dying card); "
                         "dense-head: the same from the first byte (header and thumbnail rot too; repair with the "
                         "app's batch and judge with `score`); dense-nothumb: dense, photos without a thumbnail; "
-                        "dense-rst: dense, photos with a restart marker after every block row (the jigsaw)")
+                        "dense-rst: dense, photos with a restart marker after every block row (the jigsaw); "
+                        "dense-rst-lost: the same with runs of sectors missing, as a recovery leaves them")
     r = sub.add_parser("run")
     r.add_argument("bench")
     r.add_argument("result")
