@@ -138,6 +138,11 @@ jobs:
         env:
           FOTOMEDIK_HOME: ${{ github.workspace }}\inst
         run: python scripts/mcp_smoke.py inst\app\base\FotoMedik.exe demo demo_out_mcp
+      - name: Claude extension smoke test (its Node.js server calls the installed program)
+        shell: pwsh
+        env:
+          FOTOMEDIK_HOME: ${{ github.workspace }}\inst
+        run: python scripts/ext_smoke.py inst\app\base\FotoMedik.exe
       - uses: actions/cache@v4
         with:
           path: models

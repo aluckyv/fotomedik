@@ -234,6 +234,21 @@ def serve() -> int:
         out.flush()
 
 
+def call_once(name: str) -> int:
+    """One tool call for the extension (FotoMedik.exe --mcp-call <tool>): the arguments come
+    as JSON on the input, the MCP result goes out as one JSON line."""
+    raw = sys.stdin.buffer.read() if sys.stdin is not None else b""
+    try:
+        args = json.loads(raw.decode("utf-8-sig") or "{}")
+    except ValueError:
+        args = None
+    res = call_tool(name, args) if isinstance(args, dict) else \
+        {"content": [{"type": "text", "text": "the arguments are not a JSON object"}], "isError": True}
+    sys.stdout.buffer.write(json.dumps(res, ensure_ascii=False).encode("utf-8") + b"\n")
+    sys.stdout.flush()
+    return 0
+
+
 def main() -> None:
     sys.exit(serve())
 

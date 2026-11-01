@@ -1,6 +1,7 @@
 """The program's other ways of running, besides the window (FotoMedik.exe <flag> ...):
 
   --mcp            the MCP server Claude's desktop app talks to (fotomedik.mcp_server)
+  --mcp-call <t>   one tool call of that server, for the Claude extension (JSON in, JSON out)
   --jobs           the runner of the queued repair jobs (fotomedik.jobs)
   --cli <args>     the command line (fotomedik.cli), e.g. --cli batch <folder> -o <out>
 
@@ -46,6 +47,10 @@ def _run(mode: str, args: list[str]) -> int:
         from .mcp_server import serve
 
         return serve()
+    if mode == "--mcp-call":
+        from .mcp_server import call_once
+
+        return call_once(args[0] if args else "")
     if mode == "--jobs":
         from .jobs import run_queue
 
@@ -63,9 +68,9 @@ def dispatch(args: list[str]) -> int | None:
     """Run the mode the first argument asks for and return its exit code; None for the window.
     An error ends the mode with its story on stderr (in the packaged program an error left
     unhandled would open a message box and the process would wait for a click that never comes)."""
-    if not args or args[0] not in ("--mcp", "--jobs", "--cli"):
+    if not args or args[0] not in ("--mcp", "--mcp-call", "--jobs", "--cli"):
         return None
-    if args[0] == "--cli":
+    if args[0] in ("--cli", "--mcp-call"):
         _std_streams()
     try:
         return _run(args[0], args[1:])

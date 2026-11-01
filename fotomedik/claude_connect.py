@@ -1,8 +1,9 @@
 """Connect FotoMedik to Claude's desktop app, with one click and no questions.
 
 FotoMedik's MCP server (FotoMedik.exe --mcp, see fotomedik.mcp_server) reaches Claude as a
-desktop extension (FotoMedik.mcpb): a few lines of JavaScript that Claude runs with its own
-Node.js and that start this program, passing Claude's messages to it and its answers back.
+desktop extension (FotoMedik.mcpb): a small MCP server in JavaScript that Claude runs with
+its own Node.js; it answers Claude itself and does each tool call with this program
+(FotoMedik.exe --mcp-call <tool>).
 "Connect to Claude" brings an installed extension up to date in place (Claude uses it the
 next time it starts the server), sees a FotoMedik entry in Claude's settings file as
 connected too, and otherwise writes the package and shows it, to be dragged into Claude's
@@ -24,35 +25,128 @@ from . import install
 NAME = "fotomedik"
 PACKAGE = "FotoMedik.mcpb"
 
-INDEX_JS = r"""// FotoMedik for Claude: start the FotoMedik program of this computer as the MCP server
-// (FotoMedik.exe --mcp) and pass Claude's messages to it and its answers back. The streams
-// are passed on by hand: Claude's own Node.js gives this script streams, not handles that a
-// child process could inherit.
+INDEX_JS_TEMPLATE = r"""// FotoMedik for Claude: the MCP server of the FotoMedik extension, run by Claude's own Node.js.
+// It talks to Claude itself (the handshake never waits for the program) and does each tool
+// call with the FotoMedik program of this computer: FotoMedik.exe --mcp-call <tool>, the
+// arguments on its input, the result on its output. When the program cannot run, the
+// call says why instead of the connection dropping.
 const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const readline = require("readline");
 
-const local = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+const TOOLS = __TOOLS__;
+const INSTRUCTIONS = __INSTRUCTIONS__;
+const VERSION = __VERSION__;
+const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+const home = os.homedir();
+const local = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
 const exe = process.env.FOTOMEDIK_EXE || path.join(local, "FotoMedik", "app", "base", "FotoMedik.exe");
-const args = process.env.FOTOMEDIK_ARGS ? JSON.parse(process.env.FOTOMEDIK_ARGS) : ["--mcp"];
-if (!fs.existsSync(exe)) {
-  process.stderr.write("FotoMedik is not installed here (" + exe + "): start FotoMedik once.\n");
-  process.exit(1);
+const prefix = process.env.FOTOMEDIK_ARGS ? JSON.parse(process.env.FOTOMEDIK_ARGS) : [];
+
+function childEnv() {
+  // Claude may start this script with only a few variables; Windows programs need these
+  const env = Object.assign({}, process.env);
+  const root = env.SystemRoot || env.SYSTEMROOT || env.windir || "C:\\Windows";
+  const put = (k, v) => { if (!env[k]) env[k] = v; };
+  put("SystemRoot", root); put("windir", root);
+  put("USERPROFILE", home); put("LOCALAPPDATA", local);
+  put("APPDATA", path.join(home, "AppData", "Roaming"));
+  put("TEMP", path.join(local, "Temp")); put("TMP", env.TEMP);
+  put("HOMEDRIVE", home.slice(0, 2)); put("HOMEPATH", home.slice(2));
+  const sys32 = path.join(root, "System32");
+  env.PATH = (env.PATH || env.Path || "") + path.delimiter + sys32 + path.delimiter + root;
+  env.PYTHONIOENCODING = "utf-8";
+  return env;
 }
-const child = spawn(exe, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-child.on("error", (e) => {
-  process.stderr.write("FotoMedik did not start: " + e.message + "\n");
-  process.exit(1);
+
+function fail(text) {
+  return { content: [{ type: "text", text: text }], isError: true };
+}
+
+function callTool(name, args) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(exe)) return resolve(fail("FotoMedik is not installed here (" + exe + "): start FotoMedik once."));
+    const out = [], err = [];
+    let child;
+    try {
+      child = spawn(exe, prefix.concat(["--mcp-call", name]),
+                    { env: childEnv(), windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    } catch (e) {
+      return resolve(fail("FotoMedik did not start (" + exe + "): " + e.message));
+    }
+    const timer = setTimeout(() => child.kill(), 120000);
+    child.stdout.on("data", (d) => out.push(d));
+    child.stderr.on("data", (d) => err.push(d));
+    child.stdin.on("error", () => {});
+    child.on("error", (e) => { clearTimeout(timer); resolve(fail("FotoMedik did not start (" + exe + "): " + e.message)); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const text = Buffer.concat(out).toString("utf8").trim();
+      const last = text.split("\n").pop();
+      try {
+        resolve(JSON.parse(last));
+      } catch (e) {
+        const why = (Buffer.concat(err).toString("utf8") || text).slice(-3000);
+        resolve(fail("FotoMedik ended with code " + code + " without an answer:\n" + why));
+      }
+    });
+    child.stdin.end(JSON.stringify(args || {}));
+  });
+}
+
+function send(msg) {
+  process.stdout.write(JSON.stringify(msg) + "\n");
+}
+
+async function handle(msg) {
+  if (msg.id === undefined || msg.id === null) return;  // a notification
+  const p = msg.params || {};
+  let result;
+  if (msg.method === "initialize") {
+    result = { protocolVersion: PROTOCOLS.includes(p.protocolVersion) ? p.protocolVersion : PROTOCOLS[0],
+               capabilities: { tools: { listChanged: false } },
+               serverInfo: { name: "fotomedik", version: VERSION }, instructions: INSTRUCTIONS };
+  } else if (msg.method === "ping") {
+    result = {};
+  } else if (msg.method === "tools/list") {
+    result = { tools: TOOLS };
+  } else if (msg.method === "tools/call") {
+    result = await callTool(p.name || "", p.arguments || {});
+  } else if (msg.method === "resources/list" || msg.method === "prompts/list") {
+    result = {}; result[msg.method.split("/")[0]] = [];
+  } else {
+    return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found: " + msg.method } });
+  }
+  send({ jsonrpc: "2.0", id: msg.id, result: result });
+}
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+let pending = 0, closed = false;
+rl.on("line", (line) => {
+  line = line.trim();
+  if (!line) return;
+  let msg;
+  try { msg = JSON.parse(line); } catch (e) {
+    return send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+  }
+  pending++;
+  handle(msg).catch((e) => send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: String(e) } }))
+    .finally(() => { pending--; if (closed && pending === 0) process.exit(0); });
 });
-process.stdin.pipe(child.stdin);
-child.stdout.pipe(process.stdout);
-child.stderr.on("data", (d) => process.stderr.write(d));
-child.stdin.on("error", () => {});
-process.stdout.on("error", () => {});
-child.on("exit", (code) => process.exit(code === null ? 1 : code));
-for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => child.kill());
+rl.on("close", () => { closed = true; if (pending === 0) process.exit(0); });
 """
+
+
+def index_js() -> str:
+    from . import _build
+    from .mcp_server import INSTRUCTIONS, TOOLS
+
+    return (INDEX_JS_TEMPLATE.replace("__TOOLS__", json.dumps(TOOLS))
+            .replace("__INSTRUCTIONS__", json.dumps(INSTRUCTIONS))
+            .replace("__VERSION__", json.dumps(str(_build.BUILD))))
 
 
 def manifest() -> dict:
@@ -87,7 +181,7 @@ def build_extension(dest: Path | None = None) -> Path:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", json.dumps(manifest(), indent=2, ensure_ascii=False))
-        z.writestr("server/index.js", INDEX_JS)
+        z.writestr("server/index.js", index_js())
     tmp = dest.with_suffix(".tmp")
     tmp.write_bytes(buf.getvalue())
     os.replace(tmp, dest)
@@ -136,7 +230,7 @@ def connect() -> tuple[bool, str]:
     ext = installed_extensions()
     for d in ext:  # bring the installed script up to date in place
         (d / "server").mkdir(exist_ok=True)
-        (d / "server" / "index.js").write_text(INDEX_JS, encoding="utf-8")
+        (d / "server" / "index.js").write_text(index_js(), encoding="utf-8")
     if ext:
         return True, "Connected to Claude (FotoMedik extension, up to date)."
     if in_settings():

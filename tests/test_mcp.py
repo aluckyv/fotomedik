@@ -246,7 +246,7 @@ def test_connect_to_claude_asks_nothing(home, tmp_path, monkeypatch):
     (other / "server" / "index.js").write_text("theirs", encoding="utf-8")
     ok, text = claude_connect.connect()
     assert ok and "up to date" in text
-    assert (ext / "server" / "index.js").read_text(encoding="utf-8") == claude_connect.INDEX_JS
+    assert (ext / "server" / "index.js").read_text(encoding="utf-8") == claude_connect.index_js()
     assert (other / "server" / "index.js").read_text(encoding="utf-8") == "theirs"
     # a server written into Claude's settings by hand counts as connected
     shutil.rmtree(ext)
@@ -257,23 +257,38 @@ def test_connect_to_claude_asks_nothing(home, tmp_path, monkeypatch):
     node = shutil.which("node")
     if node is None:
         return
-    # the script passes Claude's messages to the server and its answers back
+    # the extension's own server: the handshake without the program, each tool call with it
     root = tmp_path / "ext"
     with zipfile.ZipFile(pkg) as z:
         z.extractall(root)
-    env = dict(os.environ, PYTHONPATH=str(ROOT), FOTOMEDIK_EXE=sys.executable,
-               FOTOMEDIK_ARGS=json.dumps(["-m", "fotomedik.mcp_server"]))
-    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "server/discover"},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
-    p = subprocess.run([node, str(root / "server" / "index.js")], env=env, timeout=60, capture_output=True,
+    script = str(root / "server" / "index.js")
+    runner = ["-c", "import sys; from fotomedik.entry import dispatch; sys.exit(dispatch(sys.argv[1:]))"]
+    env = dict(os.environ, PYTHONPATH=str(ROOT), FOTOMEDIK_EXE=sys.executable, FOTOMEDIK_ARGS=json.dumps(runner))
+    msgs = [{"jsonrpc": "2.0", "id": 0, "method": "server/discover"},
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "app_info", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+             "params": {"name": "start_job", "arguments": {"source": str(tmp_path), "output": str(tmp_path / "o")}}}]
+    p = subprocess.run([node, script], env=env, timeout=120, capture_output=True,
                        input="".join(json.dumps(m) + "\n" for m in msgs).encode())
     assert p.returncode == 0, p.stderr
-    replies = [json.loads(x) for x in p.stdout.decode().splitlines()]
-    assert replies[0]["id"] == 1 and replies[0]["error"]["code"] == -32601  # an unknown probe gets an answer
-    assert {t["name"] for t in replies[1]["result"]["tools"]} == {t["name"] for t in mcp_server.TOOLS}
-    p = subprocess.run([node, str(root / "server" / "index.js")], timeout=60, capture_output=True,
-                       env=dict(os.environ, FOTOMEDIK_EXE=str(tmp_path / "nope.exe")), input=b"")
-    assert p.returncode == 1 and b"not installed" in p.stderr
+    replies = {r["id"]: r for r in map(json.loads, p.stdout.decode().splitlines())}
+    assert sorted(replies) == [0, 1, 2, 3, 4]
+    assert replies[0]["error"]["code"] == -32601  # an unknown probe gets an answer at once
+    assert replies[1]["result"]["serverInfo"]["name"] == "fotomedik"
+    assert {t["name"] for t in replies[2]["result"]["tools"]} == {t["name"] for t in mcp_server.TOOLS}
+    info = replies[3]["result"]
+    assert not info["isError"] and info["structuredContent"]["home"] == str(home)
+    assert replies[4]["result"]["isError"] and "inside" in replies[4]["result"]["content"][0]["text"]
+    # the program missing: the call says so, the connection stays
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "app_info"}}]
+    p = subprocess.run([node, script], timeout=60, capture_output=True,
+                       env=dict(os.environ, FOTOMEDIK_EXE=str(tmp_path / "nope.exe")),
+                       input=(json.dumps(msgs[0]) + "\n").encode())
+    res = json.loads(p.stdout)["result"]
+    assert p.returncode == 0 and res["isError"] and "not installed" in res["content"][0]["text"]
 
 
 def test_the_program_picks_its_mode(monkeypatch, capsys):
