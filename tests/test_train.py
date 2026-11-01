@@ -96,6 +96,7 @@ def test_thumbnail_step_is_skipped_after_the_guided_network():
     sys.path.insert(0, str(Path(__file__).parent))
     from test_ai import FakeLama, FakeSR
 
+    from fotomedik.ai import models
     from fotomedik.ai.enhance import Engine, enhance_steps
 
     class In:
@@ -115,6 +116,7 @@ def test_thumbnail_step_is_skipped_after_the_guided_network():
     holes[40:88] = True
     small = rng.integers(60, 200, (32, 40, 3), dtype=np.uint8)
     eng = Engine(FakeSR(), FakeLama(), deblock=Guided())
+    eng.deblock_model = models.DEBLOCK_GUIDED
     _out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["deblock", "thumbsr"], thumb_small=small)
     assert any("skipped" in d for d in done) and not any("enlarged by" in d for d in done)
     big = rng.integers(60, 200, (2400, 3200, 3), dtype=np.uint8)  # 8 MP: larger than the network learnt on
@@ -122,4 +124,4 @@ def test_thumbnail_step_is_skipped_after_the_guided_network():
     bh[800:880] = True
     _out, done = enhance_steps(big, bh, np.zeros_like(bh), eng, ["deblock", "thumbsr"],
                                thumb_small=rng.integers(60, 200, (120, 160, 3), dtype=np.uint8))
-    assert any("larger than the network" in d for d in done) and any("enlarged by" in d for d in done)
+    assert any("left out" in d for d in done) and any("enlarged by" in d for d in done)

@@ -729,8 +729,6 @@ def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: di
         g = quarter_guide(thumb_small, arr.shape)
         if g is not None and max(h, w) > guided_max_side(s):
             g = None  # a photo larger than the network learnt on: the thumbnail would only blur it
-            if stats is not None:
-                stats["too_big"] = True
         has = 0.0 if g is None else 1.0
         if stats is not None:
             stats["guided"] = g is not None  # the holes were rebuilt from the thumbnail
@@ -860,15 +858,19 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             unknown = unknown & ~filled
     _check(stop)
     st: dict = {}
-    if "deblock" in steps and engine.deblock_s is not None:
+    file = engine.deblock_model.file if engine.deblock_model is not None else ""
+    tuned = file in ("fbcnn-fotomedik.onnx", "fbcnn-fotomedik-guided.onnx")
+    if "deblock" in steps and engine.deblock_s is not None and tuned \
+            and max(arr.shape[:2]) > guided_max_side(engine.deblock_s):
+        # the networks fine-tuned on 1600-pixel photos smear and band 12 MP ones (KRIT): left out
+        done.append("JPEG clean-up left out: the photo is larger than the fine-tuned network learnt on")
+    elif "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
         arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small)
         real = arr.copy()  # the cleaned picture is the base from here on
-        file = engine.deblock_model.file if engine.deblock_model is not None else ""
         which = {"fbcnn-fotomedik.onnx": "FBCNN fine-tuned on your photos, ",
                  "fbcnn-fotomedik-guided.onnx": "FBCNN guided by the thumbnail, fine-tuned on your photos, "}.get(file, "")
-        big = "; the thumbnail not used: the photo is larger than the network learnt on" if st.get("too_big") else ""
-        done.append(f"JPEG blocks and noise removed ({which}{st.get('tiles', 0)} tiles, {_took(t0)}){big}")
+        done.append(f"JPEG blocks and noise removed ({which}{st.get('tiles', 0)} tiles, {_took(t0)})")
     guided = "deblock" in steps and engine.deblock_s is not None and st.get("guided", False)
     if holes.any() and guided and "thumbsr" in steps and "diffusion" not in steps and "ai" not in steps:
         # the guided network rebuilt the holes from the whole thumbnail itself, better than the
