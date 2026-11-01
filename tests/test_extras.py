@@ -222,3 +222,66 @@ def test_wrongly_coloured_stripes_next_to_holes_are_healed_too():
     assert "stripes" in done[0]
     assert np.abs(out[136, 100].astype(int) - (255, 60, 170)).sum() > 100  # the pink is gone
     assert np.array_equal(out[200:216, 20:60], arr[200:216, 20:60])
+
+
+# ----------------------------------------------------------------- the clean-ups that keep the real picture
+
+
+def _sky(h=128, w=256, seed=0):
+    rng = np.random.default_rng(seed)
+    base = np.full((h, w, 3), (120, 160, 210), np.float32)
+    return base, base + rng.normal(0, 1.5, base.shape)
+
+
+def test_protect_real_keeps_the_real_pixels_and_cleans_the_holes():
+    from fotomedik.ai.enhance import PROTECT_FEATHER, protect_real
+
+    real = np.full((64, 64, 3), 100, np.uint8)
+    cleaned = np.full((64, 64, 3), 140, np.uint8)
+    holes = np.zeros((64, 64), bool)
+    holes[16:48, 16:48] = True
+    out = protect_real(cleaned, real, holes)
+    assert (out[:16 - PROTECT_FEATHER] == 100).all()  # far from the holes: untouched
+    assert (out[32, 32] == 140).all()  # in a hole: the clean-up
+    assert 100 < out[32, 16 - PROTECT_FEATHER // 2, 0] < 140  # the fade between
+
+
+def test_blend_seams_lifts_a_fill_onto_the_picture_around_it():
+    from fotomedik.ai.enhance import blend_seams
+
+    real = np.full((96, 96, 3), 150, np.uint8)
+    out = real.copy()
+    holes = np.zeros((96, 96), bool)
+    holes[32:64, 24:72] = True
+    out[holes] = 125  # a fill a shade too dark: a band
+    res = blend_seams(out, holes, real)
+    assert (res[~holes] == real[~holes]).all()  # the real pixels do not move
+    assert np.abs(res[holes].astype(int) - 150).max() <= 3
+
+
+def test_destripe_evens_a_band_against_the_thumbnail():
+    from fotomedik.ai.enhance import destripe
+
+    base, noisy = _sky()
+    arr = noisy.copy()
+    arr[64:72, 40:200] += 25  # a band one block tall, 20 blocks long
+    arr = np.clip(np.rint(arr), 0, 255).astype(np.uint8)
+    out, n = destripe(arr, base.astype(np.uint8))
+    assert n >= 15
+    band = out[64:72, 60:180].astype(np.float32).mean(axis=(0, 1))
+    assert np.abs(band - base[0, 0]).max() < 5
+    assert np.abs(out[:48].astype(int) - arr[:48]).max() <= 2  # the sky around stays
+
+
+def test_destripe_leaves_detail_lone_blocks_and_photos_without_a_thumbnail():
+    from fotomedik.ai.enhance import destripe
+
+    base, noisy = _sky(seed=1)
+    arr = noisy.copy()
+    arr[64:72, 96:104] += 30  # one odd block: a detail, not a band
+    arr[24:32, 40:200, :] += 25 + np.tile([[-20.0], [20.0]], (4, 160))[..., None]  # off, but textured
+    arr = np.clip(np.rint(arr), 0, 255).astype(np.uint8)
+    out, n = destripe(arr, base.astype(np.uint8))
+    assert n == 0 and (out == arr).all()
+    same, n0 = destripe(arr, None)
+    assert n0 == 0 and same is arr

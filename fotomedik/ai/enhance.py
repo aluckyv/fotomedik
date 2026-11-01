@@ -658,6 +658,136 @@ def _spread(diff: np.ndarray, known: np.ndarray, todo: np.ndarray, rounds: int =
     return out
 
 
+PROTECT_REAL = True  # JPEG clean-up only in the holes (bench: detail kept)
+BLEND_SEAMS = True  # filled holes lifted onto the colours around them
+SEAM_MAX = 48.0  # gray levels: a bigger step across a border is an edge or junk, not a colour mismatch
+SEAM_ROUNDS = 250  # neighbour-averaging rounds of the offset field (block grid)
+PROTECT_FEATHER = 8  # pixels over which the cleaned holes fade into the untouched real picture
+
+
+def blend_seams(out: np.ndarray, holes: np.ndarray, real: np.ndarray) -> np.ndarray:
+    """Lift the filled holes onto the real picture around them. At every border the colour
+    step is measured (the real pixels just outside minus the filled ones just inside, two
+    pixels each, steps above SEAM_MAX left out); the steps are spread through the hole as
+    a smooth field (on the 8x8 block grid) and added. A sky where real stretches and filled
+    rows alternate loses its bands; the real pixels do not move."""
+    import cv2
+
+    if not holes.any() or holes.all():
+        return out
+    h, w = holes.shape
+    o, r = out.astype(np.float32), real.astype(np.float32)
+    bh, bw = -(-h // 8), -(-w // 8)
+    acc = np.zeros((bh, bw, 3), np.float64)
+    cnt = np.zeros((bh, bw), np.float64)
+    for axis in (0, 1):
+        for sign in (1, -1):
+            # a hole pixel whose neighbour (and the one after it) in this direction is real
+            nb = np.roll(holes, -sign, axis=axis)
+            nb2 = np.roll(holes, -2 * sign, axis=axis)
+            edge = holes & ~nb & ~nb2
+            if axis == 0:
+                edge[[0, 1, -2, -1], :] = False
+            else:
+                edge[:, [0, 1, -2, -1]] = False
+            ys, xs = np.nonzero(edge)
+            if not len(ys):
+                continue
+            dy, dx = (sign, 0) if axis == 0 else (0, sign)
+            outside = (r[ys + dy, xs + dx] + r[ys + 2 * dy, xs + 2 * dx]) / 2
+            inn_y, inn_x = np.clip(ys - dy, 0, h - 1), np.clip(xs - dx, 0, w - 1)
+            inside = (o[ys, xs] + o[inn_y, inn_x]) / 2
+            d = outside - inside
+            ok = np.abs(d).max(axis=1) <= SEAM_MAX
+            ys, xs, d = ys[ok], xs[ok], d[ok]
+            np.add.at(acc, (ys // 8, xs // 8), d)
+            np.add.at(cnt, (ys // 8, xs // 8), 1.0)
+    known = cnt >= 4
+    if not known.any():
+        return out
+    field = np.zeros((bh, bw, 3), np.float64)
+    field[known] = acc[known] / cnt[known][:, None]
+    field = _spread(field, known, ~known, rounds=SEAM_ROUNDS)
+    px = cv2.resize(field.astype(np.float32), (bw * 8, bh * 8), interpolation=cv2.INTER_LINEAR)[:h, :w]
+    res = o + px * holes[..., None]
+    return np.clip(np.rint(res), 0, 255).astype(np.uint8)
+
+
+def protect_real(cleaned: np.ndarray, real: np.ndarray, holes: np.ndarray) -> np.ndarray:
+    """The real picture back where the JPEG clean-up only softened it: the cleaned pixels
+    stay in the holes and fade over PROTECT_FEATHER pixels into the untouched ones."""
+    import cv2
+
+    if not holes.any():
+        return real.copy()
+    dist = cv2.distanceTransform((~holes).astype(np.uint8), cv2.DIST_L2, 3)
+    alpha = np.clip(dist / PROTECT_FEATHER, 0.0, 1.0)[..., None]
+    res = alpha * real.astype(np.float32) + (1.0 - alpha) * cleaned.astype(np.float32)
+    return np.clip(np.rint(res), 0, 255).astype(np.uint8)
+
+
+DESTRIPE = False  # bands evened against the thumbnail: off until it can use a rescued thumbnail (no gain on the bench)
+STRIPE_OFF = 14.0  # gray levels a block's colour must stray from what is around it to be a band
+STRIPE_FLAT = 6.0  # luma spread inside a block below which it is flat (sky, wall, road)
+STRIPE_OK = 8.0  # the blocks around must agree this well: then they are right and the block is not
+STRIPE_RUN = 3  # blocks in a line a band needs: a lone odd block is a detail, not a band
+STRIPE_BIAS = 31  # blocks: window of the thumbnail's own colour offset against the photo
+
+
+def _runs(mask: np.ndarray, n: int, axis: int) -> np.ndarray:
+    """The cells of `mask` that lie in a run of at least n along `axis`."""
+    m = mask if axis == 1 else mask.T
+    out = np.zeros_like(m)
+    for i, row in enumerate(m):
+        if row.sum() < n:
+            continue
+        d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
+        for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+            if b - a >= n:
+                out[i, a:b] = True
+    return out if axis == 1 else out.T
+
+
+def destripe(arr: np.ndarray, thumb: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+    """Even out the bands and lines a flat surface still shows (rows of blocks a shade off,
+    a dark column at the edge): a flat block whose colour strays from the thumbnail (allowing
+    for the thumbnail's own colour offset) gets its colour moved there by a smooth correction.
+    Without a thumbnail nothing is done. Its texture stays; detail, edges and lone blocks are left
+    alone. Returns (rgb, blocks evened)."""
+    import cv2
+
+    from ..recipes.r12_smooth import surface
+
+    h, w = arr.shape[:2]
+    bh, bw = h // 8, w // 8
+    if bh < 8 or bw < 8:
+        return arr, 0
+    if thumb is None or thumb.shape[:2] != arr.shape[:2]:
+        return arr, 0  # without a reference a band and a real shade look alike (tried: worse)
+    a = arr[: bh * 8, : bw * 8].astype(np.float32)
+    m = a.reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    luma = a @ np.array([0.299, 0.587, 0.114], np.float32)
+    flat = luma.reshape(bh, 8, bw, 8).std(axis=(1, 3)) < STRIPE_FLAT
+    t = thumb[: bh * 8, : bw * 8].astype(np.float32).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    d = m - t
+    wgt = (flat & (np.abs(d).max(axis=-1) < 2 * STRIPE_OFF)).astype(np.float32)
+    k = (STRIPE_BIAS, STRIPE_BIAS)
+    num = np.stack([cv2.boxFilter(d[..., c] * wgt, -1, k, normalize=False) for c in range(3)], axis=-1)
+    den = cv2.boxFilter(wgt, -1, k, normalize=False)[..., None]
+    target = t + num / np.maximum(den, 1e-6)  # the thumbnail with the photo's colours
+    off = np.abs(m - target).max(axis=-1)
+    near = cv2.blur((off < STRIPE_OK).astype(np.float32), (5, 5)) > 0.5  # most around fit
+    cand = flat & (off > STRIPE_OFF) & near & (den[..., 0] > 0)
+    bad = _runs(cand, STRIPE_RUN, 1) | _runs(cand, STRIPE_RUN, 0)
+    if not bad.any():
+        return arr, 0
+    corr_b = np.where(bad[..., None], target - m, 0.0)
+    corr = np.stack([surface(corr_b[..., c]) for c in range(3)], axis=-1)
+    out = arr.astype(np.float32)
+    out[: bh * 8, : bw * 8] += corr[: bh * 8, : bw * 8]
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(bad.sum())
+
+
 def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray,
                      spread: bool = False) -> np.ndarray:
     """Give every 8x8 block of `out` the average it has in `ref` where `known`, through
@@ -869,7 +999,9 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
     elif "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
         arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small)
-        if keep is not None:
+        if PROTECT_REAL:  # the file's own pixels stay sharp: the clean-up works on the holes
+            arr = protect_real(arr, real, holes & ~keep if keep is not None else holes)
+        elif keep is not None:
             arr = np.where(keep[..., None], real, arr)
         real = arr.copy()  # the cleaned picture is the base from here on
         which = {"fbcnn-fotomedik.onnx": "FBCNN fine-tuned on your photos, ",
@@ -880,6 +1012,8 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         # the guided network rebuilt the holes from the whole thumbnail itself, better than the
         # enlarged thumbnail would (bench: 31.5 dB alone, 31.0 with the thumbnail step after it)
         done.append("thumbnail step skipped: the guided network already rebuilt the holes from the thumbnail")
+        if BLEND_SEAMS:
+            arr = blend_seams(arr, holes, arr)
     elif holes.any():
         before = arr
         if "diffusion" in steps and engine.sd is not None:
@@ -954,8 +1088,15 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                 arr = sharpen_holes(arr, holes, engine, report("Real-ESRGAN tile"), stop=stop, stats=st)
                 arr = keep_block_means(arr, filled_arr, holes, holes & ~unknown)
                 done.append(f"holes sharpened (Real-ESRGAN, {st.get('tiles', 0)} tiles, {_took(t0)})")
+        if BLEND_SEAMS:
+            arr = blend_seams(arr, holes, real)
         arr = np.where(holes[..., None], arr, real)
     _check(stop)
+    if DESTRIPE and steps & {"deblock", "thumbsr", "ai", "puzzle"}:
+        t0 = time.perf_counter()
+        arr, n_even = destripe(arr, thumb)
+        if n_even:
+            done.append(f"{n_even} block(s) of bands and lines on flat surfaces evened out ({_took(t0)})")
     if "faces" in steps and engine.face_s is not None:
         from .faces import restore_faces
 

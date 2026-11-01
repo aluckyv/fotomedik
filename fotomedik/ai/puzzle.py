@@ -41,6 +41,7 @@ MOVE_COLS = 4  # and up to 4 blocks to the side
 MOVE_GAIN = 0.7  # a run moves only when it fits there clearly better than where it is
 TAIL_TRIM = 2  # blocks dropped before a stretch's first decoding error
 AMBIGUOUS = 0.85  # the best place must beat the second best with the same marker number by this
+BLOCK_OFF = 40.0  # a placed block whose colour is this far from the thumbnail's is left out
 MERGE_ERR = 12.0  # a block the repair decoded stays (no piece replaces it) when this close to the thumbnail
 KEEP_SHARE = 0.8  # the pieces must cover at least this share of what the repair decoded
 RST = re.compile(rb"\xff[\xd0-\xd7]")
@@ -258,8 +259,11 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
             continue
         for j in np.flatnonzero(free):
             g = idx[j]
+            blk = px[:, j * mw : (j + 1) * mw]
+            if valid[g] and np.abs(blk.reshape(-1, 3).mean(axis=0) - rm[g]).max() > BLOCK_OFF:
+                continue  # a block of decoded junk inside a piece that fits as a whole: left out
             r, c = divmod(int(g), cols)
-            canvas[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw] = px[:, j * mw : (j + 1) * mw]
+            canvas[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw] = blk
             owner[g] = e
             have[g] = True
         placed += 1
