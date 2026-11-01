@@ -33,13 +33,16 @@ def main() -> int:
     msgs = [{"jsonrpc": "2.0", "id": 0, "method": "server/discover"},
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "app_info", "arguments": {}}}]
-    # Claude may hand the script only a few variables: the script has to fill in the rest
-    env = {k: os.environ[k] for k in ("PATH", "USERPROFILE", "FOTOMEDIK_HOME") if k in os.environ}
+    # Claude may hand the script only a few variables (Node.js itself needs SystemRoot):
+    # the script has to fill in the rest for the program
+    env = {k: os.environ[k] for k in ("PATH", "USERPROFILE", "SYSTEMROOT", "FOTOMEDIK_HOME") if k in os.environ}
     env["FOTOMEDIK_EXE"] = exe
     p = subprocess.run([node, str(tmp / "ext" / "server" / "index.js")], env=env, timeout=180,
                        capture_output=True, input="".join(json.dumps(m) + "\n" for m in msgs).encode())
     print(p.stdout.decode("utf-8", "replace")[-2000:], p.stderr.decode("utf-8", "replace")[-2000:])
     replies = {r["id"]: r for r in map(json.loads, p.stdout.decode().splitlines())}
+    if 2 not in replies:
+        return 1
     info = replies[2]["result"]
     if info.get("isError") or not info["structuredContent"]["packaged"]:
         return 1
