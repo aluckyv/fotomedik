@@ -726,7 +726,7 @@ def protect_real(cleaned: np.ndarray, real: np.ndarray, holes: np.ndarray) -> np
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)
 
 
-DESTRIPE = True  # the last step: bands and lines left on flat surfaces evened out
+DESTRIPE = False  # bands evened against the thumbnail: off until it can use a rescued thumbnail (no gain on the bench)
 STRIPE_OFF = 14.0  # gray levels a block's colour must stray from what is around it to be a band
 STRIPE_FLAT = 6.0  # luma spread inside a block below which it is flat (sky, wall, road)
 STRIPE_OK = 8.0  # the blocks around must agree this well: then they are right and the block is not
