@@ -780,6 +780,8 @@ def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: di
     if guided:
         g = quarter_guide(thumb_small, arr.shape)
         has = 0.0 if g is None else 1.0
+        if stats is not None:
+            stats["guided"] = g is not None  # the holes were rebuilt from the thumbnail
         gq = np.zeros((h // 4, w // 4, 3), np.float32) if g is None else g.astype(np.float32) / 255.0
         gq = np.pad(gq, ((p // 4, (p + T) // 4 + 2), (p // 4, (p + T) // 4 + 2), (0, 0)), mode="edge")
         hb = np.zeros((h // 8, w // 8), np.float32)
@@ -908,6 +910,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             holes = holes & ~filled
             unknown = unknown & ~filled
     _check(stop)
+    st: dict = {}
     if "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
         # the guided network learnt on whole thumbnails only
@@ -918,7 +921,12 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         which = {"fbcnn-fotomedik.onnx": "FBCNN fine-tuned on your photos, ",
                  "fbcnn-fotomedik-guided.onnx": "FBCNN guided by the thumbnail, fine-tuned on your photos, "}.get(file, "")
         done.append(f"JPEG blocks and noise removed ({which}{st.get('tiles', 0)} tiles, {_took(t0)})")
-    if holes.any():
+    guided = "deblock" in steps and engine.deblock_s is not None and st.get("guided", False)
+    if holes.any() and guided and "thumbsr" in steps and "diffusion" not in steps and "ai" not in steps:
+        # the guided network rebuilt the holes from the whole thumbnail itself, better than the
+        # enlarged thumbnail would (bench: 31.5 dB alone, 31.0 with the thumbnail step after it)
+        done.append("thumbnail step skipped: the guided network already rebuilt the holes from the thumbnail")
+    elif holes.any():
         before = arr
         if "diffusion" in steps and engine.sd is not None:
             from .diffusion import repaint_holes

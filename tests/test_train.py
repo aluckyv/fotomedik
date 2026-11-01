@@ -1,5 +1,7 @@
 """Training material for the deblocker, and the program picking up a fine-tuned one."""
 
+from pathlib import Path
+
 import numpy as np
 
 
@@ -84,3 +86,39 @@ def test_guided_deblocker_gets_thumbnail_and_holes_in_step_with_the_tiles(tmp_pa
     (tmp_path / models.DEBLOCK_TUNED.file).write_bytes(b"x")
     (tmp_path / models.DEBLOCK_GUIDED.file).write_bytes(b"x")
     assert models.needed(["deblock"]) == [models.DEBLOCK_GUIDED]
+
+
+def test_thumbnail_step_is_skipped_after_the_guided_network():
+    """With a whole thumbnail the guided network rebuilds the holes itself (better than the
+    enlarged thumbnail after it); with none, or one rescued in part, the step still runs."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_ai import FakeLama, FakeSR
+
+    from fotomedik.ai.enhance import Engine, enhance_steps
+
+    class In:
+        def __init__(self, name):
+            self.name = name
+
+    class Guided:
+        def get_inputs(self):
+            return [In("input"), In("guide"), In("has_guide"), In("holes")]
+
+        def run(self, _o, feeds):
+            return [feeds["input"], np.zeros((1, 1), np.float32)]
+
+    rng = np.random.default_rng(1)
+    arr = rng.integers(60, 200, (128, 160, 3), dtype=np.uint8)
+    holes = np.zeros((128, 160), bool)
+    holes[40:88] = True
+    small = rng.integers(60, 200, (32, 40, 3), dtype=np.uint8)
+    eng = Engine(FakeSR(), FakeLama(), deblock=Guided())
+    _out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["deblock", "thumbsr"], thumb_small=small)
+    assert any("skipped" in d for d in done) and not any("enlarged by" in d for d in done)
+    seen = np.ones((32, 40), bool)
+    seen[24:] = False
+    _out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["deblock", "thumbsr"], thumb_small=small,
+                               thumb_seen=seen)
+    assert any("enlarged by" in d for d in done)
