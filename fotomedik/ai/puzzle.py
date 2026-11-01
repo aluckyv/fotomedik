@@ -33,7 +33,9 @@ MIN_RUN = 8  # blocks decoded before the first error: fewer say too little about
 MAX_ERR = 22.0  # mean block-colour difference from the thumbnail above which a piece fits nowhere
 DISTINCT = 0.75  # without a usable marker number the best place must beat the typical one by this
 PRIOR_SLACK = 1.2  # the best place with the right marker number may be this much worse than the best of all
-MERGE_ERR = 12.0  # a block the repair decoded is kept where no piece landed when this close to the thumbnail
+TAIL_TRIM = 2  # blocks dropped before a stretch's first decoding error
+AMBIGUOUS = 0.85  # the best place must beat the second best with the same marker number by this
+MERGE_ERR = 12.0  # a block the repair decoded stays (no piece replaces it) when this close to the thumbnail
 KEEP_SHARE = 0.8  # the pieces must cover at least this share of what the repair decoded
 RST = re.compile(rb"\xff[\xd0-\xd7]")
 
@@ -161,6 +163,11 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
         px, run = decode_stretch(head, original[a:b], ri, mw, mh)
         if px is None:
             continue
+        if run < ri:  # it ended in an error: the last blocks before it are often wrong already
+            run -= TAIL_TRIM
+            if run < MIN_RUN:
+                continue
+            px = px[:, : run * mw]
         pm = px.reshape(mh, run, mw, 3).mean(axis=(0, 2)).astype(np.float32)
         errs = np.array([np.abs(pm - rm[s : s + run]).mean() for s in starts])
         best = int(np.argmin(errs))
@@ -168,8 +175,12 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
         pick = None
         same = np.flatnonzero(np.arange(n_iv) % 8 == prior)
         if len(same):
-            k = int(same[np.argmin(errs[same])])
-            if errs[k] <= errs[best] * PRIOR_SLACK:
+            order = same[np.argsort(errs[same])]
+            k = int(order[0])
+            # a piece that fits several places with its marker number about as well (haze, sky)
+            # says nothing about where it belongs: left out
+            clear = len(order) < 2 or errs[k] <= AMBIGUOUS * errs[order[1]]
+            if errs[k] <= errs[best] * PRIOR_SLACK and clear:
                 pick = k
         if pick is None and errs[best] < DISTINCT * float(np.median(errs)):
             pick = best
@@ -184,6 +195,24 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
     canvas = np.zeros((rows * mh, cols * mw, 3), np.uint8)
     have = np.zeros(n, bool)
     placed = 0
+    rep_px = None
+    if repaired_holes is not None:
+        # the repair's own decoded blocks that agree with the thumbnail stay where they are:
+        # a piece goes only where the repair has nothing, or something that does not fit
+        rep_px = np.asarray(Image.open(io.BytesIO(repaired)).convert("RGB"))
+        if rep_px.shape[:2] == (h, w):
+            real = _means(np.repeat((~repaired_holes)[..., None], 3, axis=2).astype(np.uint8) * 255,
+                          mw, mh, cols, rows)[:, 0] > 254
+            e_rep = np.abs(_means(rep_px, mw, mh, cols, rows) - rm[:n]).mean(axis=1)
+            trusted = real & (e_rep < MERGE_ERR)
+            pad = np.pad(rep_px, ((0, rows * mh - h), (0, cols * mw - w), (0, 0)), mode="edge")
+            for g in np.flatnonzero(trusted):
+                r, c = divmod(int(g), cols)
+                canvas[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw] = pad[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw]
+            owner[trusted] = -1.0  # never replaced
+            have |= trusted
+        else:
+            rep_px = None
     for e, k, run, px in cands:
         idx = np.arange(k * ri, min(k * ri + run, n))
         free = owner[idx] > e
@@ -197,26 +226,25 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
             have[g] = True
         placed += 1
 
-    if repaired_holes is not None:  # the repair's own pieces where none landed and the thumbnail agrees
-        rep_px = np.asarray(Image.open(io.BytesIO(repaired)).convert("RGB"))
-        if rep_px.shape[:2] == (h, w):
-            real = _means(np.repeat((~repaired_holes)[..., None], 3, axis=2).astype(np.uint8) * 255,
-                          mw, mh, cols, rows)[:, 0] > 254
-            e_rep = np.abs(_means(rep_px, mw, mh, cols, rows) - rm[:n]).mean(axis=1)
-            add = real & ~have & (e_rep < MERGE_ERR)
-            pad = np.pad(rep_px, ((0, rows * mh - h), (0, cols * mw - w), (0, 0)), mode="edge")
-            for g in np.flatnonzero(add):
-                r, c = divmod(int(g), cols)
-                canvas[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw] = pad[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw]
-            have |= add
+    if not placed:
+        return None  # no piece found a better place than the repair gave it
+    if placed == 0:
+        return None  # nothing found a better place: the repair's own picture as it is
+    if rep_px is not None:
+        # blocks the repair decoded that neither fit the thumbnail well nor were replaced: kept
+        # unless they fit nowhere near it (then they were put in the wrong place)
+        keep = real & ~have & (e_rep < MAX_ERR)
+        for g in np.flatnonzero(keep):
+            r, c = divmod(int(g), cols)
+            canvas[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw] = pad[r * mh : (r + 1) * mh, c * mw : (c + 1) * mw]
+        have |= keep
     share = float(have.mean())
     repair_share = 0.0
     if repaired_holes is not None:
         repair_share = float((~repaired_holes).mean())
         if share < KEEP_SHARE * repair_share:
             return None
-        rep_px = np.asarray(Image.open(io.BytesIO(repaired)).convert("RGB"))
-        if rep_px.shape[:2] == (h, w):
+        if rep_px is not None:
             real = ~repaired_holes
             rmask = _means(np.repeat(real[..., None], 3, axis=2).astype(np.uint8) * 255, mw, mh, cols, rows)[:, 0] > 127
             e_rep = np.abs(_means(rep_px, mw, mh, cols, rows) - rm[:n])[rmask].mean() if rmask.any() else np.inf

@@ -281,11 +281,14 @@ def test_batch_only_when_tiles_stay_apart():
 
 def test_jigsaw_puts_the_pieces_back_by_the_thumbnail():
     """Stretches between restart markers decode alone and go back to their own rows, also
-    when stretches before them were lost (the repair would have to guess how many)."""
+    when stretches before them were lost (the repair would have to guess how many); the
+    repair's own blocks stay where they agree with the thumbnail, and are replaced where
+    they were put in the wrong rows."""
     import io as _io
     import re
 
     from PIL import Image as _Image
+    from PIL import ImageFile
     from synth import make_image, make_jpeg
 
     from fotomedik.ai.puzzle import puzzle
@@ -295,17 +298,23 @@ def test_jigsaw_puts_the_pieces_back_by_the_thumbnail():
     good = make_jpeg(im, restart_rows=1, exif=exif_with_thumbnail(im))
     truth = np.asarray(_Image.open(_io.BytesIO(good)).convert("RGB")).astype(int)
     marks = [m.start() for m in re.finditer(rb"\xff[\xd0-\xd7]", good)]
-    # rows 3..12 lost: their stretches cut out of the file (and the markers with them)
-    bad = good[: marks[2]] + good[marks[12]:]
+    bad = good[: marks[2]] + good[marks[12]:]  # rows 3..12 lost: cut out of the file, markers too
     small = np.asarray(_Image.open(_io.BytesIO(good)).convert("RGB").resize((160, 120)))
-    holes = np.zeros(truth.shape[:2], bool)
-    holes[:240] = True  # the repair kept half
-    from PIL import ImageFile
-
     ImageFile.LOAD_TRUNCATED_IMAGES = False  # as the window's previews leave it
+
+    holes = np.ones(truth.shape[:2], bool)  # a repair that kept nothing: every piece placed
     got = puzzle(bad, good, small, holes)
     assert got is not None and got.pieces >= 15
     have = ~got.holes
     assert 0.5 < have.mean() < 0.85  # the lost rows stay holes
     assert np.abs(got.rgb[have].astype(int) - truth[have]).mean() < 4  # every piece in its own place
+
+    # a repair that put the lower half 8 rows too low: those blocks are replaced, the rest kept
+    wrong = truth.copy()
+    wrong[368:] = truth[240:352]
+    rep = make_jpeg(_Image.fromarray(wrong.astype(np.uint8)), restart_rows=1, exif=exif_with_thumbnail(im))
+    got = puzzle(bad, rep, small, np.zeros(truth.shape[:2], bool))
+    assert got is not None
+    low = ~got.holes[368:]
+    assert np.abs(got.rgb[368:][low].astype(int) - truth[368:][low]).mean() < 8
     assert puzzle(bad, good, None, holes) is None  # no thumbnail: nothing to go by
