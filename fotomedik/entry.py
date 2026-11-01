@@ -34,27 +34,49 @@ def _std_streams() -> None:
             except Exception:  # noqa: BLE001
                 stream = None
         setattr(sys, name, stream or open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115
+    for name in ("stdout", "stderr"):  # the reports hold č, ć, š...: the packaged program ignores PYTHONIOENCODING
+        try:
+            getattr(sys, name).reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
-def dispatch(args: list[str]) -> int | None:
-    """Run the mode the first argument asks for and return its exit code; None for the window."""
-    if not args:
-        return None
-    if args[0] == "--mcp":
+def _run(mode: str, args: list[str]) -> int:
+    if mode == "--mcp":
         from .mcp_server import serve
 
         return serve()
-    if args[0] == "--jobs":
+    if mode == "--jobs":
         from .jobs import run_queue
 
         return run_queue()
+    from .cli import main
+
+    try:
+        main(args=args, prog_name="FotoMedik")
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+    return 0
+
+
+def dispatch(args: list[str]) -> int | None:
+    """Run the mode the first argument asks for and return its exit code; None for the window.
+    An error ends the mode with its story on stderr (in the packaged program an error left
+    unhandled would open a message box and the process would wait for a click that never comes)."""
+    if not args or args[0] not in ("--mcp", "--jobs", "--cli"):
+        return None
     if args[0] == "--cli":
         _std_streams()
-        from .cli import main
+    try:
+        return _run(args[0], args[1:])
+    except KeyboardInterrupt:
+        return 130
+    except BaseException:  # noqa: BLE001
+        import traceback
 
         try:
-            main(args=args[1:], prog_name="FotoMedik")
-        except SystemExit as e:
-            return e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
-        return 0
-    return None
+            traceback.print_exc()
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        return 1

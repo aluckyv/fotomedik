@@ -245,6 +245,16 @@ def test_connect_to_claude_keeps_the_other_settings(tmp_path, monkeypatch):
         claude_connect.connect()
 
 
-def test_the_program_picks_its_mode():
+def test_the_program_picks_its_mode(monkeypatch, capsys):
     assert dispatch([]) is None and dispatch(["photo.jpg"]) is None
     assert dispatch(["--cli", "--help"]) == 0
+    assert dispatch(["--cli", "batch", "/no/such/folder", "-o", "/tmp/x"]) == 2
+
+    def boom(**_kw):
+        raise UnicodeEncodeError("charmap", "č", 0, 1, "can't encode")
+
+    import fotomedik.cli
+
+    monkeypatch.setattr(fotomedik.cli, "main", boom)
+    assert dispatch(["--cli", "batch"]) == 1  # an error ends the mode (no message box in the packaged program)
+    assert "UnicodeEncodeError" in capsys.readouterr().err
