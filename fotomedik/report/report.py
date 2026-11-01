@@ -127,6 +127,9 @@ class FileReport:
     enhanced: list = field(default_factory=list)  # what went into it
     reference: str | None = None  # the reference picture the repair was guided by, when one was
     twin: str | None = None  # the neighbouring shot the holes took their colours from, when one did
+    # the thumbnail as the repair rescued it with the set's thumbnails (RGB, mask of its real
+    # pixels or None), when the repaired file's own gives none: the jigsaw's map
+    thumb: tuple | None = field(default=None, repr=False)
 
     @classmethod
     def from_context(cls, ctx: Context, findings_before: list[dict] | None = None, width=None, height=None) -> "FileReport":

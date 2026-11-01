@@ -354,6 +354,8 @@ class Enhancer:
             return True
         if not ({"thumbsr", "puzzle"} & set(self.steps)) or not rep.holes:
             return False
+        if "puzzle" in self.steps and rep.thumb is not None:  # a rescued thumbnail: the jigsaw's map
+            return True
         try:
             from .enhance import thumbnail_rgb
 
@@ -408,7 +410,12 @@ class Enhancer:
                 from .puzzle import puzzle
 
                 t0 = time.perf_counter()
-                placed = puzzle(Path(source).read_bytes(), data, small, holes)
+                ps, pr = small, None
+                if ps is None and rep.thumb is not None:  # rescued by the repair: a map for the pieces
+                    ps, pr = rep.thumb
+                    if pr is None:  # whole, yet rescued: still only a map, not colours for the holes
+                        pr = np.ones(ps.shape[:2], bool)
+                placed = puzzle(Path(source).read_bytes(), data, ps, holes, pr)
                 if placed is not None:
                     arr, holes = placed.rgb, placed.holes
                     unknown = np.zeros_like(holes)  # the holes now hold the thumbnail's colours
