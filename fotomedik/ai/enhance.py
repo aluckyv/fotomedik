@@ -726,6 +726,68 @@ def protect_real(cleaned: np.ndarray, real: np.ndarray, holes: np.ndarray) -> np
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)
 
 
+DESTRIPE = True  # the last step: bands and lines left on flat surfaces evened out
+STRIPE_OFF = 14.0  # gray levels a block's colour must stray from what is around it to be a band
+STRIPE_FLAT = 6.0  # luma spread inside a block below which it is flat (sky, wall, road)
+STRIPE_OK = 8.0  # the blocks around must agree this well: then they are right and the block is not
+STRIPE_RUN = 3  # blocks in a line a band needs: a lone odd block is a detail, not a band
+STRIPE_BIAS = 31  # blocks: window of the thumbnail's own colour offset against the photo
+
+
+def _runs(mask: np.ndarray, n: int, axis: int) -> np.ndarray:
+    """The cells of `mask` that lie in a run of at least n along `axis`."""
+    m = mask if axis == 1 else mask.T
+    out = np.zeros_like(m)
+    for i, row in enumerate(m):
+        if row.sum() < n:
+            continue
+        d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
+        for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+            if b - a >= n:
+                out[i, a:b] = True
+    return out if axis == 1 else out.T
+
+
+def destripe(arr: np.ndarray, thumb: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+    """Even out the bands and lines a flat surface still shows (rows of blocks a shade off,
+    a dark column at the edge): a flat block whose colour strays from the thumbnail (allowing
+    for the thumbnail's own colour offset) gets its colour moved there by a smooth correction.
+    Without a thumbnail nothing is done. Its texture stays; detail, edges and lone blocks are left
+    alone. Returns (rgb, blocks evened)."""
+    import cv2
+
+    from ..recipes.r12_smooth import surface
+
+    h, w = arr.shape[:2]
+    bh, bw = h // 8, w // 8
+    if bh < 8 or bw < 8:
+        return arr, 0
+    if thumb is None or thumb.shape[:2] != arr.shape[:2]:
+        return arr, 0  # without a reference a band and a real shade look alike (tried: worse)
+    a = arr[: bh * 8, : bw * 8].astype(np.float32)
+    m = a.reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    luma = a @ np.array([0.299, 0.587, 0.114], np.float32)
+    flat = luma.reshape(bh, 8, bw, 8).std(axis=(1, 3)) < STRIPE_FLAT
+    t = thumb[: bh * 8, : bw * 8].astype(np.float32).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    d = m - t
+    wgt = (flat & (np.abs(d).max(axis=-1) < 2 * STRIPE_OFF)).astype(np.float32)
+    k = (STRIPE_BIAS, STRIPE_BIAS)
+    num = np.stack([cv2.boxFilter(d[..., c] * wgt, -1, k, normalize=False) for c in range(3)], axis=-1)
+    den = cv2.boxFilter(wgt, -1, k, normalize=False)[..., None]
+    target = t + num / np.maximum(den, 1e-6)  # the thumbnail with the photo's colours
+    off = np.abs(m - target).max(axis=-1)
+    near = cv2.blur((off < STRIPE_OK).astype(np.float32), (5, 5)) > 0.5  # most around fit
+    cand = flat & (off > STRIPE_OFF) & near & (den[..., 0] > 0)
+    bad = _runs(cand, STRIPE_RUN, 1) | _runs(cand, STRIPE_RUN, 0)
+    if not bad.any():
+        return arr, 0
+    corr_b = np.where(bad[..., None], target - m, 0.0)
+    corr = np.stack([surface(corr_b[..., c]) for c in range(3)], axis=-1)
+    out = arr.astype(np.float32)
+    out[: bh * 8, : bw * 8] += corr[: bh * 8, : bw * 8]
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(bad.sum())
+
+
 def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray,
                      spread: bool = False) -> np.ndarray:
     """Give every 8x8 block of `out` the average it has in `ref` where `known`, through
@@ -1030,6 +1092,11 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             arr = blend_seams(arr, holes, real)
         arr = np.where(holes[..., None], arr, real)
     _check(stop)
+    if DESTRIPE and steps & {"deblock", "thumbsr", "ai", "puzzle"}:
+        t0 = time.perf_counter()
+        arr, n_even = destripe(arr, thumb)
+        if n_even:
+            done.append(f"{n_even} block(s) of bands and lines on flat surfaces evened out ({_took(t0)})")
     if "faces" in steps and engine.face_s is not None:
         from .faces import restore_faces
 
