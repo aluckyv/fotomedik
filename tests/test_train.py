@@ -117,8 +117,9 @@ def test_thumbnail_step_is_skipped_after_the_guided_network():
     eng = Engine(FakeSR(), FakeLama(), deblock=Guided())
     _out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["deblock", "thumbsr"], thumb_small=small)
     assert any("skipped" in d for d in done) and not any("enlarged by" in d for d in done)
-    seen = np.ones((32, 40), bool)
-    seen[24:] = False
-    _out, done = enhance_steps(arr, holes, np.zeros_like(holes), eng, ["deblock", "thumbsr"], thumb_small=small,
-                               thumb_seen=seen)
-    assert any("enlarged by" in d for d in done)
+    big = rng.integers(60, 200, (2400, 3200, 3), dtype=np.uint8)  # 8 MP: larger than the network learnt on
+    bh = np.zeros((2400, 3200), bool)
+    bh[800:880] = True
+    _out, done = enhance_steps(big, bh, np.zeros_like(bh), eng, ["deblock", "thumbsr"],
+                               thumb_small=rng.integers(60, 200, (120, 160, 3), dtype=np.uint8))
+    assert any("larger than the network" in d for d in done) and any("enlarged by" in d for d in done)

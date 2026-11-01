@@ -184,6 +184,14 @@ def _one(args):
     return Path(path).name, tuple(np.concatenate([p[k] for p in parts]) for k in range(5))
 
 
+def _long_side(path: Path) -> int:
+    try:
+        with Image.open(path) as im:
+            return max(im.size)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 class _Shards:
     KEYS = ("inp", "tgt", "guide", "has_guide", "holes")
 
@@ -215,12 +223,19 @@ def main(argv=None) -> None:
     ap.add_argument("--per", type=int, default=3, help="damaged copies of every photo")
     ap.add_argument("--patches", type=int, default=48, help="patches cut from every damaged copy")
     ap.add_argument("--long", type=int, default=1600, help="long side the photos are brought to (pixels)")
+    ap.add_argument("--min-long", type=int, default=0,
+                    help="use only photos whose long side is at least this (e.g. 3000 with --long 4032: large photos)")
     ap.add_argument("--jobs", type=int, default=0, help="photos worked on at once (default: all cores)")
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
     files = sorted(p for p in a.good.rglob("*") if p.suffix.lower() in (".jpg", ".jpeg"))
     if not files:
         raise SystemExit(f"no photos in {a.good}")
+    if a.min_long:
+        files = [p for p in files if _long_side(p) >= a.min_long]
+        print(f"{len(files)} photos with a long side of {a.min_long} px or more")
+        if not files:
+            raise SystemExit(f"no photos that large in {a.good}")
     jobs = [(str(p), a.per, a.long, a.patches, i) for i, p in enumerate(files)]
     train, val = _Shards(a.out, "train"), _Shards(a.out, "val")
     n_ok = n_pairs = 0

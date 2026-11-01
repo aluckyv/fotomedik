@@ -347,19 +347,16 @@ class Enhancer:
     def _lost_but_worth_it(self, rep: FileReport) -> bool:
         """A photo mostly lost still gets a copy when JPEG clean-up is on (the fine-tuned
         FBCNN learnt on exactly such photos: rotted blocks and bands between the holes), or
-        when the copy is built on its thumbnail ("thumbsr") and the thumbnail survived (whole, or rescued in part): it
+        when the copy is built on its thumbnail ("thumbsr") and the thumbnail is whole: it
         shows the scene the holes cut away."""
         if "deblock" in self.steps:
             return True
         if "thumbsr" not in self.steps or not rep.holes:
             return False
-        if rep.thumb is not None:  # rescued by the repair
-            return True
         try:
-            from ..recipes.dcfield import thumbnail_image
+            from .enhance import thumbnail_rgb
 
-            # whole, or rotted in part but rescued (thumbnail_rescued)
-            return thumbnail_image((self.out / rep.output_name).read_bytes()) is not None
+            return thumbnail_rgb((self.out / rep.output_name).read_bytes()) is not None
         except Exception:  # noqa: BLE001
             return False
 
@@ -382,7 +379,7 @@ class Enhancer:
         return True
 
     def _enhance(self, i: int, engine, steps, photos: _Photos) -> None:
-        from .enhance import Stopped, enhance_steps, photo_masks, save_jpeg, thumbnail_full, thumbnail_rescued
+        from .enhance import Stopped, enhance_steps, photo_masks, save_jpeg, thumbnail_picture, thumbnail_rgb
 
         rep = self.repaired[i]
         name = Path(rep.output_name).name
@@ -404,9 +401,8 @@ class Enhancer:
             arr = np.asarray(img.convert("RGB"))
             holes, unknown = photo_masks(data, rep.holes, rep.unknown)
             burst = photos.burst_for(i, self.say) if "burst" in steps else None
-            small, seen = thumbnail_rescued(data, arr, holes, rep.thumb)
             new, done = enhance_steps(arr, holes, unknown, engine, steps, burst, progress, self.quality, self.stop,
-                                      self.prompt, thumbnail_full(small, arr.shape), small, seen)
+                                      self.prompt, thumbnail_picture(data, arr.shape), thumbnail_rgb(data))
         except Stopped:
             return
         except Exception as e:  # one photo must not stop the rest

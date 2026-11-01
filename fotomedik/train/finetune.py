@@ -43,14 +43,17 @@ WEIGHTS_URL = "https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn
 ONNX_NAME = "fbcnn-fotomedik.onnx"
 ONNX_GUIDED = "fbcnn-fotomedik-guided.onnx"
 EXTRA = 5  # guided input channels besides the picture: thumbnail RGB, "has a thumbnail", holes
+BIG_SIDE = 6000  # the longest photo side a network trained with --big is used on
 CROP = 96  # training crop (from the 128-pixel patches), a multiple of 8: the JPEG grid stays put
 
 
-def load_pairs(folder: Path, prefix: str, limit: int = 0, guided: bool = False) -> dict:
-    """{inp, tgt[, guide, has_guide, holes]} of all prefix_*.npz files (see pairs)."""
+def load_pairs(folder, prefix: str, limit: int = 0, guided: bool = False) -> dict:
+    """{inp, tgt[, guide, has_guide, holes]} of all prefix_*.npz files (see pairs) in one
+    folder or a list of folders."""
+    folders = [folder] if isinstance(folder, (str, Path)) else list(folder)
     keys = ("inp", "tgt") + (("guide", "has_guide", "holes") if guided else ())
     got: dict = {k: [] for k in keys}
-    for f in sorted(glob.glob(str(folder / f"{prefix}_*.npz"))):
+    for f in [f for d in folders for f in sorted(glob.glob(str(Path(d) / f"{prefix}_*.npz")))]:
         z = np.load(f)
         if guided and "guide" not in z.files:
             raise SystemExit(f"{f} has no thumbnails: make the pairs again (delete the folder, run pairs)")
@@ -186,7 +189,7 @@ def detail_of(net, d: dict, device, guided: bool = False, sharp: float = 0.0, ch
     return err / max(k_n, 1), 100 * kept / max(ref, 1e-12)
 
 
-def export_onnx(net, path: Path, guided: bool = False) -> None:
+def export_onnx(net, path: Path, guided: bool = False, big: bool = False) -> None:
     """The network as the program runs it: "input" (N, 3, H, W) in 0..1, H and W multiples
     of 8 (guided: also "guide" (N, 3, H/4, W/4), "has_guide" (N, 1), "holes" (N, 1, H/8,
     W/8)); outputs the cleaned picture and the estimated JPEG quality."""
@@ -205,6 +208,12 @@ def export_onnx(net, path: Path, guided: bool = False) -> None:
         axes = {"input": {0: "n", 2: "h", 3: "w"}, "output": {0: "n", 2: "h", 3: "w"}}
     torch.onnx.export(net, args, str(path), input_names=names, output_names=["output", "qf"], opset_version=17,
                       dynamic_axes=axes, dynamo=False)
+    if big:  # read by the program (enhance.guided_max_side): learnt on large photos too
+        import onnx
+
+        m = onnx.load(str(path))
+        m.metadata_props.add(key="max_side", value=str(BIG_SIDE))
+        onnx.save(m, str(path))
 
 
 def model_dir() -> Path:
@@ -215,7 +224,7 @@ def model_dir() -> Path:
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("pairs", type=Path)
+    ap.add_argument("pairs", type=Path, nargs="+", help="one or more folders of pairs")
     ap.add_argument("out", type=Path)
     ap.add_argument("--iters", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=8)
@@ -227,6 +236,8 @@ def main(argv=None) -> None:
     ap.add_argument("--cpu", action="store_true", help="do not use the graphics card")
     ap.add_argument("--guided", action="store_true", help="train the guided network (sees the thumbnail and the holes)")
     ap.add_argument("--init", type=Path, help="start from this state (a best.pt of the plain fine-tuning)")
+    ap.add_argument("--big", action="store_true",
+                    help="the pairs include photos of 12 MP and more: the program may use the network on them")
     ap.add_argument("--sharp", type=float, default=0.0,
                     help="weight of the lost-edges-and-texture penalty (e.g. 0.5; 0 = average error only)")
     a = ap.parse_args(argv)
@@ -241,7 +252,7 @@ def main(argv=None) -> None:
     tr = load_pairs(a.pairs, "train", a.max_patches, a.guided)
     va = load_pairs(a.pairs, "val", 0, a.guided)
     if not len(tr["inp"]):
-        raise SystemExit(f"no train_*.npz in {a.pairs} (make them with: python -m fotomedik.train.pairs)")
+        raise SystemExit(f"no train_*.npz in {', '.join(map(str, a.pairs))} (make them with: python -m fotomedik.train.pairs)")
     if not len(va["inp"]):  # few photos: check on a slice of the training patches
         va = {k: v[-64:] for k, v in tr.items()}
     print(f"{len(tr['inp'])} training patches, {len(va['inp'])} for checking"
@@ -360,7 +371,7 @@ def main(argv=None) -> None:
     net.load_state_dict(torch.load(a.out / "best.pt", map_location="cpu", weights_only=True))
     name = ONNX_GUIDED if a.guided else ONNX_NAME
     onnx_path = a.out / name
-    export_onnx(net, onnx_path, a.guided)
+    export_onnx(net, onnx_path, a.guided, a.big)
     print(f"best: {fmt(best)} -> {onnx_path}")
     if a.install:
         dst = model_dir() / name
