@@ -665,14 +665,48 @@ SEAM_ROUNDS = 250  # neighbour-averaging rounds of the offset field (block grid)
 PROTECT_FEATHER = 8  # pixels over which the cleaned holes fade into the untouched real picture
 
 
+def _upsample8(field: np.ndarray) -> np.ndarray:
+    """A block-grid field (rows, cols, ch) to pixels (8x), bilinear between block centres
+    (the same as OpenCV's resize with INTER_LINEAR, without needing OpenCV)."""
+    def axis(n: int):
+        x = np.clip((np.arange(n * 8, dtype=np.float32) + 0.5) / 8 - 0.5, 0, n - 1)
+        i0 = np.floor(x).astype(np.intp)
+        return i0, np.minimum(i0 + 1, n - 1), (x - i0)[:, None]
+    i0, i1, f = axis(field.shape[0])
+    rows = field[i0] * (1 - f)[..., None] + field[i1] * f[..., None]
+    j0, j1, g = axis(field.shape[1])
+    return rows[:, j0] * (1 - g) + rows[:, j1] * g
+
+
+def _hole_distance(holes: np.ndarray, far: int) -> np.ndarray:
+    """Pixels from the nearest hole pixel (0 in the holes), counted up to `far` (all further
+    get `far`): grown one pixel a round, diagonally every other round (an octagon, close to
+    the true distance), so no OpenCV is needed."""
+    dist = np.full(holes.shape, float(far), np.float32)
+    dist[holes] = 0.0
+    cur = holes.copy()
+    for k in range(1, far):
+        nxt = cur.copy()
+        nxt[1:] |= cur[:-1]
+        nxt[:-1] |= cur[1:]
+        nxt[:, 1:] |= cur[:, :-1]
+        nxt[:, :-1] |= cur[:, 1:]
+        if k % 2 == 0:
+            nxt[1:, 1:] |= cur[:-1, :-1]
+            nxt[1:, :-1] |= cur[:-1, 1:]
+            nxt[:-1, 1:] |= cur[1:, :-1]
+            nxt[:-1, :-1] |= cur[1:, 1:]
+        dist[nxt & ~cur] = k
+        cur = nxt
+    return dist
+
+
 def blend_seams(out: np.ndarray, holes: np.ndarray, real: np.ndarray) -> np.ndarray:
     """Lift the filled holes onto the real picture around them. At every border the colour
     step is measured (the real pixels just outside minus the filled ones just inside, two
     pixels each, steps above SEAM_MAX left out); the steps are spread through the hole as
     a smooth field (on the 8x8 block grid) and added. A sky where real stretches and filled
     rows alternate loses its bands; the real pixels do not move."""
-    import cv2
-
     if not holes.any() or holes.all():
         return out
     h, w = holes.shape
@@ -708,7 +742,7 @@ def blend_seams(out: np.ndarray, holes: np.ndarray, real: np.ndarray) -> np.ndar
     field = np.zeros((bh, bw, 3), np.float64)
     field[known] = acc[known] / cnt[known][:, None]
     field = _spread(field, known, ~known, rounds=SEAM_ROUNDS)
-    px = cv2.resize(field.astype(np.float32), (bw * 8, bh * 8), interpolation=cv2.INTER_LINEAR)[:h, :w]
+    px = _upsample8(field.astype(np.float32))[:h, :w]
     res = o + px * holes[..., None]
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)
 
@@ -716,11 +750,9 @@ def blend_seams(out: np.ndarray, holes: np.ndarray, real: np.ndarray) -> np.ndar
 def protect_real(cleaned: np.ndarray, real: np.ndarray, holes: np.ndarray) -> np.ndarray:
     """The real picture back where the JPEG clean-up only softened it: the cleaned pixels
     stay in the holes and fade over PROTECT_FEATHER pixels into the untouched ones."""
-    import cv2
-
     if not holes.any():
         return real.copy()
-    dist = cv2.distanceTransform((~holes).astype(np.uint8), cv2.DIST_L2, 3)
+    dist = _hole_distance(holes, PROTECT_FEATHER)
     alpha = np.clip(dist / PROTECT_FEATHER, 0.0, 1.0)[..., None]
     res = alpha * real.astype(np.float32) + (1.0 - alpha) * cleaned.astype(np.float32)
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)

@@ -260,6 +260,7 @@ def test_blend_seams_lifts_a_fill_onto_the_picture_around_it():
 
 
 def test_destripe_evens_a_band_against_the_thumbnail():
+    pytest.importorskip("cv2")  # destripe (switched off) still uses OpenCV
     from fotomedik.ai.enhance import destripe
 
     base, noisy = _sky()
@@ -274,6 +275,7 @@ def test_destripe_evens_a_band_against_the_thumbnail():
 
 
 def test_destripe_leaves_detail_lone_blocks_and_photos_without_a_thumbnail():
+    pytest.importorskip("cv2")  # destripe (switched off) still uses OpenCV
     from fotomedik.ai.enhance import destripe
 
     base, noisy = _sky(seed=1)
