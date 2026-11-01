@@ -28,8 +28,6 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image, ImageFile
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
-
 MIN_BYTES = 64  # a stretch shorter than this between two markers holds no usable interval
 MIN_RUN = 8  # blocks decoded before the first error: fewer say too little about the place
 MAX_ERR = 22.0  # mean block-colour difference from the thumbnail above which a piece fits nowhere
@@ -95,12 +93,28 @@ def decode_stretch(head: bytes, chunk: bytes, ri: int, mw: int, mh: int):
         run = int(np.argmin(ok)) if not ok.all() else len(ok)
         if run < MIN_RUN:
             return None, 0
-        px = np.asarray(Image.open(io.BytesIO(j)).convert("RGB"))[:mh, : run * mw]
+        px = _pixels(j)[:mh, : run * mw]
         if px.shape[1] < run * mw:
             return None, 0
         return px, run
     except Exception:  # noqa: BLE001 - a stretch that does not decode is no piece
         return None, 0
+
+
+def _pixels(j: bytes) -> np.ndarray:
+    """The pixels of a stretch decoded alone. It ends in damaged data, so Pillow must be told
+    to load truncated pictures; other parts of the program switch that off again after
+    their own use (the window's previews), so it is set here, each time, and put back."""
+    for _try in range(2):
+        old = ImageFile.LOAD_TRUNCATED_IMAGES
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        try:
+            return np.asarray(Image.open(io.BytesIO(j)).convert("RGB"))
+        except OSError:
+            continue  # switched off meanwhile by another thread: once more
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = old
+    raise OSError("stretch does not decode")
 
 
 def _means(img: np.ndarray, mw: int, mh: int, cols: int, rows: int) -> np.ndarray:

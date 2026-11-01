@@ -300,6 +300,9 @@ def test_jigsaw_puts_the_pieces_back_by_the_thumbnail():
     small = np.asarray(_Image.open(_io.BytesIO(good)).convert("RGB").resize((160, 120)))
     holes = np.zeros(truth.shape[:2], bool)
     holes[:240] = True  # the repair kept half
+    from PIL import ImageFile
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = False  # as the window's previews leave it
     got = puzzle(bad, good, small, holes)
     assert got is not None and got.pieces >= 15
     have = ~got.holes
