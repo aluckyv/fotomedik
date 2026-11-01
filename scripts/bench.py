@@ -153,7 +153,8 @@ def ssim_map(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def score(truth: np.ndarray, got: np.ndarray | None, area: np.ndarray, faces: np.ndarray) -> dict:
     if got is None or got.shape != truth.shape:
-        return {"psnr": 0.0, "good": 0.0, "stripes": 1.0, "ssim": 0.0, "faces": 0.0 if faces.any() else None}
+        return {"psnr": 0.0, "good": 0.0, "stripes": 1.0, "ssim": 0.0, "faces": 0.0 if faces.any() else None,
+                "keep": 0.0}
     err = np.abs(got.astype(np.int16) - truth.astype(np.int16)).max(axis=-1)
     mse = float(((got.astype(np.float32) - truth) ** 2).mean())
     ok = err <= TOL
@@ -167,6 +168,8 @@ def score(truth: np.ndarray, got: np.ndarray | None, area: np.ndarray, faces: np
         "good": round(float(ok[area].mean()), 4) if area.any() else 1.0,
         "stripes": round(float(blocks[area_b].mean()), 4) if area_b.any() else 0.0,
         "faces": round(float(ok[area & faces].mean()), 4) if (area & faces).any() else None,
+        # the photo's own good parts: a step that softens them scores lower here
+        "keep": round(float(ss[~area].mean()), 4) if (~area).any() else 1.0,
     }
 
 
@@ -268,18 +271,20 @@ def summary(rows: list[dict]) -> dict:
                       "good": round(float(np.mean([r["good"] for r in rs])), 4),
                       "stripes": round(float(np.mean([r["stripes"] for r in rs])), 4),
                       "ssim": round(float(np.mean([r.get("ssim", 0.0) for r in rs])), 4),
+                      "keep": round(float(np.mean([r.get("keep", 0.0) for r in rs])), 4),
                       "faces": round(float(np.mean(fs)), 4) if fs else None}
     out["errors"] = sum(1 for r in rows if r.get("error"))
     return out
 
 
 def print_summary(s: dict) -> None:
-    print(f"\n{'':8}{'psnr':>8}{'good':>8}{'stripes':>9}{'ssim':>8}{'faces':>8}")
+    print(f"\n{'':8}{'psnr':>8}{'good':>8}{'stripes':>9}{'ssim':>8}{'keep':>8}{'faces':>8}")
     for stage in ("naive", "repair", "ai"):
         if stage in s:
             v = s[stage]
             f = "-" if v["faces"] is None else f"{v['faces']:.3f}"
-            print(f"{stage:8}{v['psnr']:8.2f}{v['good']:8.3f}{v['stripes']:9.3f}{v.get('ssim', 0):8.3f}{f:>8}")
+            print(f"{stage:8}{v['psnr']:8.2f}{v['good']:8.3f}{v['stripes']:9.3f}{v.get('ssim', 0):8.3f}"
+                  f"{v.get('keep', 0):8.3f}{f:>8}")
     print(f"errors: {s['errors']}")
 
 

@@ -658,6 +658,74 @@ def _spread(diff: np.ndarray, known: np.ndarray, todo: np.ndarray, rounds: int =
     return out
 
 
+PROTECT_REAL = True  # JPEG clean-up only in the holes (bench: detail kept)
+BLEND_SEAMS = True  # filled holes lifted onto the colours around them
+SEAM_MAX = 48.0  # gray levels: a bigger step across a border is an edge or junk, not a colour mismatch
+SEAM_ROUNDS = 250  # neighbour-averaging rounds of the offset field (block grid)
+PROTECT_FEATHER = 8  # pixels over which the cleaned holes fade into the untouched real picture
+
+
+def blend_seams(out: np.ndarray, holes: np.ndarray, real: np.ndarray) -> np.ndarray:
+    """Lift the filled holes onto the real picture around them. At every border the colour
+    step is measured (the real pixels just outside minus the filled ones just inside, two
+    pixels each, steps above SEAM_MAX left out); the steps are spread through the hole as
+    a smooth field (on the 8x8 block grid) and added. A sky where real stretches and filled
+    rows alternate loses its bands; the real pixels do not move."""
+    import cv2
+
+    if not holes.any() or holes.all():
+        return out
+    h, w = holes.shape
+    o, r = out.astype(np.float32), real.astype(np.float32)
+    bh, bw = -(-h // 8), -(-w // 8)
+    acc = np.zeros((bh, bw, 3), np.float64)
+    cnt = np.zeros((bh, bw), np.float64)
+    for axis in (0, 1):
+        for sign in (1, -1):
+            # a hole pixel whose neighbour (and the one after it) in this direction is real
+            nb = np.roll(holes, -sign, axis=axis)
+            nb2 = np.roll(holes, -2 * sign, axis=axis)
+            edge = holes & ~nb & ~nb2
+            if axis == 0:
+                edge[[0, 1, -2, -1], :] = False
+            else:
+                edge[:, [0, 1, -2, -1]] = False
+            ys, xs = np.nonzero(edge)
+            if not len(ys):
+                continue
+            dy, dx = (sign, 0) if axis == 0 else (0, sign)
+            outside = (r[ys + dy, xs + dx] + r[ys + 2 * dy, xs + 2 * dx]) / 2
+            inn_y, inn_x = np.clip(ys - dy, 0, h - 1), np.clip(xs - dx, 0, w - 1)
+            inside = (o[ys, xs] + o[inn_y, inn_x]) / 2
+            d = outside - inside
+            ok = np.abs(d).max(axis=1) <= SEAM_MAX
+            ys, xs, d = ys[ok], xs[ok], d[ok]
+            np.add.at(acc, (ys // 8, xs // 8), d)
+            np.add.at(cnt, (ys // 8, xs // 8), 1.0)
+    known = cnt >= 4
+    if not known.any():
+        return out
+    field = np.zeros((bh, bw, 3), np.float64)
+    field[known] = acc[known] / cnt[known][:, None]
+    field = _spread(field, known, ~known, rounds=SEAM_ROUNDS)
+    px = cv2.resize(field.astype(np.float32), (bw * 8, bh * 8), interpolation=cv2.INTER_LINEAR)[:h, :w]
+    res = o + px * holes[..., None]
+    return np.clip(np.rint(res), 0, 255).astype(np.uint8)
+
+
+def protect_real(cleaned: np.ndarray, real: np.ndarray, holes: np.ndarray) -> np.ndarray:
+    """The real picture back where the JPEG clean-up only softened it: the cleaned pixels
+    stay in the holes and fade over PROTECT_FEATHER pixels into the untouched ones."""
+    import cv2
+
+    if not holes.any():
+        return real.copy()
+    dist = cv2.distanceTransform((~holes).astype(np.uint8), cv2.DIST_L2, 3)
+    alpha = np.clip(dist / PROTECT_FEATHER, 0.0, 1.0)[..., None]
+    res = alpha * real.astype(np.float32) + (1.0 - alpha) * cleaned.astype(np.float32)
+    return np.clip(np.rint(res), 0, 255).astype(np.uint8)
+
+
 def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray,
                      spread: bool = False) -> np.ndarray:
     """Give every 8x8 block of `out` the average it has in `ref` where `known`, through
@@ -869,7 +937,9 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
     elif "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
         arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small)
-        if keep is not None:
+        if PROTECT_REAL:  # the file's own pixels stay sharp: the clean-up works on the holes
+            arr = protect_real(arr, real, holes & ~keep if keep is not None else holes)
+        elif keep is not None:
             arr = np.where(keep[..., None], real, arr)
         real = arr.copy()  # the cleaned picture is the base from here on
         which = {"fbcnn-fotomedik.onnx": "FBCNN fine-tuned on your photos, ",
@@ -880,6 +950,8 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         # the guided network rebuilt the holes from the whole thumbnail itself, better than the
         # enlarged thumbnail would (bench: 31.5 dB alone, 31.0 with the thumbnail step after it)
         done.append("thumbnail step skipped: the guided network already rebuilt the holes from the thumbnail")
+        if BLEND_SEAMS:
+            arr = blend_seams(arr, holes, arr)
     elif holes.any():
         before = arr
         if "diffusion" in steps and engine.sd is not None:
@@ -954,6 +1026,8 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                 arr = sharpen_holes(arr, holes, engine, report("Real-ESRGAN tile"), stop=stop, stats=st)
                 arr = keep_block_means(arr, filled_arr, holes, holes & ~unknown)
                 done.append(f"holes sharpened (Real-ESRGAN, {st.get('tiles', 0)} tiles, {_took(t0)})")
+        if BLEND_SEAMS:
+            arr = blend_seams(arr, holes, real)
         arr = np.where(holes[..., None], arr, real)
     _check(stop)
     if "faces" in steps and engine.face_s is not None:
