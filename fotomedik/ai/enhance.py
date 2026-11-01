@@ -832,14 +832,16 @@ def rotted_stripes(before: np.ndarray, holes: np.ndarray, known: np.ndarray, thu
 def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
                   burst=None, progress=None, quality: str | None = None, stop=None,
                   prompt: str | None = None, thumb: np.ndarray | None = None,
-                  thumb_small: np.ndarray | None = None) -> tuple[np.ndarray, list[str]]:
+                  thumb_small: np.ndarray | None = None, keep: np.ndarray | None = None
+                  ) -> tuple[np.ndarray, list[str]]:
     """The enhanced copy, step by step. Returns (rgb, what was done, with the time it took).
 
     burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots.
     progress(done, total, what) reports the tiles or windows of the slow steps.
     quality: diffusion preset (see diffusion.PRESETS); prompt: what the scene shows, for
     the diffusion (None: a generic prompt); thumb: the photo's thumbnail at full size (see
-    thumbnail_picture) - stripes it shows too are picture. Raises Stopped when `stop` is set."""
+    thumbnail_picture) - stripes it shows too are picture; keep: pixels no step may change
+    (the pieces the jigsaw put back: the file's own, sharp). Raises Stopped when `stop` is set."""
     steps = set(steps)
     done: list[str] = []
     real = arr.copy()
@@ -867,6 +869,8 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
     elif "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
         arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small)
+        if keep is not None:
+            arr = np.where(keep[..., None], real, arr)
         real = arr.copy()  # the cleaned picture is the base from here on
         which = {"fbcnn-fotomedik.onnx": "FBCNN fine-tuned on your photos, ",
                  "fbcnn-fotomedik-guided.onnx": "FBCNN guided by the thumbnail, fine-tuned on your photos, "}.get(file, "")

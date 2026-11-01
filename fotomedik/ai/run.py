@@ -34,8 +34,9 @@ from PIL import Image
 from .. import errlog
 from ..report.report import FileReport
 
-STEPS = ("burst", "deblock", "ai", "thumbsr", "diffusion", "faces")
+STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "faces")
 STEP_NAMES = {
+    "puzzle": "pieces put back by the thumbnail",
     "burst": "similar shots",
     "deblock": "JPEG clean-up",
     "ai": "AI healing",
@@ -347,11 +348,11 @@ class Enhancer:
     def _lost_but_worth_it(self, rep: FileReport) -> bool:
         """A photo mostly lost still gets a copy when JPEG clean-up is on (the fine-tuned
         FBCNN learnt on exactly such photos: rotted blocks and bands between the holes), or
-        when the copy is built on its thumbnail ("thumbsr") and the thumbnail is whole: it
-        shows the scene the holes cut away."""
+        when the copy is built on its thumbnail ("thumbsr", or the jigsaw puts the pieces
+        back by it) and the thumbnail is whole: it shows the scene the holes cut away."""
         if "deblock" in self.steps:
             return True
-        if "thumbsr" not in self.steps or not rep.holes:
+        if not ({"thumbsr", "puzzle"} & set(self.steps)) or not rep.holes:
             return False
         try:
             from .enhance import thumbnail_rgb
@@ -400,9 +401,25 @@ class Enhancer:
             exif = img.info.get("exif")
             arr = np.asarray(img.convert("RGB"))
             holes, unknown = photo_masks(data, rep.holes, rep.unknown)
+            small = thumbnail_rgb(data)
+            keep, first = None, []
+            source = self.sources[i] if i < len(self.sources) else None
+            if "puzzle" in steps and source is not None and holes.any():
+                from .puzzle import puzzle
+
+                t0 = time.perf_counter()
+                placed = puzzle(Path(source).read_bytes(), data, small, holes)
+                if placed is not None:
+                    arr, holes = placed.rgb, placed.holes
+                    unknown = np.zeros_like(holes)  # the holes now hold the thumbnail's colours
+                    keep = ~holes  # the file's own pixels: no later step blurs them
+                    first.append(f"pieces put back by the thumbnail: {placed.pieces} stretches, "
+                                 f"{100 * placed.share:.0f} % of the photo (the repair had "
+                                 f"{100 * placed.repair_share:.0f} %; {time.perf_counter() - t0:.1f} s)")
             burst = photos.burst_for(i, self.say) if "burst" in steps else None
             new, done = enhance_steps(arr, holes, unknown, engine, steps, burst, progress, self.quality, self.stop,
-                                      self.prompt, thumbnail_picture(data, arr.shape), thumbnail_rgb(data))
+                                      self.prompt, thumbnail_picture(data, arr.shape), small, keep)
+            done = first + done if done or first else done
         except Stopped:
             return
         except Exception as e:  # one photo must not stop the rest

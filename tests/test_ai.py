@@ -277,3 +277,32 @@ def test_batch_only_when_tiles_stay_apart():
     assert not _batch_ok(Mixing())
     assert _batch_ok(Clean())
     assert not _batch_ok(FakeSR())  # a fixed batch of one
+
+
+def test_jigsaw_puts_the_pieces_back_by_the_thumbnail():
+    """Stretches between restart markers decode alone and go back to their own rows, also
+    when stretches before them were lost (the repair would have to guess how many)."""
+    import io as _io
+    import re
+
+    from PIL import Image as _Image
+    from synth import make_image, make_jpeg
+
+    from fotomedik.ai.puzzle import puzzle
+    from fotomedik.train.damage import exif_with_thumbnail
+
+    im = make_image(640, 480, seed=3)
+    good = make_jpeg(im, restart_rows=1, exif=exif_with_thumbnail(im))
+    truth = np.asarray(_Image.open(_io.BytesIO(good)).convert("RGB")).astype(int)
+    marks = [m.start() for m in re.finditer(rb"\xff[\xd0-\xd7]", good)]
+    # rows 3..12 lost: their stretches cut out of the file (and the markers with them)
+    bad = good[: marks[2]] + good[marks[12]:]
+    small = np.asarray(_Image.open(_io.BytesIO(good)).convert("RGB").resize((160, 120)))
+    holes = np.zeros(truth.shape[:2], bool)
+    holes[:240] = True  # the repair kept half
+    got = puzzle(bad, good, small, holes)
+    assert got is not None and got.pieces >= 15
+    have = ~got.holes
+    assert 0.5 < have.mean() < 0.85  # the lost rows stay holes
+    assert np.abs(got.rgb[have].astype(int) - truth[have]).mean() < 4  # every piece in its own place
+    assert puzzle(bad, good, None, holes) is None  # no thumbnail: nothing to go by

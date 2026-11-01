@@ -286,6 +286,10 @@ class MainWindow(QMainWindow):
         ext.addWidget(lab)
         self.steps = {}
         tips = {
+            "puzzle": "Photos with restart markers (Kodak, many phones): every piece of the file is decoded\n"
+                      "on its own and put back where the thumbnail shows it belongs. After a damaged stretch\n"
+                      "the repair can place the rest 8, 16 or 24 rows off; this puts it right and also uses\n"
+                      "data the repair dropped. Nothing invented. Needs a whole thumbnail.",
             "burst": "Fill holes with REAL pixels from another shot of the same scene\n"
                      "(taken within 3 minutes), aligned and colour-matched. Nothing invented.",
             "deblock": "Remove JPEG blocks and noise from the whole picture (FBCNN, ~290 MB once).",
@@ -301,12 +305,13 @@ class MainWindow(QMainWindow):
         }
         from ..ai.run import STEP_NAMES
 
-        for key in ("burst", "deblock", "ai", "thumbsr", "faces", "diffusion"):
+        for key in ("puzzle", "burst", "deblock", "ai", "thumbsr", "faces", "diffusion"):
             cb = QCheckBox(STEP_NAMES[key].capitalize())
             cb.setToolTip(tips[key])
             ext.addWidget(cb)
             self.steps[key] = cb
         self.steps["burst"].setChecked(True)
+        self.steps["puzzle"].setChecked(True)
         self.ai = self.steps["ai"]  # older name (smoke test)
         self.enlarger = QComboBox()
         for key, label in (("swinir", "SwinIR (faithful)"), ("esrgan", "Real-ESRGAN (sharp)"),
