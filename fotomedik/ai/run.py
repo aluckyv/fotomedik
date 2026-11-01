@@ -194,8 +194,9 @@ class Enhancer:
 
     def __init__(self, sources, out: Path, steps, say=None, stop=None, on_done=None, engine=None,
                  quality: str | None = None, half: bool = True, prompt: str | None = None,
-                 enlarger: str | None = None):
+                 enlarger: str | None = None, skip=None):
         self.sources = list(sources)
+        self.skip = set(skip or ())  # photos that only lend their pixels (their copy exists already)
         self.enlarger = enlarger
         self.out = out
         user_say = say or (lambda s: None)
@@ -303,7 +304,7 @@ class Enhancer:
                         seen.add(i)
                         rep = self.repaired[i]
                         photos.add(i, rep, self.sources[i])
-                        if (rep.output_name and rep.fallback is None
+                        if (rep.output_name and rep.fallback is None and i not in self.skip
                                 and (not is_lost(rep) or self._lost_but_worth_it(rep))
                                 and (rep.holes or (whole_picture and rep.findings))):
                             pending.append(i)
@@ -451,12 +452,13 @@ class Enhancer:
 
 def run_extras(items: list[tuple[FileReport, Path | None]], out: Path, steps, say=None, stop=None,
                on_done=None, engine=None, quality: str | None = None, prompt: str | None = None,
-               enlarger: str | None = None) -> str | None:
+               enlarger: str | None = None, skip=None) -> str | None:
     """Make the enhanced copy of every repaired photo that needs one, after the fact.
-    items: (report, original path). Returns the device the networks ran on, "" when
-    no network was needed, or None when nothing could be done (reasons go to say)."""
+    items: (report, original path); skip: indices of photos that get no copy (they still
+    serve as burst donors). Returns the device the networks ran on, "" when no network
+    was needed, or None when nothing could be done (reasons go to say)."""
     enh = Enhancer([src for _rep, src in items], out, steps, say, stop, on_done, engine, quality, prompt=prompt,
-                   enlarger=enlarger)
+                   enlarger=enlarger, skip=skip)
     if not enh.steps:
         return None
     enh.start()

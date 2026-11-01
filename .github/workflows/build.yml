@@ -133,6 +133,11 @@ jobs:
           if ($p.ExitCode -ne 0) { exit 1 }
           if (!(Test-Path inst\app\base\FotoMedik.exe)) { exit 1 }
           if (!(Test-Path demo_out_exe\healthy.jpg)) { exit 1 }
+      - name: Claude (MCP) smoke test of the installed program
+        shell: pwsh
+        env:
+          FOTOMEDIK_HOME: ${{ github.workspace }}\inst
+        run: python scripts/mcp_smoke.py inst\app\base\FotoMedik.exe demo demo_out_mcp
       - uses: actions/cache@v4
         with:
           path: models

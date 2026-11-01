@@ -363,7 +363,10 @@ def scan(path: Path, lang: str):
 def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
                 jobs: int = 0, reports: bool = False, enhance: str = "", quality: str | None = None,
                 prompt: str | None = None, reference: Path | None = None, twins: bool = False,
-                enlarger: str | None = None):
+                enlarger: str | None = None, only: set[str] | None = None, skip_done: bool = False):
+    """only: the photos (paths relative to the folder, lower case) to do, the rest left out.
+    skip_done: photos that have their result in `out` already get no new enhanced copy
+    (they are repaired again, quickly, as burst donors for the others)."""
     if path.is_dir() and out.resolve() == path.resolve():
         raise click.ClickException("output folder must differ from the input folder (originals are never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
@@ -378,6 +381,23 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
     from .runner import plan
 
     items = plan(files, options)
+    steps = [x.strip() for x in enhance.split(",") if x.strip()]
+
+    def rel_of(p: Path) -> str:
+        return (p.relative_to(path) if path.is_dir() else Path(p.name)).as_posix()
+
+    if only is not None:
+        items = [it for it in items if rel_of(it[0]).lower() in only]
+    skip: set[int] = set()
+    if skip_done:
+        from .jobs import done_already
+
+        done = [done_already(rel_of(p), out, steps) for p, _rel, _o in items]
+        if steps:
+            skip = {i for i, d in enumerate(done) if d}
+        else:
+            items = [it for it, d in zip(items, done) if not d]
+        click.echo(f"{sum(done)} photo(s) done already, left out")
     with Workers(jobs, len(items)) as workers:
         if auto_ref and len(files) > 1:
             learned = _learn_candidates(files, click.echo, jobs, workers)
@@ -385,7 +405,6 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
                 opts["ref_candidates"], opts["thumb_refs"] = learned
         work = [(str(p), str(rel), str(out), opts, profile) for p, rel, opts in items]
         results = workers.map(_repair_file, work, cost=lambda it: os.path.getsize(it[0]), counted=True)
-    steps = [x.strip() for x in enhance.split(",") if x.strip()]
     if steps:
         from .ai.run import run_extras
 
@@ -397,7 +416,7 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
 
         reports_wanted = reports
         device = run_extras([(rep, items[i][0]) for i, (rep, _s) in enumerate(results)], out, steps, click.echo,
-                            on_done=ai_done, quality=quality, prompt=prompt, enlarger=enlarger)
+                            on_done=ai_done, quality=quality, prompt=prompt, enlarger=enlarger, skip=skip)
         if device:
             click.echo(f"[enhance] networks ran on {device}")
     reports: list[FileReport] = []
@@ -484,14 +503,22 @@ def learn(good: Path, out: Path):
 @click.option("--twins", is_flag=True,
               help="a photo without a usable thumbnail takes the colours of its holes from a shot of the same "
                    "scene taken within 30 seconds")
+@click.option("--only-file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="a text file naming the photos to do, one per line (paths relative to FOLDER)")
+@click.option("--skip-done", is_flag=True,
+              help="leave out photos whose enhanced copy (without --enhance: repaired copy) is in OUT already")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
 def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality,
-          scene, enlarger, reference, twins, lang):
+          scene, enlarger, reference, twins, only_file, skip_done, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
+    only = None
+    if only_file is not None:
+        only = {ln.strip().replace("\\", "/").strip("/").lower()
+                for ln in only_file.read_text(encoding="utf-8-sig").splitlines() if ln.strip()}
     reps = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
                        auto_ref=True, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""),
                        quality=quality, prompt=scene or None, reference=reference, twins=twins,
-                       enlarger=enlarger)
+                       enlarger=enlarger, only=only, skip_done=skip_done)
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])

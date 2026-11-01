@@ -18,6 +18,19 @@ changed.
 
 From source: `pip install -e . pyside6`, then `python -m fotomedik.gui`.
 
+### Claude (MCP)
+
+**Connect to Claude…** (top right) adds FotoMedik to Claude's desktop app as an MCP
+server (`FotoMedik.exe --mcp`; the old settings file is kept as a backup) and can
+restart Claude. Claude can then queue folders for repair on this computer
+(`start_job`), follow them (`job_status`, `list_jobs`), stop them (`stop_job`) and
+see what the program has (`app_info`). The jobs run one after another in processes
+of their own, on this computer's graphics card, and go on when Claude is closed;
+`skip_done` continues a stopped job. Originals are never changed: the output folder
+is never the source, inside it or around it, never one of the folders and drives
+listed in the dialog, and nothing is deleted. Without the window:
+`FotoMedik.exe --cli batch <folder> -o <out>` (the command line below).
+
 ## Instalacija (Windows, Python 3.11+)
 
 ```
