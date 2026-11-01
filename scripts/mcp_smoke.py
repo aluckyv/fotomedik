@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # the reports hold č, đ...
     exe, src, out = sys.argv[1], Path(sys.argv[2]).resolve(), Path(sys.argv[3]).resolve()
     p = subprocess.Popen([exe, "--mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     n = 0
