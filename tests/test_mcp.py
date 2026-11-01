@@ -218,35 +218,59 @@ def test_skipped_photos_still_lend_their_pixels(tmp_path, photos, monkeypatch):
     assert sorted(seen["names"]) == ["a.jpg", "b.jpg", "c.JPG"] and seen["skip"] == ["a.jpg"]
 
 
-def test_connect_to_claude_makes_an_extension(home, tmp_path):
+def test_connect_to_claude_asks_nothing(home, tmp_path, monkeypatch):
     import shutil
     import zipfile
 
-    done = claude_connect.connect(open_it=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    # not in Claude at all: the package is written, to be dragged into Claude once
+    ok, text = claude_connect.connect()
     pkg = home / "FotoMedik.mcpb"
-    assert pkg.exists() and any("Settings > Extensions" in d for d in done)
+    assert not ok and "Settings > Extensions" in text and pkg.exists()
     with zipfile.ZipFile(pkg) as z:
         assert sorted(z.namelist()) == ["manifest.json", "server/index.js"]
         man = json.loads(z.read("manifest.json"))
-        js = z.read("server/index.js").decode()
     assert man["manifest_version"] == "0.3" and man["name"] == "fotomedik"
     assert man["server"]["type"] == "node" and man["server"]["entry_point"] == "server/index.js"
     assert man["server"]["mcp_config"]["args"] == ["${__dirname}/server/index.js"]
     assert {t["name"] for t in man["tools"]} == {t["name"] for t in mcp_server.TOOLS}
-    assert '"--mcp"' in js and "FOTOMEDIK_EXE" in js
+    # the extension installed in Claude (the Store app's folder): its script is brought up to date in place
+    ext = tmp_path / "Local" / "Packages" / "Claude_x1" / "LocalCache" / "Roaming" / "Claude" / "Claude Extensions" / "local.fm"
+    (ext / "server").mkdir(parents=True)
+    (ext / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    (ext / "server" / "index.js").write_text("old", encoding="utf-8")
+    other = ext.parent / "other"
+    (other / "server").mkdir(parents=True)
+    (other / "manifest.json").write_text('{"name": "blender"}', encoding="utf-8")
+    (other / "server" / "index.js").write_text("theirs", encoding="utf-8")
+    ok, text = claude_connect.connect()
+    assert ok and "up to date" in text
+    assert (ext / "server" / "index.js").read_text(encoding="utf-8") == claude_connect.INDEX_JS
+    assert (other / "server" / "index.js").read_text(encoding="utf-8") == "theirs"
+    # a server written into Claude's settings by hand counts as connected
+    shutil.rmtree(ext)
+    cfg = tmp_path / "Roaming" / "Claude" / "claude_desktop_config.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('{"mcpServers": {"fotomedik": {"command": "x.exe"}}}', encoding="utf-8")
+    assert claude_connect.connect() == (True, "Connected to Claude (Claude's settings).")
     node = shutil.which("node")
     if node is None:
         return
-    # the extension's script hands Claude's connection to the server as it is
+    # the script passes Claude's messages to the server and its answers back
     root = tmp_path / "ext"
     with zipfile.ZipFile(pkg) as z:
         z.extractall(root)
     env = dict(os.environ, PYTHONPATH=str(ROOT), FOTOMEDIK_EXE=sys.executable,
                FOTOMEDIK_ARGS=json.dumps(["-m", "fotomedik.mcp_server"]))
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "server/discover"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
     p = subprocess.run([node, str(root / "server" / "index.js")], env=env, timeout=60, capture_output=True,
-                       input=(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n").encode())
+                       input="".join(json.dumps(m) + "\n" for m in msgs).encode())
     assert p.returncode == 0, p.stderr
-    assert {t["name"] for t in json.loads(p.stdout)["result"]["tools"]} == {t["name"] for t in mcp_server.TOOLS}
+    replies = [json.loads(x) for x in p.stdout.decode().splitlines()]
+    assert replies[0]["id"] == 1 and replies[0]["error"]["code"] == -32601  # an unknown probe gets an answer
+    assert {t["name"] for t in replies[1]["result"]["tools"]} == {t["name"] for t in mcp_server.TOOLS}
     p = subprocess.run([node, str(root / "server" / "index.js")], timeout=60, capture_output=True,
                        env=dict(os.environ, FOTOMEDIK_EXE=str(tmp_path / "nope.exe")), input=b"")
     assert p.returncode == 1 and b"not installed" in p.stderr

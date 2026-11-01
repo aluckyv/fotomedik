@@ -185,9 +185,10 @@ class MainWindow(QMainWindow):
         head.addWidget(sub)
         headrow = QHBoxLayout()
         headrow.addLayout(head, 1)
-        self.claude_btn = QPushButton("Connect to Claude…")
+        self.claude_btn = QPushButton("Connect to Claude")
         self.claude_btn.setToolTip("Let Claude (the desktop app) repair folders on this computer:\n"
-                                   "queue folders, follow the repairs and stop them. Originals are never changed.")
+                                   "queue folders, follow the repairs and stop them. Originals are never changed,\n"
+                                   "and nothing is written into the protected places (mcp.json).")
         self.claude_btn.clicked.connect(self._connect_claude)
         headrow.addWidget(self.claude_btn, 0, Qt.AlignmentFlag.AlignTop)
         outer.addLayout(headrow)
@@ -703,20 +704,16 @@ class MainWindow(QMainWindow):
         dlg.show()
 
     def _connect_claude(self) -> None:
-        from .. import claude_connect, jobs
+        """One click, no questions: FotoMedik's server in Claude, the result in the status bar."""
+        from .. import claude_connect
 
-        ans = _connect_dialog(self)
-        if ans is None:
-            return
         try:
-            jobs.save_settings(ans)
-            done = claude_connect.connect()
-        except Exception as e:  # noqa: BLE001  (shown to the person)
-            QMessageBox.warning(self, "Connect to Claude", f"It did not work: {type(e).__name__}: {e}")
-            return
-        prot = jobs.settings()["protected"]
-        done.append("protected: " + (", ".join(prot) if prot else "nothing listed"))
-        QMessageBox.information(self, "Connect to Claude", "\n".join(done))
+            ok, text = claude_connect.connect()
+        except Exception as e:  # noqa: BLE001  (shown in the status bar)
+            ok, text = False, f"Connect to Claude did not work: {type(e).__name__}: {e}"
+        self.stat.setText(text)
+        if ok:
+            self.claude_btn.setText("Connected to Claude ✓")
 
     def _open_output(self) -> None:
         d = getattr(self, "out_dir", None)
@@ -815,35 +812,6 @@ class MainWindow(QMainWindow):
             self.thread.quit()
             self.thread.wait(5000)
         super().closeEvent(e)
-
-
-def _connect_dialog(parent) -> list[str] | None:
-    """Ask for the protected places; None when cancelled."""
-    from PySide6.QtWidgets import QDialog, QDialogButtonBox
-
-    from .. import jobs
-
-    dlg = QDialog(parent)
-    dlg.setWindowTitle("Connect to Claude")
-    lay = QVBoxLayout(dlg)
-    lay.addWidget(QLabel("Claude (the desktop app) will be able to repair folders on this computer: queue them,\n"
-                         "follow the repairs and stop them. Originals are never changed, nothing is deleted,\n"
-                         "and nothing is written into the places listed below.\n\n"
-                         "FotoMedik opens its Claude extension: click Install in Claude. It works right away,\n"
-                         "Claude does not have to be closed."))
-    lay.addWidget(QLabel("Folders and drives Claude must never write into, one per line (e.g. F:\\):"))
-    box = QPlainTextEdit("\n".join(jobs.settings()["protected"]))
-    box.setObjectName("protected")
-    box.setFixedHeight(90)
-    lay.addWidget(box)
-    bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-    bb.button(QDialogButtonBox.StandardButton.Ok).setText("Connect")
-    bb.accepted.connect(dlg.accept)
-    bb.rejected.connect(dlg.reject)
-    lay.addWidget(bb)
-    if dlg.exec() != QDialog.DialogCode.Accepted:
-        return None
-    return box.toPlainText().splitlines()
 
 
 def main(argv: list[str] | None = None) -> int:
