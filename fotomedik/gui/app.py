@@ -583,7 +583,7 @@ class MainWindow(QMainWindow):
         paths = [p for p in self._paths() if p.exists()]
         self._ov_n += 1
         n = self._ov_n
-        if not paths:
+        if not paths or self.quiet:  # the self-test ends before a look would (build 149 crashed at exit)
             self.ovlabel.hide()
             return
         self.ovlabel.setText("Looking at the photos…")
@@ -606,7 +606,9 @@ class MainWindow(QMainWindow):
                 from ..overview import overview
 
                 files = runner.collect(paths, Path("/nonexistent-output"))
-                ov = overview(files)
+                # in this thread alone, no worker processes: a pool left running when the
+                # window closes took the program down with it (exit code -1 in CI)
+                ov = overview(files, jobs=1)
                 sig.done.emit(n, ov, ov.text(nvidia_present()))
             except Exception as e:  # noqa: BLE001
                 sig.done.emit(n, None, f"The photos could not be looked at: {type(e).__name__}: {e}")
