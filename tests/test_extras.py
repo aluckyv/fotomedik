@@ -260,7 +260,6 @@ def test_blend_seams_lifts_a_fill_onto_the_picture_around_it():
 
 
 def test_destripe_evens_a_band_against_the_thumbnail():
-    pytest.importorskip("cv2")  # destripe (switched off) still uses OpenCV
     from fotomedik.ai.enhance import destripe
 
     base, noisy = _sky()
@@ -275,7 +274,6 @@ def test_destripe_evens_a_band_against_the_thumbnail():
 
 
 def test_destripe_leaves_detail_lone_blocks_and_photos_without_a_thumbnail():
-    pytest.importorskip("cv2")  # destripe (switched off) still uses OpenCV
     from fotomedik.ai.enhance import destripe
 
     base, noisy = _sky(seed=1)
@@ -316,3 +314,20 @@ def test_texture_holes_leaves_skin_alone():
     arr[holes] = (205, 160, 135)  # an arm the fill made smooth
     out = texture_holes(arr, holes)
     assert (out[holes] == arr[holes]).all()
+
+
+def test_destripe_uses_only_the_real_part_of_a_rescued_thumbnail():
+    from fotomedik.ai.enhance import destripe
+
+    base, noisy = _sky(seed=2)
+    arr = noisy.copy()
+    arr[64:72, 40:200] += 25  # a band
+    arr = np.clip(np.rint(arr), 0, 255).astype(np.uint8)
+    thumb = base.astype(np.uint8).copy()
+    real = np.ones(arr.shape[:2], bool)
+    real[56:80] = False  # the rescued thumbnail lost these rows: grey there
+    thumb[56:80] = 128
+    out, n = destripe(arr, thumb, real)
+    assert n == 0 and (out == arr).all()  # no map there: the band is left alone
+    out, n = destripe(arr, base.astype(np.uint8), None)
+    assert n >= 15

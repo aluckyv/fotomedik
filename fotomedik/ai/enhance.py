@@ -758,7 +758,8 @@ def protect_real(cleaned: np.ndarray, real: np.ndarray, holes: np.ndarray) -> np
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)
 
 
-DESTRIPE = False  # bands evened against the thumbnail: off until it can use a rescued thumbnail (no gain on the bench)
+TEXTURE_WITH_FILL = True  # the photo's own texture in the holes after every fill (the patch step), not only on request
+DESTRIPE = True  # bands on flat surfaces evened against the thumbnail, or a rescued thumbnail's real part
 STRIPE_OFF = 14.0  # gray levels a block's colour must stray from what is around it to be a band
 STRIPE_FLAT = 6.0  # luma spread inside a block below which it is flat (sky, wall, road)
 STRIPE_OK = 8.0  # the blocks around must agree this well: then they are right and the block is not
@@ -780,15 +781,31 @@ def _runs(mask: np.ndarray, n: int, axis: int) -> np.ndarray:
     return out if axis == 1 else out.T
 
 
-def destripe(arr: np.ndarray, thumb: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+def rescued_picture(rescued: tuple, shape) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """(rgb, real mask) at full size of a thumbnail the repair rescued in part
+    ((small rgb, small mask or None)), or (None, None)."""
+    try:
+        small, real = rescued
+        h, w = shape[:2]
+        rgb = np.asarray(Image.fromarray(np.ascontiguousarray(small)).resize((w, h), Image.BICUBIC))
+        if real is None:
+            return rgb, None
+        m = np.asarray(Image.fromarray(np.asarray(real, bool).astype(np.uint8) * 255).resize((w, h), Image.BILINEAR)) > 250
+        return rgb, m
+    except Exception:  # noqa: BLE001 - only a reference for the bands
+        return None, None
+
+
+def destripe(arr: np.ndarray, thumb: np.ndarray | None = None,
+             thumb_real: np.ndarray | None = None) -> tuple[np.ndarray, int]:
     """Even out the bands and lines a flat surface still shows (rows of blocks a shade off,
     a dark column at the edge): a flat block whose colour strays from the thumbnail (allowing
     for the thumbnail's own colour offset) gets its colour moved there by a smooth correction.
-    Without a thumbnail nothing is done. Its texture stays; detail, edges and lone blocks are left
-    alone. Returns (rgb, blocks evened)."""
-    import cv2
-
+    thumb_real: where a thumbnail rescued in part is real (its rotted rest says nothing);
+    without a thumbnail nothing is done. Its texture stays; detail, edges and lone blocks
+    are left alone. Returns (rgb, blocks evened)."""
     from ..recipes.r12_smooth import surface
+    from .patchfill import box_blur
 
     h, w = arr.shape[:2]
     bh, bw = h // 8, w // 8
@@ -801,15 +818,18 @@ def destripe(arr: np.ndarray, thumb: np.ndarray | None = None) -> tuple[np.ndarr
     luma = a @ np.array([0.299, 0.587, 0.114], np.float32)
     flat = luma.reshape(bh, 8, bw, 8).std(axis=(1, 3)) < STRIPE_FLAT
     t = thumb[: bh * 8, : bw * 8].astype(np.float32).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    known = np.ones((bh, bw), bool)
+    if thumb_real is not None and thumb_real.shape[:2] == arr.shape[:2]:
+        known = thumb_real[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).mean(axis=(1, 3)) > 0.99
     d = m - t
-    wgt = (flat & (np.abs(d).max(axis=-1) < 2 * STRIPE_OFF)).astype(np.float32)
-    k = (STRIPE_BIAS, STRIPE_BIAS)
-    num = np.stack([cv2.boxFilter(d[..., c] * wgt, -1, k, normalize=False) for c in range(3)], axis=-1)
-    den = cv2.boxFilter(wgt, -1, k, normalize=False)[..., None]
+    wgt = (flat & known & (np.abs(d).max(axis=-1) < 2 * STRIPE_OFF)).astype(np.float32)
+    r = STRIPE_BIAS // 2
+    num = box_blur(d * wgt[..., None], r)  # means over the window (the counts cancel out)
+    den = box_blur(wgt[..., None], r)
     target = t + num / np.maximum(den, 1e-6)  # the thumbnail with the photo's colours
     off = np.abs(m - target).max(axis=-1)
-    near = cv2.blur((off < STRIPE_OK).astype(np.float32), (5, 5)) > 0.5  # most around fit
-    cand = flat & (off > STRIPE_OFF) & near & (den[..., 0] > 0)
+    near = box_blur((off < STRIPE_OK).astype(np.float32)[..., None], 2)[..., 0] > 0.5  # most around fit
+    cand = flat & known & (off > STRIPE_OFF) & near & (den[..., 0] > 1e-6)
     bad = _runs(cand, STRIPE_RUN, 1) | _runs(cand, STRIPE_RUN, 0)
     if not bad.any():
         return arr, 0
@@ -994,8 +1014,8 @@ def rotted_stripes(before: np.ndarray, holes: np.ndarray, known: np.ndarray, thu
 def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
                   burst=None, progress=None, quality: str | None = None, stop=None,
                   prompt: str | None = None, thumb: np.ndarray | None = None,
-                  thumb_small: np.ndarray | None = None, keep: np.ndarray | None = None
-                  ) -> tuple[np.ndarray, list[str]]:
+                  thumb_small: np.ndarray | None = None, keep: np.ndarray | None = None,
+                  rescued: tuple | None = None) -> tuple[np.ndarray, list[str]]:
     """The enhanced copy, step by step. Returns (rgb, what was done, with the time it took).
 
     burst: callable(rgb, holes) -> (rgb, filled mask) giving real pixels from other shots.
@@ -1050,14 +1070,26 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         before = arr
         if "diffusion" in steps and engine.sd is not None:
             from .diffusion import repaint_holes
+            from .guard import date_stamp, face_mask
+            from .patchfill import skin
 
             t0 = time.perf_counter()
             if unknown.any() and engine.inpaint_s is not None:  # a start for holes the thumbnail left blank
                 arr = inpaint_unknown(arr, unknown, engine)
-            arr, what = repaint_holes(arr, holes, unknown, engine, quality, report("Stable Diffusion window"), stop,
-                                      prompt)
-            arr = keep_block_means(arr, before, holes, holes & ~unknown)
-            done.append(f"holes repainted (Stable Diffusion, follows the thumbnail; {what}, {_took(t0)})")
+            # people are never repainted (the network draws them badly): faces, skin and a margin keep
+            # the thumbnail's (or LaMa's) fill; the date stamp too
+            people = face_mask(arr, engine.face_det) | skin(arr) | date_stamp(arr)
+            paint = holes & ~people
+            if paint.any():
+                arr, what = repaint_holes(arr, paint, unknown & paint, engine, quality,
+                                          report("Stable Diffusion window"), stop, prompt)
+                arr = keep_block_means(arr, before, paint, paint & ~unknown)
+            else:
+                what = "nothing to repaint outside people"
+            kept = int((holes & people).sum())
+            done.append(f"holes repainted (Stable Diffusion, follows the thumbnail; {what}, {_took(t0)})"
+                        + (f"; people left as they were ({100 * kept / max(1, int(holes.sum())):.0f} % of the holes)"
+                           if kept else ""))
         elif "thumbsr" in steps and (engine.thumb_sr or engine.sr) is not None and thumb_small is not None:
             from .guard import date_stamp
 
@@ -1124,7 +1156,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             arr = blend_seams(arr, holes, real)
         arr = np.where(holes[..., None], arr, real)
     _check(stop)
-    if "patch" in steps and holes.any():
+    if ("patch" in steps or (TEXTURE_WITH_FILL and steps & {"thumbsr", "ai", "diffusion"})) and holes.any():
         from .guard import date_stamp, face_mask
         from .patchfill import texture_holes
 
@@ -1136,7 +1168,10 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                         f"of them, like Content-Aware Fill; faces left as they were; {_took(t0)})")
     if DESTRIPE and steps & {"deblock", "thumbsr", "ai", "puzzle"}:
         t0 = time.perf_counter()
-        arr, n_even = destripe(arr, thumb)
+        ref, ref_real = thumb, None
+        if ref is None and rescued is not None:  # a thumbnail the repair rescued in part: its real part
+            ref, ref_real = rescued_picture(rescued, arr.shape)
+        arr, n_even = destripe(arr, ref, ref_real)
         if n_even:
             done.append(f"{n_even} block(s) of bands and lines on flat surfaces evened out ({_took(t0)})")
     if "faces" in steps and engine.face_s is not None:

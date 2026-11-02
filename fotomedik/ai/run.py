@@ -429,7 +429,8 @@ class Enhancer:
                                  f"{100 * placed.repair_share:.0f} %; {time.perf_counter() - t0:.1f} s)")
             burst = photos.burst_for(i, self.say) if "burst" in steps else None
             new, done = enhance_steps(arr, holes, unknown, engine, steps, burst, progress, self.quality, self.stop,
-                                      self.prompt, thumbnail_picture(data, arr.shape), small, keep)
+                                      self.prompt, thumbnail_picture(data, arr.shape), small, keep,
+                                      rep.thumb if small is None else None)
             done = first + done if done or first else done
         except Stopped:
             return
