@@ -75,8 +75,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install -e . pyside6 pyinstaller onnx packaging opencv-python-headless
+          python-version: "3.12.10"  # exact, like base-constraints.txt: part of the base id
+      - run: pip install -e . pyside6 pyinstaller onnx packaging opencv-python-headless -c base-constraints.txt
       - name: build _fastdec.dll
         run: python build_fastdec.py
       - name: demo photos
@@ -112,6 +112,8 @@ jobs:
           Copy-Item dist_launcher\FotoMedik.exe assets\FotoMedik.exe
           $freeze = (pip freeze | Where-Object { $_ -notmatch '^-e |fotomedik' }) -join "`n"
           $id_text = (python --version) + "`n" + $freeze + "`n" + (Get-Content -Raw base_manifest.txt) + (Get-Content -Raw fotomedik.spec) + (Get-Content -Raw fotomedik_app.py)
+          # kept with the build's files, to see what changed when a build brings a new base
+          $id_text | Set-Content -Encoding utf8 assets\base_id.txt
           $sha = [System.Security.Cryptography.SHA256]::Create()
           $base_id = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($id_text)))).Replace("-","").ToLower()
           $info = [ordered]@{ build = ${{ github.run_number }}; commit = "${{ github.sha }}"; base_id = $base_id;

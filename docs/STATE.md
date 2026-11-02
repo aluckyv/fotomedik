@@ -175,7 +175,11 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   A staged base is NOT put in by restarting Claude: Claude starts `app\base\FotoMedik.exe`
   itself, not the launcher, and holds its files. The owner closes Claude fully, opens
   FotoMedik once from its shortcut (the launcher swaps the parts in), then opens Claude.
-  The base id hashes `pip freeze`, so a floating dependency on the build machine can change it.
+  The base id hashes `python --version`, `pip freeze`, the base's module list and the spec. Since
+  build 138 the Windows build pins Python 3.12.10 and every base package (`base-constraints.txt`,
+  including click and packaging, which the build machine's Python already carries and its image
+  updates), and keeps the id's text as `base_id.txt` with the build's files, to diff when a
+  build brings a new base again. Builds 135, 136 and 137 each brought one without a change of ours.
   A server started before build 125 has no `update_app` at all: Claude has to be restarted once.
 - Claude's screen control of the owner's computer lapses after 30 minutes without use and needs
   the owner's approval again: do not plan unattended installs on it.

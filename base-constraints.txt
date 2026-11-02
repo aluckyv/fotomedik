@@ -1,0 +1,24 @@
+# Exact versions of what goes into the app's base (app\base) on the Windows build, so the base
+# id - and with it the need for a new base download - changes only when one of these is
+# changed on purpose (see the app-windows job in .github/workflows/build.yml).
+Pillow==13.0.0
+PySide6==6.12.0
+PySide6_Addons==6.12.0
+PySide6_Essentials==6.12.0
+altgraph==0.17.5
+ml_dtypes==0.6.0
+numpy==2.5.4
+onnx==1.23.2
+opencv-python-headless==5.0.0.93
+pefile==2024.8.26
+protobuf==7.36.2
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+pywin32-ctypes==0.2.3
+shiboken6==6.12.0
+typing_extensions==4.16.0
+PySide6_Pdf==6.12.0.140
+PySide6_WebEngine==6.12.0.140
+# already on the build machine's Python, updated with its image unless pinned
+click==8.5.0
+packaging==26.3
