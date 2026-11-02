@@ -250,11 +250,15 @@ def in_settings() -> bool:
     return False
 
 
-def connect() -> tuple[bool, str]:
+def connect(quiet: bool = False) -> tuple[bool, str]:
     """(connected, one line for the status bar). Nothing is asked and no window opens; only
-    when FotoMedik is not in Claude at all the package is written and shown in Explorer."""
-    path = build_extension()  # always the current package, for a new install
+    when FotoMedik is not in Claude at all the package is written and shown in Explorer.
+    quiet (at the window's start): an installed extension is brought up to date, nothing else
+    is done or shown."""
     ext = installed_extensions()
+    if quiet and not ext:
+        return in_settings(), "Connected to Claude (Claude's settings)." if in_settings() else ""
+    path = build_extension()  # always the current package, for a new install
     for d in ext:  # bring the installed extension up to date in place
         (d / "server").mkdir(exist_ok=True)
         for name, text in _files().items():

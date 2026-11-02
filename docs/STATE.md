@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 146.
+Last update: 2026-11-02, build 147.
 
 ## How the work is done
 
@@ -214,7 +214,16 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   A server started before build 125 has no `update_app` at all: Claude has to be restarted once.
 - Claude's screen control of the owner's computer lapses after 30 minutes without use and needs
   the owner's approval again: do not plan unattended installs on it.
-- The window's **Check for updates** button (next to Connect to Claude) asks GitHub on demand.
+- The window (build 147): a menu bar (Photos: choose, save to, references, open results;
+  Program: Connect to Claude, Check for updates, About) and a **Quality** preset instead of the
+  row of step checkboxes: Faithful (repair only), Standard (`puzzle,burst,deblock,thumbsr`, the
+  jobs' default), Maximum (`puzzle,burst,deblock,diffusion,faces`), Custom (opens the Advanced
+  panel, where the step checkboxes, the enlarger, the diffusion preset and scene, and the
+  repair's options - magenta marks, reports, colours from similar shots - live). A step ticked
+  by hand turns the preset into whatever matches, else Custom (`gui/app.py PRESETS`).
+- At start the packaged window brings an installed extension up to date on its own
+  (`claude_connect.connect(quiet=True)`, build 147): nothing is asked, written or shown when
+  FotoMedik is not in Claude yet. Program > Check for updates asks GitHub on demand.
 - Build numbers are GitHub run numbers (failed runs count too): main went 121 -> 124.
 - Jobs: JSON files in `%LOCALAPPDATA%\FotoMedik\jobs`, run one at a time by a detached runner
   (`--jobs`) that calls `--cli batch`. `skip_done` continues a stopped job. Output folders are
@@ -287,10 +296,17 @@ Waiting for the owner's choice (proposed, not started):
 2. No enhanced copy for photos with no real data at all (today the AI invents texture there).
 3. A byte-level second repair round after the first (kept for last, only if the rest is not enough).
 
-SDXL inpainting for the diffusion step: no ready ONNX export exists (checked 2026-11-02).
-`.github/workflows/export-sdxl.yml` exports it to fp16 and puts it in parts on the public
-`models-sdxl` release (OpenRAIL++-M terms pass on). The owner gave the OK on 2026-11-02; the
-first run was started then. The app does not use it yet.
+SDXL: see the enhanced copy's notes (step `sdxl`, an experiment; slow and not better on the
+owner's card). The GitHub export workflow dies on memory; `scripts/export_sdxl.bat` does it
+on the owner's computer.
+
+Tidying the program (owner's plan, 2026-11-02, in this order): 4. connect to Claude at start
+(build 147), 1. menu and presets (147), 2. a quick scan of the folder before the repair that
+says what kind of damage it holds (whole, rescued or no thumbnail, faces, similar shots, size)
+and proposes the preset, 3. after a result: redo one photo's enhanced copy with other steps and
+compare. Then faces: GFPGAN alone helps little (sharper eyes on fair faces, the worst faces
+left alone by `agrees`, three non-faces touched); next is recognition of the owner's people
+across photos (ArcFace) plus a face network fine-tuned on them, as a night job on his card.
 
 Known problems:
 - Rotted decoded rows the stripe detection misses stay in the enhanced copy as thin light or

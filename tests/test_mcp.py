@@ -224,9 +224,11 @@ def test_connect_to_claude_asks_nothing(home, tmp_path, monkeypatch):
 
     monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    pkg = home / "FotoMedik.mcpb"
+    # not in Claude at all, at the window's start: nothing is written or shown
+    assert claude_connect.connect(quiet=True) == (False, "") and not pkg.exists()
     # not in Claude at all: the package is written, to be dragged into Claude once
     ok, text = claude_connect.connect()
-    pkg = home / "FotoMedik.mcpb"
     assert not ok and "Settings > Extensions" in text and pkg.exists()
     with zipfile.ZipFile(pkg) as z:
         assert sorted(z.namelist()) == ["manifest.json", "server/README.txt", "server/index.js"]
@@ -252,7 +254,7 @@ def test_connect_to_claude_asks_nothing(home, tmp_path, monkeypatch):
     (other / "server").mkdir(parents=True)
     (other / "manifest.json").write_text('{"name": "blender"}', encoding="utf-8")
     (other / "server" / "index.js").write_text("theirs", encoding="utf-8")
-    ok, text = claude_connect.connect()
+    ok, text = claude_connect.connect(quiet=True)  # at the window's start too
     assert ok and "up to date" in text
     assert (ext / "server" / "index.js").read_text(encoding="utf-8") == claude_connect.index_js()
     assert (other / "server" / "index.js").read_text(encoding="utf-8") == "theirs"

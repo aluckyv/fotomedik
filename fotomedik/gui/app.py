@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QProgressDialog,
@@ -42,6 +42,21 @@ from .preview import load_preview
 
 APP_NAME = "FotoMedik"
 ACCENT = "#2f6fde"
+# Quality presets: the enhanced copy's steps (the repaired copy is always made and always
+# faithful). "custom" is whatever the advanced panel says.
+PRESETS = {
+    "faithful": ("Faithful — repair only", (), "Only the repaired copy: the file's own data, holes filled from the\n"
+                 "thumbnail. Nothing invented, no AI networks needed."),
+    "standard": ("Standard — enhanced copy", ("puzzle", "burst", "deblock", "thumbsr"),
+                 "Also an enhanced copy: pieces put back by the thumbnail, real pixels from similar shots,\n"
+                 "JPEG clean-up, holes from the thumbnail enlarged by AI, seams healed, faint bands evened.\n"
+                 "Downloads the AI networks once (about 600 MB)."),
+    "maximum": ("Maximum — diffusion and faces", ("puzzle", "burst", "deblock", "diffusion", "faces"),
+                "The enhanced copy's holes repainted by Stable Diffusion and faces restored by GFPGAN.\n"
+                "Invents detail; needs a graphics card (minutes per photo on the processor). About 2.5 GB once."),
+    "custom": ("Custom…", None, "Pick the steps yourself in the advanced panel."),
+}
+DEFAULT_PRESET = "standard"
 STYLE = f"""
 QMainWindow, QWidget {{ background: #f6f7f9; color: #1d2330; font-size: 10pt; }}
 QLineEdit {{ background: white; border: 1px solid #cfd5df; border-radius: 6px; padding: 6px 8px; }}
@@ -56,6 +71,8 @@ QPlainTextEdit {{ background: white; border: 1px solid #dde2ea; border-radius: 6
 QProgressBar {{ border: 1px solid #cfd5df; border-radius: 6px; background: white; text-align: center; height: 18px; }}
 QProgressBar::chunk {{ background: {ACCENT}; border-radius: 5px; }}
 QFrame#drop {{ border: 2px dashed #b9c3d3; border-radius: 10px; background: #fbfcfe; }}
+QFrame#adv {{ border: 1px solid #dde2ea; border-radius: 8px; background: #fbfcfe; }}
+QMenuBar {{ background: #f6f7f9; }}
 QLabel#hint {{ color: #5b6578; }}
 QLabel#imgcap {{ color: #5b6578; font-weight: 600; }}
 """
@@ -186,20 +203,8 @@ class MainWindow(QMainWindow):
         head.setSpacing(2)
         head.addWidget(title)
         head.addWidget(sub)
-        headrow = QHBoxLayout()
-        headrow.addLayout(head, 1)
-        self.claude_btn = QPushButton("Connect to Claude")
-        self.claude_btn.setToolTip("Let Claude (the desktop app) repair folders on this computer:\n"
-                                   "queue folders, follow the repairs and stop them. Originals are never changed,\n"
-                                   "and nothing is written into the protected places (mcp.json).")
-        self.claude_btn.clicked.connect(self._connect_claude)
-        self.check_btn = QPushButton("Check for updates")
-        self.check_btn.setToolTip("Ask GitHub for a newer build of FotoMedik (Claude can also update it\n"
-                                  "through its connection, between repairs).")
-        self.check_btn.clicked.connect(self._check_updates)
-        headrow.addWidget(self.check_btn, 0, Qt.AlignmentFlag.AlignTop)
-        headrow.addWidget(self.claude_btn, 0, Qt.AlignmentFlag.AlignTop)
-        outer.addLayout(headrow)
+        outer.addLayout(head)
+        self._menus()
 
         # ---- update banner (shown when GitHub has a newer build)
         self.banner = QFrame()
@@ -225,6 +230,7 @@ class MainWindow(QMainWindow):
         if updater.is_packaged():
             updater.cleanup_old()
             self.checker.start()
+            self._connect_at_start()
 
         # ---- input / output
         drop = QFrame()
@@ -279,16 +285,20 @@ class MainWindow(QMainWindow):
         self.stopb.setEnabled(False)
         self.stopb.clicked.connect(self._stop)
         act.addWidget(self.stopb)
-        self.mark = QCheckBox("Mark unrecoverable areas in magenta")
-        act.addWidget(self.mark)
-        self.reports = QCheckBox("Save a report file for each photo")
-        self.reports.setToolTip("Writes <photo>.report.json next to every repaired copy")
-        act.addWidget(self.reports)
-        self.twins = QCheckBox("Colours from similar shots")
-        self.twins.setToolTip("A photo without a usable thumbnail takes the colours of its holes from a shot of\n"
-                              "the same scene taken within 30 seconds (colour and brightness only, and only\n"
-                              "where the two shots agree). Its decoded parts stay as they are.")
-        act.addWidget(self.twins)
+        act.addSpacing(12)
+        act.addWidget(QLabel("Quality:"))
+        self.preset = QComboBox()
+        for key, (label, _steps, tip) in PRESETS.items():
+            self.preset.addItem(label, key)
+            self.preset.setItemData(self.preset.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
+        self.preset.setToolTip("What the enhanced copy (<photo>_enhanced.jpg) gets. The repaired copy is\n"
+                               "always made and always stays faithful to the file.")
+        act.addWidget(self.preset)
+        self.advb = QPushButton("Advanced ▸")
+        self.advb.setCheckable(True)
+        self.advb.setToolTip("The steps one by one, the networks and the repair's extra options")
+        self.advb.toggled.connect(self._show_advanced)
+        act.addWidget(self.advb)
         act.addStretch(1)
         self.openb = QPushButton("Open results folder")
         self.openb.setEnabled(False)
@@ -296,7 +306,12 @@ class MainWindow(QMainWindow):
         act.addWidget(self.openb)
         outer.addLayout(act)
 
-        # ---- enhanced copy (<photo>_enhanced.jpg): optional steps
+        # ---- advanced panel: the enhanced copy's steps, the networks, the repair's options
+        self.adv = QFrame()
+        self.adv.setObjectName("adv")
+        advl = QVBoxLayout(self.adv)
+        advl.setContentsMargins(12, 8, 12, 8)
+        advl.setSpacing(6)
         ext = QHBoxLayout()
         lab = QLabel("Enhanced copy:")
         lab.setToolTip("Also save <photo>_enhanced.jpg next to the repaired copy.\n"
@@ -326,10 +341,9 @@ class MainWindow(QMainWindow):
         for key in ("puzzle", "burst", "deblock", "ai", "thumbsr", "faces", "diffusion"):
             cb = QCheckBox(STEP_NAMES[key].capitalize())
             cb.setToolTip(tips[key])
+            cb.toggled.connect(self._step_toggled)
             ext.addWidget(cb)
             self.steps[key] = cb
-        self.steps["burst"].setChecked(True)
-        self.steps["puzzle"].setChecked(True)
         self.ai = self.steps["ai"]  # older name (smoke test)
         self.enlarger = QComboBox()
         for key, label in (("swinir", "SwinIR (faithful)"), ("esrgan", "Real-ESRGAN (sharp)"),
@@ -357,7 +371,7 @@ class MainWindow(QMainWindow):
         self.steps["diffusion"].toggled.connect(self.quality.setEnabled)
         ext.addWidget(self.quality)
         ext.addStretch(1)
-        outer.addLayout(ext)
+        advl.addLayout(ext)
         scene = QHBoxLayout()
         lab = QLabel("Scene:")
         lab.setToolTip("A few words on what the photos show, for Maximum quality: Stable Diffusion\n"
@@ -369,7 +383,27 @@ class MainWindow(QMainWindow):
         self.scene.setEnabled(False)
         self.steps["diffusion"].toggled.connect(self.scene.setEnabled)
         scene.addWidget(self.scene, 1)
-        outer.addLayout(scene)
+        advl.addLayout(scene)
+        rep = QHBoxLayout()
+        rep.addWidget(QLabel("Repair:"))
+        self.mark = QCheckBox("Mark unrecoverable areas in magenta")
+        rep.addWidget(self.mark)
+        self.reports = QCheckBox("Save a report file for each photo")
+        self.reports.setToolTip("Writes <photo>.report.json next to every repaired copy")
+        rep.addWidget(self.reports)
+        self.twins = QCheckBox("Colours from similar shots")
+        self.twins.setToolTip("A photo without a usable thumbnail takes the colours of its holes from a shot of\n"
+                              "the same scene taken within 30 seconds (colour and brightness only, and only\n"
+                              "where the two shots agree). Its decoded parts stay as they are.")
+        rep.addWidget(self.twins)
+        rep.addStretch(1)
+        advl.addLayout(rep)
+        self.adv.hide()
+        outer.addWidget(self.adv)
+        self._applying = False
+        self.preset.setCurrentIndex(list(PRESETS).index(DEFAULT_PRESET))
+        self._apply_preset(DEFAULT_PRESET)
+        self.preset.currentIndexChanged.connect(self._preset_picked)  # after the steps exist
 
         prog = QHBoxLayout()
         self.bar = QProgressBar()
@@ -450,6 +484,80 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(0, 2)
         split.setStretchFactor(1, 5)
         outer.addWidget(split, 1)
+
+    # ------------------------------------------------------------------ menus and presets
+    def _menus(self) -> None:
+        bar = self.menuBar()
+        photos = bar.addMenu("&Photos")
+        for text, slot in (("Choose a &folder…", self._pick_folder), ("Choose &photos…", self._pick_files),
+                           ("Choose where to &save…", self._pick_output),
+                           ("Folder with &reference pictures…", self._pick_references)):
+            photos.addAction(text).triggered.connect(slot)
+        photos.addSeparator()
+        self.open_act = photos.addAction("&Open results folder")
+        self.open_act.setEnabled(False)
+        self.open_act.triggered.connect(self._open_output)
+        photos.addSeparator()
+        photos.addAction("E&xit").triggered.connect(self.close)
+        prog = bar.addMenu("P&rogram")
+        self.claude_act = QAction("Connect to &Claude", self)
+        self.claude_act.setToolTip("Let Claude (the desktop app) repair folders on this computer: queue folders, "
+                                   "follow the repairs and stop them. Originals are never changed, and nothing "
+                                   "is written into the protected places (mcp.json).")
+        self.claude_act.triggered.connect(self._connect_claude)
+        prog.addAction(self.claude_act)
+        self.check_act = QAction("Check for &updates", self)
+        self.check_act.triggered.connect(self._check_updates)
+        prog.addAction(self.check_act)
+        prog.addSeparator()
+        prog.addAction("&About FotoMedik").triggered.connect(self._about)
+
+    def _about(self) -> None:
+        build = updater.current_build()
+        QMessageBox.information(self, APP_NAME, f"{APP_NAME}" + (f", build {build}" if build else "") + "\n\n"
+                                "Diagnoses and repairs damaged JPEG photos. Originals are never changed;\n"
+                                "the repaired copy holds the file's own data, the enhanced copy may invent detail.")
+
+    def _apply_preset(self, key: str) -> None:
+        steps = PRESETS[key][1]
+        if steps is None:
+            return
+        self._applying = True
+        try:
+            for k, cb in self.steps.items():
+                cb.setChecked(k in steps)
+            if key == "maximum":
+                self.quality.setCurrentIndex(1)  # balanced
+        finally:
+            self._applying = False
+
+    def _preset_picked(self, _i: int) -> None:
+        key = self.preset.currentData()
+        if key == "custom":
+            self.advb.setChecked(True)
+        else:
+            self._apply_preset(key)
+
+    def _step_toggled(self, _on: bool) -> None:
+        """A step changed by hand: the preset is whatever matches, else Custom."""
+        if self._applying:
+            return
+        on = tuple(k for k, cb in self.steps.items() if cb.isChecked())
+        for key, (_label, steps, _tip) in PRESETS.items():
+            if steps is not None and set(steps) == set(on):
+                break
+        else:
+            key = "custom"
+        if self.preset.currentData() != key:
+            self._applying = True
+            try:
+                self.preset.setCurrentIndex(list(PRESETS).index(key))
+            finally:
+                self._applying = False
+
+    def _show_advanced(self, on: bool) -> None:
+        self.adv.setVisible(on)
+        self.advb.setText("Advanced ▾" if on else "Advanced ▸")
 
     # ------------------------------------------------------------------ input
     def _paths(self) -> list[Path]:
@@ -544,6 +652,7 @@ class MainWindow(QMainWindow):
         self.go.setEnabled(False)
         self.stopb.setEnabled(True)
         self.openb.setEnabled(True)
+        self.open_act.setEnabled(True)
         self.out_dir = out
         steps = options.get("enhance") or []
         self.aibox.setVisible(bool(steps))
@@ -721,9 +830,33 @@ class MainWindow(QMainWindow):
             ok, text = claude_connect.connect()
         except Exception as e:  # noqa: BLE001  (shown in the status bar)
             ok, text = False, f"Connect to Claude did not work: {type(e).__name__}: {e}"
+        self._connected(ok, text)
+
+    def _connected(self, ok: bool, text: str) -> None:
         self.stat.setText(text)
         if ok:
-            self.claude_btn.setText("Connected to Claude ✓")
+            self.claude_act.setText("Connected to Claude ✓")
+
+    def _connect_at_start(self) -> None:
+        """Bring FotoMedik's extension in Claude up to date as soon as the window opens, without
+        asking and without opening anything: a build that changes the server is in Claude at once."""
+        from .. import claude_connect
+
+        class Done(QObject):
+            done = Signal(bool, str)
+
+        self._conn = Done()
+        self._conn.done.connect(self._connected)
+
+        def work():
+            try:
+                ok, text = claude_connect.connect(quiet=True)
+            except Exception as e:  # noqa: BLE001
+                ok, text = False, f"Connect to Claude did not work: {type(e).__name__}: {e}"
+            if ok:
+                self._conn.done.emit(ok, text)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _open_output(self) -> None:
         d = getattr(self, "out_dir", None)
@@ -742,7 +875,7 @@ class MainWindow(QMainWindow):
             self.stat.setText("Run from source: updates come with git, not from here.")
             return
         self.checking = True
-        self.check_btn.setEnabled(False)
+        self.check_act.setEnabled(False)
         self.stat.setText("Asking GitHub for a newer build…")
         self.checker.start()
 
@@ -750,7 +883,7 @@ class MainWindow(QMainWindow):
         if not self.checking:
             return  # the check at start: only a newer build is shown (the banner)
         self.checking = False
-        self.check_btn.setEnabled(True)
+        self.check_act.setEnabled(True)
         if err:
             self.stat.setText(f"GitHub could not be reached ({err}).")
         elif upd is None:
