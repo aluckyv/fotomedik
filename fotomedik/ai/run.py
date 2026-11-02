@@ -422,7 +422,9 @@ class Enhancer:
                     arr, holes = placed.rgb, placed.holes
                     unknown = np.zeros_like(holes)  # the holes now hold the thumbnail's colours
                     keep = ~holes  # the file's own pixels: no later step blurs them
-                    first.append(f"pieces put back by the thumbnail: {placed.pieces} stretches, "
+                    moved = (f"{placed.rows_moved} rows the repair put too high or low moved back, "
+                             if placed.rows_moved else "")
+                    first.append(f"pieces put back by the thumbnail: {moved}{placed.pieces} stretches, "
                                  f"{100 * placed.share:.0f} % of the photo (the repair had "
                                  f"{100 * placed.repair_share:.0f} %; {time.perf_counter() - t0:.1f} s)")
             burst = photos.burst_for(i, self.say) if "burst" in steps else None

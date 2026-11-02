@@ -44,6 +44,12 @@ AMBIGUOUS = 0.85  # the best place must beat the second best with the same marke
 BLOCK_OFF = 40.0  # a placed block whose colour is this far from the thumbnail's is left out
 MERGE_ERR = 12.0  # a block the repair decoded stays (no piece replaces it) when this close to the thumbnail
 KEEP_SHARE = 0.8  # the pieces must cover at least this share of what the repair decoded
+SHIFT_ROWS = True  # whole regions of rows the repair put 8, 16, 24... rows off are moved together
+SHIFT_MAX = 4  # by up to 4 x 8 block rows
+SHIFT_GAIN = 0.5  # a row's place must fit the thumbnail at least this much better than where it is
+SHIFT_CLEAR = 0.8  # and better than the next best place by this
+SHIFT_GAP = 12  # block rows: a row between two rows that moved alike moves alike, across up to this gap
+SHIFT_MARGIN = 3.0  # gray levels a row's best place must beat the others by (a flat row fits anywhere)
 RST = re.compile(rb"\xff[\xd0-\xd7]")
 
 
@@ -54,6 +60,7 @@ class Placed:
     pieces: int  # stretches placed
     share: float  # share of the photo the pieces cover
     repair_share: float  # share the repair's own decoded data covered
+    rows_moved: int = 0  # block rows of the repair moved as whole regions (row_shifts)
 
 
 def _segment(marker: int, payload: bytes) -> bytes:
@@ -148,6 +155,80 @@ def _means(img: np.ndarray, mw: int, mh: int, cols: int, rows: int) -> np.ndarra
     return pad.reshape(rows, mh, cols, mw, 3).mean(axis=(1, 3)).reshape(-1, 3)
 
 
+def row_shifts(pm: np.ndarray, rmg: np.ndarray, real: np.ndarray) -> np.ndarray:
+    """Per block row of the repair: by how many rows it is off from where the thumbnail
+    shows its content (a multiple of 8: the restart markers count 0..7), 0 when it is in
+    place or nothing says. pm, rmg: (rows, cols, 3) block colours of the repair and of the
+    thumbnail (NaN where it is no map); real: (rows, cols) blocks the repair decoded.
+    A dense rot makes the repair lose whole cycles of 8 intervals: then everything from
+    there on sits 8, 16 or 24 rows too high, a sky included, where no single row can tell
+    where it belongs. Rows that tell are decided; rows between two that moved alike move
+    alike; a lone decision is not followed."""
+    rows, cols = real.shape
+    valid = ~np.isnan(rmg[..., 0])
+    shift = np.zeros(rows, np.int64)
+    decided = np.zeros(rows, bool)
+    for r in range(rows):
+        if real[r].mean() < 0.5:
+            continue
+        errs = {}
+        for k in range(-SHIFT_MAX, SHIFT_MAX + 1):
+            t = r + 8 * k
+            if not 0 <= t < rows:
+                continue
+            ok = real[r] & valid[t]
+            if ok.sum() < 0.3 * cols:
+                continue
+            errs[8 * k] = float(np.abs(pm[r, ok] - rmg[t, ok]).mean())
+        if 0 not in errs or len(errs) < 2:
+            continue
+        order = sorted(errs, key=errs.get)
+        best, second = order[0], errs[order[1]]
+        if errs[best] > MAX_ERR or errs[best] > SHIFT_CLEAR * second or second - errs[best] < SHIFT_MARGIN:
+            continue
+        if best == 0 or (errs[best] <= SHIFT_GAIN * errs[0] and errs[0] - errs[best] >= SHIFT_MARGIN):
+            shift[r], decided[r] = best, True
+    # a lone row that moved, with no neighbour moving alike within the gap: not followed
+    idx = np.flatnonzero(decided)
+    for i, r in enumerate(idx):
+        if shift[r] == 0:
+            continue
+        near = [q for q in idx if q != r and abs(q - r) <= SHIFT_GAP and shift[q] == shift[r]]
+        if not near:
+            shift[r] = 0
+    # rows between two that moved alike
+    idx = np.flatnonzero(decided)
+    for a, b in zip(idx[:-1], idx[1:]):
+        if shift[a] != 0 and shift[a] == shift[b] and b - a <= SHIFT_GAP:
+            shift[a:b] = shift[a]
+    return shift
+
+
+def shift_regions(rep: np.ndarray, holes: np.ndarray, ref: np.ndarray, shift: np.ndarray, real: np.ndarray,
+                  mh: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """The repair with its block rows moved by `shift` (rows, multiples of 8): (rgb, holes,
+    rows moved). A row moves with its fill; the rows it leaves become holes (the enlarged
+    thumbnail there); a row in place that the thumbnail confirms is never overwritten."""
+    h = rep.shape[0]
+    rows = len(shift)
+    out, hol = rep.copy(), holes.copy()
+    moves = [(r, r + int(shift[r])) for r in range(rows) if shift[r] and 0 <= r + shift[r] < rows]
+    fixed = {r for r in range(rows) if shift[r] == 0 and real[r].mean() >= 0.5}
+    moves = [(r, t) for r, t in moves if t not in fixed]
+    if not moves:
+        return rep, holes, 0
+    for r, _t in moves:
+        y0, y1 = r * mh, min(h, (r + 1) * mh)
+        out[y0:y1], hol[y0:y1] = ref[y0:y1], True
+    for r, t in sorted(moves, key=lambda m: real[m[0]].mean()):  # the most decoded row wins a place
+        y0, y1, t0 = r * mh, min(h, (r + 1) * mh), t * mh
+        n = min(y1 - y0, h - t0)
+        if n <= 0:
+            continue
+        out[t0 : t0 + n], hol[t0 : t0 + n] = rep[y0 : y0 + n], holes[y0 : y0 + n]
+    return out, hol, len(moves)
+
+
 def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
            repaired_holes: np.ndarray | None = None, small_real: np.ndarray | None = None) -> Placed | None:
     """The pieces of `original` placed by the thumbnail `small` (RGB), or None when the
@@ -179,6 +260,19 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
             return None
         rm = np.where(valid[:, None], rm, np.nan)  # no map there: left out of every fit
     rm = np.concatenate([rm, np.repeat(rm[-1:], ri, axis=0)])  # the last interval may be short
+    rep_img, shifted = None, 0
+    if repaired_holes is not None:
+        rep_img = np.asarray(Image.open(io.BytesIO(repaired)).convert("RGB"))
+        if rep_img.shape[:2] != (h, w):
+            rep_img = None
+        elif SHIFT_ROWS and ri == cols:
+            real0 = _means(np.repeat((~repaired_holes)[..., None], 3, axis=2).astype(np.uint8) * 255,
+                           mw, mh, cols, rows)[:, 0] > 254
+            shift = row_shifts(_means(rep_img, mw, mh, cols, rows).reshape(rows, cols, 3),
+                               rm[:n].reshape(rows, cols, 3), real0.reshape(rows, cols))
+            if shift.any():
+                rep_img, repaired_holes, shifted = shift_regions(rep_img, repaired_holes, ref, shift,
+                                                                 real0.reshape(rows, cols), mh)
 
     marks = [(m.start(), original[m.start() + 1] - 0xD0) for m in RST.finditer(original)]
     if len(marks) < 4:
@@ -230,8 +324,8 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
     if repaired_holes is not None:
         # the repair's own decoded blocks that agree with the thumbnail stay where they are:
         # a piece goes only where the repair has nothing, or something that does not fit
-        rep_px = np.asarray(Image.open(io.BytesIO(repaired)).convert("RGB"))
-        if rep_px.shape[:2] == (h, w):
+        rep_px = rep_img
+        if rep_px is not None:
             real = _means(np.repeat((~repaired_holes)[..., None], 3, axis=2).astype(np.uint8) * 255,
                           mw, mh, cols, rows)[:, 0] > 254
             e_rep = np.abs(_means(rep_px, mw, mh, cols, rows) - rm[:n]).mean(axis=1)
@@ -335,7 +429,7 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
             moved.update(int(s) for s in run_idx)
             placed += 1
 
-    if not placed:
+    if not placed and not shifted:
         return None  # no piece found a better place than the repair gave it
     if rep_px is not None:
         # blocks the repair decoded that neither fit the thumbnail well nor were replaced: kept
@@ -359,11 +453,11 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
             rmask &= valid
             e_rep = np.abs(_means(rep_px, mw, mh, cols, rows) - rm[:n])[rmask].mean() if rmask.any() else np.inf
             e_new = np.abs(_means(canvas[:h, :w], mw, mh, cols, rows) - rm[:n])[have & valid].mean()
-            if e_new > e_rep * 1.05 and share < 1.2 * repair_share:
+            if e_new > e_rep * 1.05 and share < 1.2 * repair_share and not shifted:
                 return None  # the repair's own placement agrees with the thumbnail as well
     holes = ~np.repeat(np.repeat(have.reshape(rows, cols), mh, 0), mw, 1)[:h, :w]
     base = ref
     if small_real is not None and rep_px is not None:
         base = rep_px  # a rescued thumbnail's colours are not trusted in the holes: the repair's fill
     rgb = np.where(holes[..., None], base, canvas[:h, :w]).astype(np.uint8)
-    return Placed(rgb, holes, placed, share, repair_share)
+    return Placed(rgb, holes, placed, share, repair_share, shifted)
