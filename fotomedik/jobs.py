@@ -78,6 +78,37 @@ def _inside(p: Path, folder: Path) -> bool:
     return p == folder or p.is_relative_to(folder)
 
 
+def look_at_folder(source: str, photos: bool = False) -> dict:
+    """The overview of a folder (see overview.py) as plain data for Claude."""
+    from .ai.cuda import nvidia_present
+    from .cli import _iter_files
+    from .overview import overview
+
+    src = _full(source)
+    if not src.is_dir():
+        raise JobError(f"the source folder does not exist: {src}")
+    files = list(_iter_files(src))
+    ov = overview(files)
+    gpu = nvidia_present()
+    preset, why = ov.suggest(gpu)
+    d = ov.damaged
+    out = {"photos": len(ov.photos), "damaged": len(d),
+           "damaged_header": sum(1 for p in d if p.state == "header"),
+           "thumbnail_whole": sum(1 for p in d if p.thumb == "whole"),
+           "thumbnail_part": sum(1 for p in d if p.thumb == "part"),
+           "thumbnail_none": sum(1 for p in d if p.thumb == "none"),
+           "with_faces": sum(1 for p in d if p.faces), "burst_groups": ov.bursts(),
+           "unreadable": sum(1 for p in ov.photos if p.state == "unreadable"),
+           "suggested_preset": preset, "suggested_steps": {"faithful": "", "standard": DEFAULT_STEPS,
+                                                            "maximum": "puzzle,burst,deblock,diffusion,faces"}[preset],
+           "why": why, "nvidia_driver": gpu}
+    if photos:
+        out["list"] = [{"photo": p.name, "state": p.state, "decodes": None if p.recovered is None else round(p.recovered, 3),
+                        "thumbnail": p.thumb, "thumbnail_real": round(p.thumb_real, 2), "faces": p.faces,
+                        "size": f"{p.width}x{p.height}" if p.width else None} for p in ov.photos]
+    return out
+
+
 def check_paths(source: str, output: str, protected: list[str] | None = None) -> tuple[Path, Path]:
     """(source, output) as absolute paths, or JobError when the job could harm a file."""
     if not str(source).strip() or not str(output).strip():

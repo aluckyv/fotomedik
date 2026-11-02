@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 147.
+Last update: 2026-11-02, build 148.
 
 ## How the work is done
 
@@ -221,6 +221,16 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   panel, where the step checkboxes, the enlarger, the diffusion preset and scene, and the
   repair's options - magenta marks, reports, colours from similar shots - live). A step ticked
   by hand turns the preset into whatever matches, else Custom (`gui/app.py PRESETS`).
+- The quick look (`overview.py`, build 148): before the repair, the chosen photos are looked at
+  in the background (the set's headers learnt as in the repair, then the decoder's first pass
+  and the thumbnail of each photo, whole / partly rescued / none, faces looked for on the
+  thumbnail enlarged, the time taken): one line under the inputs says what the folder holds and
+  which preset fits (`Overview.suggest`: Faithful when nothing is damaged, else Standard; faces
+  and a graphics card are mentioned for Maximum). The preset follows the suggestion until the
+  person picks one by hand. Also `fotomedik overview FOLDER [--photos]` and the MCP tool
+  `look_at_folder` (Claude sees the same numbers before starting a job). Synthetic files: a
+  colour photo without a thumbnail got a thumbnail "rescued" from its own scan (Pillow's tables
+  match the set's thumbnails); real cameras' did not (Sarimsakli: 13 of 38 came out "none").
 - At start the packaged window brings an installed extension up to date on its own
   (`claude_connect.connect(quiet=True)`, build 147): nothing is asked, written or shown when
   FotoMedik is not in Claude yet. Program > Check for updates asks GitHub on demand.
@@ -301,9 +311,7 @@ owner's card). The GitHub export workflow dies on memory; `scripts/export_sdxl.b
 on the owner's computer.
 
 Tidying the program (owner's plan, 2026-11-02, in this order): 4. connect to Claude at start
-(build 147), 1. menu and presets (147), 2. a quick scan of the folder before the repair that
-says what kind of damage it holds (whole, rescued or no thumbnail, faces, similar shots, size)
-and proposes the preset, 3. after a result: redo one photo's enhanced copy with other steps and
+(build 147), 1. menu and presets (147), 2. the quick look before the repair (148), 3. after a result: redo one photo's enhanced copy with other steps and
 compare. Then faces: GFPGAN alone helps little (sharper eyes on fair faces, the worst faces
 left alone by `agrees`, three non-faces touched); next is recognition of the owner's people
 across photos (ArcFace) plus a face network fine-tuned on them, as a night job on his card.

@@ -83,6 +83,17 @@ TOOLS = [
             "install": {"type": "boolean", "description": "download and put it in (default true)", "default": True}}},
     },
     {
+        "name": "look_at_folder",
+        "description": ("A quick look at a folder before a job (nothing written, a few seconds): how many photos "
+                        "are damaged, how many have a whole, a partly rescued or no thumbnail, faces, similar "
+                        "shots, and which quality preset fits (faithful: repair only; standard: "
+                        f"{jobs.DEFAULT_STEPS}; maximum: adds diffusion and faces)."),
+        "inputSchema": {"type": "object", "properties": {
+            "source": {"type": "string", "description": "folder with the damaged photos (only read)"},
+            "photos": {"type": "boolean", "description": "also list every photo's facts (default false)",
+                       "default": False}}, "required": ["source"]},
+    },
+    {
         "name": "app_info",
         "description": ("The FotoMedik build, where it keeps its files, the AI models and runtimes it has, "
                         "whether an NVIDIA driver is present, the protected places, and whether a job runs."),
@@ -146,8 +157,12 @@ def app_info() -> dict:
     }
 
 
+def look_at_folder(source: str, photos: bool = False) -> dict:
+    return jobs.look_at_folder(source, bool(photos))
+
+
 HANDLERS = {"start_job": start_job, "job_status": job_status, "list_jobs": list_jobs, "stop_job": stop_job,
-            "update_app": update_app, "app_info": app_info}
+            "update_app": update_app, "app_info": app_info, "look_at_folder": look_at_folder}
 
 
 def call_tool(name: str, args: dict) -> dict:

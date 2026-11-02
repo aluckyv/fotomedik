@@ -58,9 +58,10 @@ PROGRESS_EVERY = 1.0  # seconds between progress lines of a slow step
 RESTARTS = 3  # times the enhanced copies start again after an unexpected error
 
 
-def enhanced_name(output_name: str) -> str:
-    """'sub/x.jpg' -> 'sub/x_enhanced.jpg' (separators kept as given)."""
-    return os.path.splitext(output_name)[0] + "_enhanced.jpg"
+def enhanced_name(output_name: str, suffix: str = "") -> str:
+    """'sub/x.jpg' -> 'sub/x_enhanced.jpg' (separators kept as given); with a suffix, another
+    try at the same photo: 'sub/x_enhanced_2.jpg'."""
+    return os.path.splitext(output_name)[0] + "_enhanced" + suffix + ".jpg"
 
 
 ai_name = enhanced_name  # older name
@@ -202,10 +203,11 @@ class Enhancer:
 
     def __init__(self, sources, out: Path, steps, say=None, stop=None, on_done=None, engine=None,
                  quality: str | None = None, half: bool = True, prompt: str | None = None,
-                 enlarger: str | None = None, skip=None):
+                 enlarger: str | None = None, skip=None, suffix: str = ""):
         self.sources = list(sources)
         self.skip = set(skip or ())  # photos that only lend their pixels (their copy exists already)
         self.enlarger = enlarger
+        self.suffix = suffix  # another try at a photo: its copy gets this after "_enhanced"
         self.out = out
         user_say = say or (lambda s: None)
 
@@ -451,7 +453,7 @@ class Enhancer:
                 self.say(engine.notes.pop(0))
         if not done:
             return
-        out_name = enhanced_name(rep.output_name)
+        out_name = enhanced_name(rep.output_name, self.suffix)
         (self.out / out_name).write_bytes(save_jpeg(new, exif))
         rep.ai_output = out_name
         rep.enhanced = done

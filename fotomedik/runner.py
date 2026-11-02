@@ -243,7 +243,7 @@ def run(paths: list[Path], out: Path, options: dict | None = None, jobs: int = 0
 
         enhancer = Enhancer([p for p, _rel, _o in items], out, steps, on_ai_status or say, stop,
                             on_done=copy_made, quality=options.get("quality"), prompt=options.get("prompt"),
-                            enlarger=options.get("enlarger"))
+                            enlarger=options.get("enlarger"), suffix=options.get("ai_suffix") or "")
         enhancer.start()
     with Workers(jobs, len(items)) as workers:
         if len(files) > 1:

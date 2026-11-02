@@ -114,7 +114,7 @@ def test_server_speaks_mcp_over_stdio(home, photos, tmp_path):
     assert init["protocolVersion"] == "2025-06-18" and init["serverInfo"]["name"] == "fotomedik"
     assert "tools" in init["capabilities"]
     names = {t["name"] for t in replies[2]["result"]["tools"]}
-    assert names == {"start_job", "job_status", "list_jobs", "stop_job", "update_app", "app_info"}
+    assert names == {"start_job", "job_status", "list_jobs", "stop_job", "update_app", "app_info", "look_at_folder"}
     for t in replies[2]["result"]["tools"]:
         assert t["inputSchema"]["type"] == "object" and t["description"]
     info = replies[3]["result"]

@@ -9,7 +9,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -273,7 +274,19 @@ class MainWindow(QMainWindow):
         b.clicked.connect(self._pick_references)
         row3.addWidget(b)
         dl.addLayout(row3)
+        self.ovlabel = QLabel("")  # the quick look at the chosen photos (overview.py)
+        self.ovlabel.setObjectName("hint")
+        self.ovlabel.setWordWrap(True)
+        self.ovlabel.hide()
+        dl.addWidget(self.ovlabel)
         outer.addWidget(drop)
+        self._ov_timer = QTimer(self)
+        self._ov_timer.setSingleShot(True)
+        self._ov_timer.setInterval(700)
+        self._ov_timer.timeout.connect(self._look)
+        self._ov_n = 0  # the look that is wanted; older ones that come back are dropped
+        self._preset_by_hand = False
+        self.inp.textChanged.connect(lambda _t: self._ov_timer.start())
 
         # ---- actions
         act = QHBoxLayout()
@@ -465,6 +478,11 @@ class MainWindow(QMainWindow):
         self.refb.setEnabled(False)
         self.refb.clicked.connect(self._with_reference)
         tools.addWidget(self.refb)
+        self.againb = QPushButton("Enhance again…")
+        self.againb.setToolTip("Another enhanced copy of this photo with other steps (faces, diffusion, the\n"
+                               "photo's own texture...). The first copy stays; the new one gets its own row.")
+        self.againb.setEnabled(False)
+        self.againb.clicked.connect(self._enhance_again)
         self.cmpb = QPushButton("Compare with the original…")
         self.cmpb.setToolTip("Have an intact copy of this photo (another backup, an edited copy)?\n"
                              "Measures the repair against it: which decoded parts are right, how far the\n"
@@ -472,6 +490,7 @@ class MainWindow(QMainWindow):
         self.cmpb.setEnabled(False)
         self.cmpb.clicked.connect(self._compare)
         tools.addWidget(self.stepsb)
+        tools.addWidget(self.againb)
         tools.addWidget(self.handb)
         tools.addWidget(self.cmpb)
         tools.addStretch(1)
@@ -533,6 +552,8 @@ class MainWindow(QMainWindow):
 
     def _preset_picked(self, _i: int) -> None:
         key = self.preset.currentData()
+        if not self._applying:
+            self._preset_by_hand = True  # the quick look no longer changes it
         if key == "custom":
             self.advb.setChecked(True)
         else:
@@ -554,6 +575,59 @@ class MainWindow(QMainWindow):
                 self.preset.setCurrentIndex(list(PRESETS).index(key))
             finally:
                 self._applying = False
+
+    # ------------------------------------------------------------------ the quick look
+    def _look(self) -> None:
+        """What kind of damage the chosen photos hold, in the background; the preset follows
+        the suggestion until the person picks one by hand."""
+        paths = [p for p in self._paths() if p.exists()]
+        self._ov_n += 1
+        n = self._ov_n
+        if not paths:
+            self.ovlabel.hide()
+            return
+        self.ovlabel.setText("Looking at the photos…")
+        self.ovlabel.show()
+
+        class Done(QObject):
+            done = Signal(int, object, str)
+
+        self._ov_done = getattr(self, "_ov_done", None) or Done()
+        try:
+            self._ov_done.done.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self._ov_done.done.connect(self._looked)
+        sig = self._ov_done
+
+        def work():
+            try:
+                from ..ai.cuda import nvidia_present
+                from ..overview import overview
+
+                files = runner.collect(paths, Path("/nonexistent-output"))
+                ov = overview(files)
+                sig.done.emit(n, ov, ov.text(nvidia_present()))
+            except Exception as e:  # noqa: BLE001
+                sig.done.emit(n, None, f"The photos could not be looked at: {type(e).__name__}: {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _looked(self, n: int, ov, text: str) -> None:
+        if n != self._ov_n:
+            return  # the photos changed since
+        self.ovlabel.setText(text)
+        if ov is not None and not self._preset_by_hand:
+            from ..ai.cuda import nvidia_present
+
+            key, _why = ov.suggest(nvidia_present())
+            if self.preset.currentData() != key:
+                self._applying = True
+                try:
+                    self.preset.setCurrentIndex(list(PRESETS).index(key))
+                    self._apply_preset(key)
+                finally:
+                    self._applying = False
 
     def _show_advanced(self, on: bool) -> None:
         self.adv.setVisible(on)
@@ -699,6 +773,9 @@ class MainWindow(QMainWindow):
         self.stat.setText(f"{len(self.results)} / {self.total} photos")
         if rep.reference:
             items[0].setText(f"{r.source.name}  (ref: {rep.reference})")
+        suffix = (r.options or {}).get("ai_suffix")
+        if suffix:  # another try at the same photo: say which steps
+            items[0].setText(f"{r.source.name}  (again{suffix}: {', '.join(r.options.get('enhance') or []) or 'repair only'})")
         if len(self.results) == 1:
             self.table.selectRow(0)
 
@@ -719,6 +796,7 @@ class MainWindow(QMainWindow):
         self.stopb.setEnabled(False)
         sel = getattr(self, "selected", None)
         self.refb.setEnabled(sel is not None and not sel.report.reference)
+        self.againb.setEnabled(sel is not None and sel.output is not None and bool(sel.report.holes))
         n = len(self.results)
         if err:
             self.stat.setText("Stopped by an error.")
@@ -748,7 +826,10 @@ class MainWindow(QMainWindow):
         self.handb.setEnabled(r.output is not None)
         self.cmpb.setEnabled(r.output is not None)
         self.refb.setEnabled(self.go.isEnabled() and not r.report.reference)
+        self.againb.setEnabled(self.go.isEnabled() and r.output is not None and bool(r.report.holes))
         self.stepsb.setEnabled(True)
+        steps = (r.options or {}).get("enhance") or []
+        self.aibox.cap.setText("Enhanced copy" + (" — " + ", ".join(steps) if steps else ""))
         self.before.show_image(load_preview(r.source), "Does not open in a normal viewer")
         self.after.show_image(load_preview(r.output) if r.output else None, "Nothing could be saved")
         if self.aibox.isVisible():
@@ -803,6 +884,18 @@ class MainWindow(QMainWindow):
             if k in r.options:
                 options[k] = r.options[k]
         self._launch([r.source], r.output.parent if r.output else self.out_dir, options, len(self.results) + 1)
+
+    def _enhance_again(self) -> None:
+        r = getattr(self, "selected", None)
+        if r is None or r.output is None or not self.go.isEnabled():
+            return
+        from .again_dialog import AgainDialog
+
+        dlg = AgainDialog(self, r)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dlg.options()
+        self._launch([r.source], r.output.parent, options, len(self.results) + 1)
 
     def _compare(self) -> None:
         r = getattr(self, "selected", None)

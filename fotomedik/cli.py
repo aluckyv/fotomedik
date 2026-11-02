@@ -347,6 +347,25 @@ def compare(repaired: Path, truth: Path, picture: Path | None, runs: bool):
         click.echo(f"picture: {picture}")
 
 
+@main.command("overview")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option("--photos", is_flag=True, help="also list every photo's facts")
+def overview_cmd(path: Path, photos: bool):
+    """A quick look at a folder: what kind of damage it holds and which preset fits."""
+    from .ai.cuda import nvidia_present
+    from .overview import overview
+
+    files = list(_iter_files(path))
+    ov = overview(files, say=lambda t: click.echo(t, err=True))
+    click.echo(ov.text(nvidia_present()))
+    if photos:
+        for p in ov.photos:
+            dec = "" if p.recovered is None else f" {100 * p.recovered:.0f} % decodes"
+            click.echo(f"  {p.name}: {p.state}{dec}, thumbnail {p.thumb}"
+                       + (f" ({100 * p.thumb_real:.0f} % real)" if p.thumb == "part" else "")
+                       + (f", {p.faces} face(s)" if p.faces else ""))
+
+
 @main.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
