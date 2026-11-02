@@ -28,9 +28,10 @@ jobs:
       - name: Install
         run: |
           # torch and torchvision from the same CPU index, pinned together: a torchvision from PyPI
-          # (pulled in by optimum[exporters]) fails with "operator torchvision::nms does not exist"
+          # (pulled in by optimum[exporters]) fails with "operator torchvision::nms does not exist".
+          # numpy 1.x: ONNX Runtime 1.20's UNet attention fusion fails on numpy 2 (int() of a 1-d array)
           pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install "torch==2.5.1" "torchvision==0.20.1" "diffusers==0.31.0" "transformers==4.46.3" "optimum[exporters]==1.23.3" "onnx==1.17.0" "onnxruntime==1.20.1" onnxconverter-common accelerate safetensors
+          pip install "numpy==1.26.4" "torch==2.5.1" "torchvision==0.20.1" "diffusers==0.31.0" "transformers==4.46.3" "optimum[exporters]==1.23.3" "onnx==1.17.0" "onnxruntime==1.20.1" onnxconverter-common accelerate safetensors
       - name: Export (fp32)
         run: |
           set -o pipefail
