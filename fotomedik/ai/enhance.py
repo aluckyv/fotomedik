@@ -194,6 +194,7 @@ class Engine:
 
         def make(path):
             so = ort.SessionOptions()
+            so.log_severity_level = 3  # errors only: its warnings (UTF-16 on Windows) garbled the job logs
             if "DmlExecutionProvider" in providers:  # DirectML wants these off
                 so.enable_mem_pattern = False
                 so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
