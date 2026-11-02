@@ -970,6 +970,65 @@ def destripe(arr: np.ndarray, thumb: np.ndarray | None = None,
     return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(bad.sum())
 
 
+ROWS_RESCUED = False  # experiment: rows a shade off evened against a rescued thumbnail's real part
+ROWS_NEIGHBOURS = False  # experiment: rows a shade off evened against the rows above and below
+ROW_OFF = 6.0  # gray levels a run of blocks must stray to be evened (destripe asks for 14)
+ROW_AGREE = 3.0  # the rows above and below must agree this well (neighbour mode)
+ROW_RUN = 4  # blocks in a row a run needs
+ROW_FLAT = 6.0  # luma spread inside a block below which it is flat
+
+
+def even_rows(arr: np.ndarray, ref: np.ndarray | None = None,
+              ref_real: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+    """Short rows of blocks a shade too bright or dark on a flat surface (a sky): decoded runs
+    of a rotted level the repair kept, too faint for `destripe`. With `ref` (a thumbnail
+    rescued in part, `ref_real` where it is real) a run moves to the reference's colour,
+    allowing for its own colour offset around; without one, to the rows right above and below
+    when those agree with each other. Returns (rgb, blocks evened)."""
+    from ..recipes.r12_smooth import surface
+    from .patchfill import box_blur
+
+    h, w = arr.shape[:2]
+    bh, bw = h // 8, w // 8
+    if bh < 8 or bw < 8:
+        return arr, 0
+    a = arr[: bh * 8, : bw * 8].astype(np.float32)
+    m = a.reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    luma = a @ np.array([0.299, 0.587, 0.114], np.float32)
+    flat = luma.reshape(bh, 8, bw, 8).std(axis=(1, 3)) < ROW_FLAT
+    if ref is not None:
+        if ref.shape[:2] != arr.shape[:2]:
+            return arr, 0
+        t = ref[: bh * 8, : bw * 8].astype(np.float32).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+        known = np.ones((bh, bw), bool)
+        if ref_real is not None and ref_real.shape[:2] == arr.shape[:2]:
+            known = ref_real[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).mean(axis=(1, 3)) > 0.99
+        d = m - t
+        wgt = (flat & known & (np.abs(d).max(axis=-1) < 4 * ROW_OFF)).astype(np.float32)
+        r = STRIPE_BIAS // 2
+        den = box_blur(wgt[..., None], r)
+        target = t + box_blur(d * wgt[..., None], r) / np.maximum(den, 1e-6)
+        valid = flat & known & (den[..., 0] > 1e-6)
+    else:
+        up, dn = np.empty_like(m), np.empty_like(m)
+        up[1:], up[0] = m[:-1], m[0]
+        dn[:-1], dn[-1] = m[1:], m[-1]
+        fu, fd = np.zeros_like(flat), np.zeros_like(flat)
+        fu[1:], fd[:-1] = flat[:-1], flat[1:]
+        target = (up + dn) / 2
+        valid = flat & fu & fd & (np.abs(up - dn).max(axis=-1) < ROW_AGREE)
+    off = np.abs(m - target).max(axis=-1)
+    cand = valid & (off > ROW_OFF) & (off < 4 * ROW_OFF)
+    bad = _runs(cand, ROW_RUN, 1)
+    if not bad.any():
+        return arr, 0
+    corr_b = np.where(bad[..., None], target - m, 0.0)
+    corr = np.stack([surface(corr_b[..., c]) for c in range(3)], axis=-1)
+    out = arr.astype(np.float32)
+    out[: bh * 8, : bw * 8] += corr[: bh * 8, : bw * 8]
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(bad.sum())
+
+
 def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray,
                      spread: bool = False) -> np.ndarray:
     """Give every 8x8 block of `out` the average it has in `ref` where `known`, through
@@ -995,6 +1054,7 @@ def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known:
 
 
 DEBLOCK_TILE = 512
+DEBLOCK_HOLES_WITHOUT_THUMB = False  # the hole map for the network without a thumbnail (before build 134)
 DEBLOCK_PAD = 16
 
 
@@ -1050,7 +1110,7 @@ def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: di
         # without the thumbnail the network is not told where the holes are: it only cleans what
         # the repair and the jigsaw put there (a rescued thumbnail's colours) instead of guessing
         # grey and brown bands into a sky that LaMa then kept (100_0223)
-        if g is not None and holes is not None and holes.any():
+        if (g is not None or DEBLOCK_HOLES_WITHOUT_THUMB) and holes is not None and holes.any():
             hm = holes[: h // 8 * 8, : w // 8 * 8]
             hb = hm.reshape(h // 8, 8, w // 8, 8).any(axis=(1, 3)).astype(np.float32)
         hb = np.pad(hb, ((p // 8, (p + T) // 8 + 2), (p // 8, (p + T) // 8 + 2)), mode="edge")
@@ -1338,6 +1398,13 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         arr, n_even = destripe(arr, ref, ref_real)
         if n_even:
             done.append(f"{n_even} block(s) of bands and lines on flat surfaces evened out ({_took(t0)})")
+        n_rows = 0
+        if thumb is None and ROWS_RESCUED and ref is not None:
+            arr, n_rows = even_rows(arr, ref, ref_real)
+        elif thumb is None and ROWS_NEIGHBOURS:
+            arr, n_rows = even_rows(arr)
+        if n_rows:
+                done.append(f"{n_rows} block(s) of faint rows on flat surfaces evened out")
     if "faces" in steps and engine.face_s is not None:
         from .faces import restore_faces
 
