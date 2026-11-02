@@ -431,10 +431,11 @@ def _tail(path: Path, lines: int) -> list[str]:
             fh.seek(0, 2)
             size = fh.tell()
             fh.seek(max(0, size - 64 * 1024))
-            text = fh.read().decode("utf-8", "replace")
+            text = fh.read().decode("utf-8", "replace").replace("\x00", "")  # UTF-16 bits of onnxruntime
     except OSError:
         return []
-    return [ln.rstrip() for ln in text.splitlines() if ln.strip()][-lines:]
+    keep = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    return [ln for ln in keep if "onnxruntime" not in ln and "[W:" not in ln][-lines:]
 
 
 def _since(ts: str | None) -> float:

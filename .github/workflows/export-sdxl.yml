@@ -1,0 +1,81 @@
+name: export-sdxl
+
+# Exports the SDXL inpainting model (diffusers/stable-diffusion-xl-1.0-inpainting-0.1,
+# CreativeML Open RAIL++-M) to ONNX in fp16 for FotoMedik's diffusion step, and puts it on
+# the "models-sdxl" release, the large files cut into parts under GitHub's 2 GB limit.
+# Started by hand; a CPU runner with swap does the export.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - name: Room on disk and in memory
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo swapoff -a || true
+          sudo fallocate -l 28G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          free -g; df -h / /mnt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "diffusers==0.31.0" "transformers==4.46.3" "optimum[exporters]==1.23.3" "onnx==1.17.0" "onnxruntime==1.20.1" onnxconverter-common accelerate safetensors
+      - name: Export (fp32)
+        run: |
+          cd /mnt && sudo chown -R "$USER" /mnt
+          optimum-cli export onnx --model diffusers/stable-diffusion-xl-1.0-inpainting-0.1 \
+            --task inpainting --no-post-process /mnt/sdxl32 2>&1 | tail -40
+          du -sh /mnt/sdxl32/*
+      - name: fp16
+        run: |
+          python - <<'EOF'
+          import os, onnx
+          from onnxconverter_common import float16
+          src, dst = "/mnt/sdxl32", "/mnt/sdxl16"
+          for part in sorted(os.listdir(src)):
+              p = os.path.join(src, part, "model.onnx")
+              if not os.path.exists(p):
+                  continue
+              os.makedirs(os.path.join(dst, part), exist_ok=True)
+              m = onnx.load(p)
+              m16 = float16.convert_float_to_float16(m, keep_io_types=True, disable_shape_infer=True)
+              out = os.path.join(dst, part, "model.onnx")
+              onnx.save(m16, out, save_as_external_data=True, all_tensors_to_one_file=True, location="model.onnx_data")
+              del m, m16
+              print(part, "done", flush=True)
+          EOF
+          du -sh /mnt/sdxl16/*
+      - name: Check
+        run: |
+          python - <<'EOF'
+          import onnxruntime as ort, glob
+          for f in sorted(glob.glob("/mnt/sdxl16/*/model.onnx")):
+              s = ort.InferenceSession(f, providers=["CPUExecutionProvider"])
+              print(f, [(i.name, i.shape, i.type) for i in s.get_inputs()])
+          EOF
+      - name: Cut into parts and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd /mnt/sdxl16
+          mkdir -p /mnt/up
+          for part in *; do
+            [ -d "$part" ] || continue
+            tar -cf "/mnt/up/sdxl-inpaint-$part.tar" -C "$part" .
+          done
+          cd /mnt/up
+          for f in *.tar; do split -b 1900M -d -a 2 "$f" "$f.part"; rm "$f"; done
+          sha256sum * > SHA256SUMS
+          ls -la
+          gh release view models-sdxl >/dev/null 2>&1 || gh release create models-sdxl --title "SDXL inpainting (ONNX fp16)" \
+            --notes "diffusers/stable-diffusion-xl-1.0-inpainting-0.1 exported to ONNX fp16 by the export-sdxl workflow. Licence: CreativeML Open RAIL++-M (its use restrictions apply and pass on). Parts: cat sdxl-inpaint-<part>.tar.part* > <part>.tar"
+          gh release upload models-sdxl * --clobber
