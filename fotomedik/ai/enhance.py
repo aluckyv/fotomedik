@@ -976,13 +976,14 @@ ROW_RUN = 4  # blocks in a row a run needs
 ROW_FLAT = 6.0  # luma spread inside a block below which it is flat
 
 
-def even_rows(arr: np.ndarray, ref: np.ndarray | None = None,
-              ref_real: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+def even_rows(arr: np.ndarray, ref: np.ndarray | None = None, ref_real: np.ndarray | None = None,
+              avoid: np.ndarray | None = None) -> tuple[np.ndarray, int]:
     """Short rows of blocks a shade too bright or dark on a flat surface (a sky): decoded runs
     of a rotted level the repair kept, too faint for `destripe`. With `ref` (a thumbnail
     rescued in part, `ref_real` where it is real) a run moves to the reference's colour,
     allowing for its own colour offset around; without one, to the rows right above and below
-    when those agree with each other. Returns (rgb, blocks evened)."""
+    when those agree with each other. `avoid` (faces, skin): blocks touching it are never
+    moved (a face is flat enough to pass for sky; 100_0223 went dark). Returns (rgb, blocks evened)."""
     from ..recipes.r12_smooth import surface
     from .patchfill import box_blur
 
@@ -994,6 +995,8 @@ def even_rows(arr: np.ndarray, ref: np.ndarray | None = None,
     m = a.reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
     luma = a @ np.array([0.299, 0.587, 0.114], np.float32)
     flat = luma.reshape(bh, 8, bw, 8).std(axis=(1, 3)) < ROW_FLAT
+    if avoid is not None and avoid.shape[:2] == arr.shape[:2]:
+        flat &= ~avoid[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).any(axis=(1, 3))
     if ref is not None:
         if ref.shape[:2] != arr.shape[:2]:
             return arr, 0
@@ -1401,10 +1404,15 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         if n_even:
             done.append(f"{n_even} block(s) of bands and lines on flat surfaces evened out ({_took(t0)})")
         n_rows = 0
-        if thumb is None and "rows" in steps and ref is not None:
-            arr, n_rows = even_rows(arr, ref, ref_real)
-        elif thumb is None and "rowsnear" in steps:
-            arr, n_rows = even_rows(arr)
+        if thumb is None and ("rows" in steps and ref is not None or "rowsnear" in steps):
+            from .guard import face_mask
+            from .patchfill import skin
+
+            people = face_mask(arr, engine.face_det) | skin(arr)
+            if "rows" in steps and ref is not None:
+                arr, n_rows = even_rows(arr, ref, ref_real, people)
+            else:
+                arr, n_rows = even_rows(arr, avoid=people)
         if n_rows:
                 done.append(f"{n_rows} block(s) of faint rows on flat surfaces evened out")
     if "faces" in steps and engine.face_s is not None:
