@@ -349,3 +349,19 @@ def test_bridge_thin_runs_what_crosses_a_thin_gap_on_through_it():
     wide[10:60] = True  # too tall to bridge
     _, n = bridge_thin(arr, wide, real)
     assert n == 0
+
+
+def test_seam_guard_keeps_the_earlier_fill_where_the_new_one_fits_worse():
+    from fotomedik.ai.enhance import seam_guard
+
+    real = np.full((64, 64, 3), 150, np.uint8)
+    holes = np.zeros((64, 64), bool)
+    holes[24:32, 8:56] = True
+    old = real.copy()  # the repair bridged it smoothly
+    new = real.copy()
+    new[24:32, 8:32] = 60  # the new fill put a dark bar in half of it
+    out, kept = seam_guard(new, old, holes, real)
+    assert kept == 6 and (out[24:32, 8:56] == 150).all()
+    better = real.copy()
+    out, kept = seam_guard(better, old, holes, real)
+    assert kept == 0

@@ -735,6 +735,59 @@ def bridge_thin(arr: np.ndarray, holes: np.ndarray, real: np.ndarray, most: int 
     return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(thin.sum())
 
 
+SEAM_GUARD = True  # a hole keeps its earlier fill where the new one meets the real picture worse
+SEAM_PREF = 0.75  # the earlier fill wins when its seam error is below this share of the new one's
+SEAM_MIN = 4.0  # and lower by at least this many gray levels
+
+
+def seam_guard(new: np.ndarray, old: np.ndarray, holes: np.ndarray, real: np.ndarray) -> tuple[np.ndarray, int]:
+    """Never worse at the seams than before: for every run of hole blocks (8x8) along a
+    row, the colour step to the real rows right above and below is measured for the new
+    fill and for the fill the photo came with (the repair's smooth surface, or the jigsaw's
+    thumbnail); where the old one fits clearly better, it stays. A fill guessed from the
+    thumbnail can put a dark bar across a dress the repair had bridged smoothly (100_0239).
+    Returns (rgb, blocks kept from before)."""
+    h, w = holes.shape
+    bh, bw = h // 8, w // 8
+    if bh < 3 or bw < 1 or not holes.any():
+        return new, 0
+    hb = holes[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).mean(axis=(1, 3)) > 0.5
+    n_f, o_f, r_f = new.astype(np.float32), old.astype(np.float32), real.astype(np.float32)
+    out = new.copy()
+    kept = 0
+    for by in range(bh):
+        row = hb[by]
+        if not row.any():
+            continue
+        x = 0
+        while x < bw:
+            if not row[x]:
+                x += 1
+                continue
+            e = x
+            while e < bw and row[e]:
+                e += 1
+            xs = slice(x * 8, e * 8)
+            en, eo, cnt = 0.0, 0.0, 0
+            if by > 0 and not hb[by - 1, x:e].any():
+                ref = r_f[by * 8 - 1, xs]
+                en += float(np.abs(n_f[by * 8, xs] - ref).mean())
+                eo += float(np.abs(o_f[by * 8, xs] - ref).mean())
+                cnt += 1
+            if by < bh - 1 and not hb[by + 1, x:e].any():
+                ref = r_f[by * 8 + 8, xs]
+                en += float(np.abs(n_f[by * 8 + 7, xs] - ref).mean())
+                eo += float(np.abs(o_f[by * 8 + 7, xs] - ref).mean())
+                cnt += 1
+            if cnt and eo < SEAM_PREF * en and en - eo > SEAM_MIN * cnt:
+                ys = slice(by * 8, by * 8 + 8)
+                m = holes[ys, xs]
+                out[ys, xs][m] = old[ys, xs][m]
+                kept += e - x
+            x = e
+    return out, kept
+
+
 def blend_seams(out: np.ndarray, holes: np.ndarray, real: np.ndarray) -> np.ndarray:
     """Lift the filled holes onto the real picture around them. At every border the colour
     step is measured (the real pixels just outside minus the filled ones just inside, two
@@ -1061,6 +1114,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
     steps = set(steps)
     done: list[str] = []
     real = arr.copy()
+    came = arr.copy()  # the photo as it came (its holes filled by the repair or the jigsaw): see seam_guard
     unknown = unknown & holes
 
     def report(what):
@@ -1208,6 +1262,10 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             arr = blend_seams(arr, holes, real)
         arr = np.where(holes[..., None], arr, real)
     _check(stop)
+    if SEAM_GUARD and holes.any():
+        arr, n_kept = seam_guard(arr, came, holes, real)
+        if n_kept:
+            done.append(f"{n_kept} hole block(s) kept their earlier fill (it met the picture better)")
     if ("patch" in steps or (TEXTURE_WITH_FILL and steps & {"thumbsr", "ai", "diffusion"})) and holes.any():
         from .guard import date_stamp, face_mask
         from .patchfill import texture_holes
