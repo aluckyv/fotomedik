@@ -970,6 +970,9 @@ def destripe(arr: np.ndarray, thumb: np.ndarray | None = None,
     return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(bad.sum())
 
 
+# On by default since build 139 (the owner's choice after the graphics card comparison); the
+# "rows" step name is still accepted.
+EVEN_ROWS = True
 ROW_OFF = 6.0  # gray levels a run of blocks must stray to be evened (destripe asks for 14)
 ROW_RUN = 4  # blocks in a row a run needs
 ROW_FLAT = 6.0  # luma spread inside a block below which it is flat
@@ -1407,7 +1410,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         if n_even:
             done.append(f"{n_even} block(s) of bands and lines on flat surfaces evened out ({_took(t0)})")
         n_rows = 0
-        if thumb is None and "rows" in steps and ref is not None:
+        if thumb is None and (EVEN_ROWS or "rows" in steps) and ref is not None:
             from .guard import face_mask
             from .patchfill import skin
 

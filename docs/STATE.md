@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 137.
+Last update: 2026-11-02, build 139.
 
 ## How the work is done
 
@@ -125,6 +125,10 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
     the reference spreads 6..14 levels over 5x5 blocks (soft, 12 px), so only plain sky moves.
     `holemap` (the old behaviour) on dense-nothumb: 13.06 vs 13.07 dB, equal; build 134 stays
     for 0223's sake.
+  - Build 137 on the graphics card: 100_0226's clouds clean again, 0223's sky still calm;
+    dense-head psnr 15.23 -> 15.24, good 0.4221 -> 0.4232, ssim 0.6016 -> 0.6018 (better on 9 of
+    the 10 photos it touches, DSC_4524 ssim -0.002). The owner made it default: build 139,
+    `EVEN_ROWS = True` (photos without a whole thumbnail that have a rescued one).
   - `level_real` (build 133, `LEVEL_FROM_NET`): the guided network moves decoded rows of a
     rotted level (too bright, tinted; the repair kept them) to the thumbnail's level;
     protect_real used to put them back between its fill as bands (100_0239: dark and light

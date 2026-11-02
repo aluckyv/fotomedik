@@ -40,7 +40,7 @@ TOOLS = [
                 "output": {"type": "string", "description": "folder for the results; never the source, "
                            "inside it or around it; made when missing"},
                 "steps": {"type": "string", "description": "enhanced-copy steps, comma separated, from "
-                          f"{', '.join(jobs.STEPS)}; \"\" for the repair only (rows, holemap are experiments). "
+                          f"{', '.join(jobs.STEPS)}; \"\" for the repair only (holemap is an experiment; rows is always on). "
                           f"Default: {jobs.DEFAULT_STEPS}"},
                 "only": {"type": "array", "items": {"type": "string"},
                          "description": "only these photos (paths relative to source)"},

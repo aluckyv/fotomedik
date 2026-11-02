@@ -34,7 +34,7 @@ from PIL import Image
 from .. import errlog
 from ..report.report import FileReport
 
-# rows, holemap: experiments, off unless asked for (compared on the graphics card)
+# holemap: an experiment, off unless asked for; rows: on by default since build 139 (the name still works)
 STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces", "rows", "holemap")
 STEP_NAMES = {
     "puzzle": "pieces put back by the thumbnail",
@@ -45,7 +45,7 @@ STEP_NAMES = {
     "diffusion": "maximum quality (diffusion)",
     "patch": "the photo's own texture in the holes",
     "faces": "faces",
-    "rows": "faint rows evened by the rescued thumbnail (experiment)",
+    "rows": "faint rows evened by the rescued thumbnail (on by default)",
     "holemap": "clean-up told where the holes are without a thumbnail, as before build 134 (experiment)",
 }
 NETWORK_STEPS = {"deblock", "ai", "thumbsr", "diffusion", "faces"}
