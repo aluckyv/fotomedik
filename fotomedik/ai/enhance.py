@@ -1047,7 +1047,10 @@ def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: di
         gq = np.zeros((h // 4, w // 4, 3), np.float32) if g is None else g.astype(np.float32) / 255.0
         gq = np.pad(gq, ((p // 4, (p + T) // 4 + 2), (p // 4, (p + T) // 4 + 2), (0, 0)), mode="edge")
         hb = np.zeros((h // 8, w // 8), np.float32)
-        if holes is not None and holes.any():
+        # without the thumbnail the network is not told where the holes are: it only cleans what
+        # the repair and the jigsaw put there (a rescued thumbnail's colours) instead of guessing
+        # grey and brown bands into a sky that LaMa then kept (100_0223)
+        if g is not None and holes is not None and holes.any():
             hm = holes[: h // 8 * 8, : w // 8 * 8]
             hb = hm.reshape(h // 8, 8, w // 8, 8).any(axis=(1, 3)).astype(np.float32)
         hb = np.pad(hb, ((p // 8, (p + T) // 8 + 2), (p // 8, (p + T) // 8 + 2)), mode="edge")
