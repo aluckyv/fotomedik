@@ -702,6 +702,39 @@ def _hole_distance(holes: np.ndarray, far: int) -> np.ndarray:
     return dist
 
 
+BRIDGE_THIN = 32  # pixels: a hole this thin between real rows is bridged from the rows above and below
+
+
+def bridge_thin(arr: np.ndarray, holes: np.ndarray, real: np.ndarray, most: int = BRIDGE_THIN) -> tuple[np.ndarray, int]:
+    """Thin holes (a row or two of blocks between real rows) filled column by column with a
+    blend of the real pixel right above and right below: what crosses the gap (a leg, a
+    pole, a shop front) runs on through it. A thumbnail of 160 pixels cannot say what a
+    16-pixel row holds, and its colour there made flat bands across the picture (100_0239).
+    Returns (rgb, pixels bridged)."""
+    h, w = holes.shape
+    if not holes.any() or most <= 0:
+        return arr, 0
+    ys = np.arange(h)[:, None]
+    above = np.where(~holes, ys, -1)
+    above = np.maximum.accumulate(above, axis=0)
+    below = np.where(~holes, ys, h)
+    below = np.minimum.accumulate(below[::-1], axis=0)[::-1]
+    gap = below - above - 1
+    thin = holes & (above >= 0) & (below < h) & (gap <= most)
+    if not thin.any():
+        return arr, 0
+    a = np.clip(above, 0, h - 1)
+    b = np.clip(below, 0, h - 1)
+    r = real.astype(np.float32)
+    top = np.take_along_axis(r, a[..., None].repeat(3, axis=2), axis=0)
+    bot = np.take_along_axis(r, b[..., None].repeat(3, axis=2), axis=0)
+    t = ((ys - a) / np.maximum(b - a, 1)).astype(np.float32)[..., None]
+    val = (1.0 - t) * top + t * bot
+    out = arr.astype(np.float32)
+    out[thin] = val[thin]
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(thin.sum())
+
+
 def blend_seams(out: np.ndarray, holes: np.ndarray, real: np.ndarray) -> np.ndarray:
     """Lift the filled holes onto the real picture around them. At every border the colour
     step is measured (the real pixels just outside minus the filled ones just inside, two
@@ -1153,6 +1186,10 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                 arr = sharpen_holes(arr, holes, engine, report("Real-ESRGAN tile"), stop=stop, stats=st)
                 arr = keep_block_means(arr, filled_arr, holes, holes & ~unknown)
                 done.append(f"holes sharpened (Real-ESRGAN, {st.get('tiles', 0)} tiles, {_took(t0)})")
+        if BRIDGE_THIN:
+            arr, n_thin = bridge_thin(arr, holes, real)
+            if n_thin:
+                done.append(f"thin holes bridged from the rows above and below ({100 * n_thin / max(1, int(holes.sum())):.0f} % of the holes)")
         if BLEND_SEAMS:
             arr = blend_seams(arr, holes, real)
         arr = np.where(holes[..., None], arr, real)

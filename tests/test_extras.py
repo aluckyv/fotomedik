@@ -331,3 +331,21 @@ def test_destripe_uses_only_the_real_part_of_a_rescued_thumbnail():
     assert n == 0 and (out == arr).all()  # no map there: the band is left alone
     out, n = destripe(arr, base.astype(np.uint8), None)
     assert n >= 15
+
+
+def test_bridge_thin_runs_what_crosses_a_thin_gap_on_through_it():
+    from fotomedik.ai.enhance import bridge_thin
+
+    real = np.full((64, 64, 3), 200, np.uint8)
+    real[:, 20:28] = 40  # a dark pole crossing the picture
+    arr = real.copy()
+    holes = np.zeros((64, 64), bool)
+    holes[30:46] = True  # a 16-pixel row lost
+    arr[holes] = 120  # the fill made it a flat band
+    out, n = bridge_thin(arr, holes, real)
+    assert n == 16 * 64
+    assert (out[30:46, 20:28] == 40).all() and (out[30:46, 40:] == 200).all()
+    wide = np.zeros((64, 64), bool)
+    wide[10:60] = True  # too tall to bridge
+    _, n = bridge_thin(arr, wide, real)
+    assert n == 0
