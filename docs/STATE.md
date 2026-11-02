@@ -105,6 +105,14 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
 - After the steps (in `enhance.py`, landed 2026-11-02):
   - `protect_real`: the clean-up result stays only in the holes and fades over 8 px into the
     untouched pixels: real detail is no longer blurred.
+  - `level_real` (build 133, `LEVEL_FROM_NET`): the guided network moves decoded rows of a
+    rotted level (too bright, tinted; the repair kept them) to the thumbnail's level;
+    protect_real used to put them back between its fill as bands (100_0239: dark and light
+    lines over the whole photo). Now real pixels take the network's low-frequency level
+    (window 7 x 49 px over real pixels only) where it differs by 6..16+ gray levels, and keep
+    their own detail. Mistake made on the way (do not repeat): forcing `keep` pixels back to
+    the raw input after protect_real dropped its feathered edge (keep = all real pixels after
+    the jigsaw): -0.41 dB and more stripes on every photo.
   - `blend_seams`: the colour step at every hole border is spread through the fill as a smooth
     field on the 8x8 grid: fewer sky bands where real and filled rows alternate.
   - both use numpy only (no OpenCV needed).
