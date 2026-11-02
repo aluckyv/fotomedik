@@ -43,8 +43,8 @@ if __name__ == "__main__":
 
     try:
         rc = main()
-    except SystemExit:
-        raise
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     except BaseException:
         import traceback
 
@@ -52,4 +52,15 @@ if __name__ == "__main__":
             crash.write(traceback.format_exc())
             crash.flush()
         raise
-    sys.exit(rc)
+    # The window is closed and its threads are done (gui.app._settle); the process ends here
+    # without Python's and Qt's teardown, which crashed at random (an access violation, an
+    # abort) after everything had gone well - builds 149-155.
+    import os
+
+    for f in (sys.stdout, sys.stderr, crash):
+        try:
+            if f is not None:
+                f.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    os._exit(int(rc or 0))

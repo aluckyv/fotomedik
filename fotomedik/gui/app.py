@@ -1183,5 +1183,11 @@ def _settle(w: MainWindow, app: QApplication) -> None:
     if w.thread is not None and w.thread.isRunning():
         w.thread.quit()
         w.thread.wait(10000)
+    w.worker = None  # the worker lived in that thread: gone before the window, in this thread
+    w.thread = None
     w.close()
+    app.processEvents()
+    import gc
+
+    gc.collect()
     app.processEvents()

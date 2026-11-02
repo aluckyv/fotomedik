@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 155.
+Last update: 2026-11-02, build 157.
 
 ## How the work is done
 
@@ -253,7 +253,11 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   (148 passed by timing). `app._settle` (build 154) stops the worker, waits for the thread and
   closes the window before Qt is torn down, in the self-test and in the normal exit. Found
   through `fotomedik_app.py`'s new crash file: an error that ends the program, and a hard crash
-  (faulthandler), go to `FotoMedik-crash.txt` in the program's home; CI prints it.
+  (faulthandler), go to `FotoMedik-crash.txt` in the program's home; CI prints it. Build 155
+  (docs only) then died with an access violation at teardown, no Python frame: Qt's and
+  Python's teardown order is not ours to fix, so since build 157 `fotomedik_app.py` ends the
+  process with `os._exit` once the window is closed and its threads are done (stdio and the
+  crash file flushed first); `_settle` also drops the worker before the window.
 - At start the packaged window brings an installed extension up to date on its own
   (`claude_connect.connect(quiet=True)`, build 147): nothing is asked, written or shown when
   FotoMedik is not in Claude yet. Program > Check for updates asks GitHub on demand.
