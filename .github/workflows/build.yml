@@ -89,6 +89,8 @@ jobs:
           python fotomedik_app.py --smoke demo demo_out_src shot_src.png
           $code = $LASTEXITCODE
           if (Test-Path shot_src.txt) { Get-Content shot_src.txt | ForEach-Object { Write-Host "::notice title=smoke (source)::$_" } }
+          $crash = Join-Path $env:LOCALAPPDATA "FotoMedik\FotoMedik-crash.txt"
+          if ((Test-Path $crash) -and (Get-Item $crash).Length -gt 0) { Write-Host "--- crash ---"; Get-Content $crash }
           exit $code
       - name: stamp the build number
         shell: pwsh
