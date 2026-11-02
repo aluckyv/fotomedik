@@ -127,7 +127,7 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   - `destripe` (build 126, on again, numpy only): bands on flat surfaces evened against the
     thumbnail, or only where a rescued thumbnail is real (`rescued_picture`). Small effect.
   - `TEXTURE_WITH_FILL` (build 126): the patch step's texture runs after thumbsr/ai/diffusion
-    without being asked for. Owner to confirm in the morning; switch back if it looks wrong.
+    without being asked for. The owner confirmed it stays on (2026-11-02).
     Build 130: texture is looked for near the hole first (`patchfill.NEAR`), and only close
     matches are taken (`MATCH_MAX = 10`): build 128 copied wrong texture from far away.
   - guided-network path (build 129): rotted stripes along the holes are taken out there too
@@ -229,8 +229,9 @@ Waiting for the owner's choice (proposed, not started):
 3. A byte-level second repair round after the first (kept for last, only if the rest is not enough).
 
 SDXL inpainting for the diffusion step: no ready ONNX export exists (checked 2026-11-02).
-`.github/workflows/export-sdxl.yml` would export it to fp16 and put it in parts on a public
-release; starting it needs the owner's OK (publishing model files; OpenRAIL++-M terms pass on).
+`.github/workflows/export-sdxl.yml` exports it to fp16 and puts it in parts on the public
+`models-sdxl` release (OpenRAIL++-M terms pass on). The owner gave the OK on 2026-11-02; the
+first run was started then. The app does not use it yet.
 
 Known problems:
 - Rotted decoded rows the stripe detection misses stay in the enhanced copy as thin light or
