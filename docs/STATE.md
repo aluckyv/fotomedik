@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 157.
+Last update: 2026-11-03, build 159 (the first build since 154 that passed CI: the program ends with TerminateProcess).
 
 ## How the work is done
 
@@ -55,7 +55,7 @@ Last update: 2026-11-02, build 157.
 | R4 | foreign (blank) card sectors inside the scan | cut out |
 | R5 | flipped bits in the image data | bit guessing between restart markers, kept only when the thumbnail agrees |
 | R6 | foreign data after the image | cut + EOI |
-| R7 | destroyed header | transplant from a camera profile; header voted bit by bit from every photo of the set. A header that parses is kept unless a reference decodes clearly further (build 157: photos saved with their own optimised Huffman tables look "near" each other's; with dense rot every header stopped at the first rotted sector and 5 of 15 got another photo's tables) |
+| R7 | destroyed header | transplant from a camera profile; header voted bit by bit from every photo of the set. A header that parses is kept unless a reference decodes clearly further (build 157: photos saved with their own optimised Huffman tables look "near" each other's; with dense rot every header stopped at the first rotted sector and 5 of 15 got another photo's tables; the margin is 64 MCUs and double, since wrong tables decode garbage for up to 80 MCUs before an impossible code shows) |
 | R8 | nothing of the image | the Exif thumbnail |
 | R9 | lost intervals | holes filled (thumbnail-guided DC field, smooth surface, not flat squares) |
 | R10 | intact tail after a rotted stretch | tail scan in C, cut where colours step away from the thumbnail |
@@ -358,6 +358,15 @@ count (R11 has it, within a row or two) and from the seams with real rows above 
 the thumbnail for the column only, DISTINCT compared inside the chosen row, ACCEPT scaled by
 the thumbnail-to-picture ratio. Measure on the wedding set (stretches at their place: 4 %
 today) and on the dh/dn benches (no regression).
+First try (2026-11-03, not kept, patch in the session's scratch): placed pieces taught to
+the reference field (clean mask + rebuild, 0.08 s per rebuild at 16 MP), the decoded prefix
+before the first error counted as clean, a row prior on the misfit, the chain-by-chain count
+as the search centre (+-2.5 rows). No gain on DSC_4230 (12 of 241 stretches at their place):
+the count itself drifts 2.8 rows (median) because nothing gets placed to re-anchor it, and
+when the best place is the true one its runner-up is the row above or below (92 %), at 0.76
+of its cost. What is still missing is a row test the thumbnail cannot give: the seam between
+a piece's blocks and the real blocks above and below (DC or pixels), and placing the first
+pieces after the real rows at the top by the count alone (it is within 24 MCUs there).
 
 Waiting for the owner's choice (proposed, not started):
 1. Rescued thumbnail: let the thumbnail step, `destripe` and the hole colours use its real part.

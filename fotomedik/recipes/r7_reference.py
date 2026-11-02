@@ -28,8 +28,11 @@ CLOSE_SOS = 0.15  # fraction of differing bits for a certain SOS match
 # from their neighbours' by a few bits (they look like "silently damaged" tables), and with
 # dense rot every header, right or wrong, stops at the first rotted sector; before, the
 # rounded decoded share tied at 0.00 on 16 MP photos and 5 of 15 got another photo's tables.
-STRICT_MCUS = 4
-STRICT_SHARE = 0.25
+# Wrong tables decode garbage for up to about 80 MCUs before an impossible code shows, and
+# the best of fifteen such runs beats a right header that stopped at a rotted sector 20 MCUs
+# in; a right header for silently damaged tables decodes hundreds further.
+STRICT_MCUS = 64
+STRICT_SHARE = 1.0
 
 _POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.int32)
 
