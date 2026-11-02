@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 149.
+Last update: 2026-11-02, build 154.
 
 ## How the work is done
 
@@ -237,6 +237,13 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   is saved as `<name>_enhanced_2.jpg`, `_3`... (`options["ai_suffix"]`, `run.free_suffix`) and
   comes in as a new row "(again_2: steps)", so tries sit side by side; the Enhanced box's
   caption names the steps. The first copy is never overwritten.
+- Builds 149-153 failed their self-test at the very end ("Fatal Python error: Aborted", no
+  Python frame): the self-test quit the program as soon as the results were in, while the
+  repair's QThread was still ending, and Qt aborts a program that destroys a running thread
+  (148 passed by timing). `app._settle` (build 154) stops the worker, waits for the thread and
+  closes the window before Qt is torn down, in the self-test and in the normal exit. Found
+  through `fotomedik_app.py`'s new crash file: an error that ends the program, and a hard crash
+  (faulthandler), go to `FotoMedik-crash.txt` in the program's home; CI prints it.
 - At start the packaged window brings an installed extension up to date on its own
   (`claude_connect.connect(quiet=True)`, build 147): nothing is asked, written or shown when
   FotoMedik is not in Claude yet. Program > Check for updates asks GitHub on demand.
