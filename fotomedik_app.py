@@ -63,4 +63,12 @@ if __name__ == "__main__":
                 f.flush()
         except Exception:  # noqa: BLE001
             pass
+    if sys.platform == "win32":
+        # os._exit still lets Windows unload the DLLs (Qt, onnxruntime) and one of them
+        # crashed in its detach routine (build 157: access violation inside os._exit);
+        # TerminateProcess ends the process without notifying them
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        k32.TerminateProcess(k32.GetCurrentProcess(), int(rc or 0))
     os._exit(int(rc or 0))
