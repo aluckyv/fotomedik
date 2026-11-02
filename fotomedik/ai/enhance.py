@@ -1197,8 +1197,10 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                  "fbcnn-fotomedik-guided.onnx": "FBCNN guided by the thumbnail, fine-tuned on your photos, "}.get(file, "")
         done.append(f"JPEG blocks and noise removed ({which}{st.get('tiles', 0)} tiles, {_took(t0)})")
         if n_lev:
+            share = 100 * n_lev / max(1, int((~holes).sum()))
             done.append(f"decoded rows of a wrong brightness or tint set to the thumbnail's "
-                        f"({100 * n_lev / max(1, int((~holes).sum())):.0f} % of the real picture)")
+                        f"({share:.0f} % of the real picture)" if share >= 1 else
+                        "decoded rows of a wrong brightness or tint set to the thumbnail's (under 1 % of the real picture)")
     guided = "deblock" in steps and engine.deblock_s is not None and st.get("guided", False)
     if holes.any() and guided and "thumbsr" in steps and "diffusion" not in steps and "ai" not in steps:
         # the guided network rebuilt the holes from the whole thumbnail itself, better than the

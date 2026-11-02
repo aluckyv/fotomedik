@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02 (night), build 132.
+Last update: 2026-11-02 (night), build 133.
 
 ## How the work is done
 
@@ -110,7 +110,9 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
     protect_real used to put them back between its fill as bands (100_0239: dark and light
     lines over the whole photo). Now real pixels take the network's low-frequency level
     (window 7 x 49 px over real pixels only) where it differs by 6..16+ gray levels, and keep
-    their own detail. Mistake made on the way (do not repeat): forcing `keep` pixels back to
+    their own detail. Bench (12 photos): psnr 29.75 -> 29.80, stripes 0.0131 -> 0.0129, better
+    on 11 of 12, none worse; it touches ~1 % of the real picture there (decoded rows on the
+    bench are mostly at the right level). Mistake made on the way (do not repeat): forcing `keep` pixels back to
     the raw input after protect_real dropped its feathered edge (keep = all real pixels after
     the jigsaw): -0.41 dB and more stripes on every photo.
   - `blend_seams`: the colour step at every hole border is spread through the fill as a smooth
@@ -200,6 +202,9 @@ Last result, 12 photos of a dense-rst-lost bench (1600 px), steps `puzzle,burst,
 | enhanced, build 119 | 29.28 | 0.942 | 0.015 | 0.872 | 0.928 |
 | enhanced, build 120+ | 29.98 | 0.943 | 0.013 | 0.873 | 0.931 |
 | + destripe | 29.98 | 0.943 | 0.013 | 0.873 | 0.931 |
+| build 131 (texture, bridging) | 28.71 | 0.932 | 0.018 | 0.848 | 0.916 |
+| build 132 (bridging off) | 29.75 | 0.940 | 0.013 | 0.855 | 0.920 |
+| build 133 (+ level_real) | 29.80 | 0.941 | 0.013 | 0.855 | 0.920 |
 
 ## Tried, and what was learnt
 
