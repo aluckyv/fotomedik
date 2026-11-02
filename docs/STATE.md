@@ -150,9 +150,10 @@ Last result, 12 photos of a dense-rst-lost bench (1600 px), steps `puzzle,burst,
   look alike. With a thumbnail it is safe but changed nothing on the bench, because photos
   with a whole thumbnail already lose their bands earlier. The photos that keep bands have no
   whole thumbnail. Hence: off until it can use a rescued thumbnail.
-- **Rescued thumbnails** have the right shapes but often wrong colours (a colour offset carried
-  through the damaged data), and their lost part is grey. Proposed fix: calibrate their colours
-  against the photo's real parts, then use them (not done yet, see Open).
+- **Rescued thumbnails** (`cli._rescued_thumbnail`, RGB; `dcfield.thumbnail_image` gives YCbCr)
+  have the right shapes and colours where their mask says real; their lost part is a grey fill.
+  (An earlier note said their colours were wrong: that was YCbCr shown as RGB.) Today only the
+  jigsaw uses them; the thumbnail step, destripe and the hole colours do not.
 - Guided FBCNN after the thumbnail step: went back to the old thumbnail handling; the guided
   network only on photos like those it learnt on.
 - SwinIR in a batch mixed the tiles (scan-line noise): it enlarges one tile at a time.
@@ -160,8 +161,7 @@ Last result, 12 photos of a dense-rst-lost bench (1600 px), steps `puzzle,burst,
 ## Open
 
 Waiting for the owner's choice (proposed, not started):
-1. Rescued thumbnail: correct its colours against the real parts of the photo, then let
-   `destripe` (and maybe the hole colours) use it where it is good.
+1. Rescued thumbnail: let the thumbnail step, `destripe` and the hole colours use its real part.
 2. No enhanced copy for photos with no real data at all (today the AI invents texture there).
 3. A byte-level second repair round after the first (kept for last, only if the rest is not enough).
 
