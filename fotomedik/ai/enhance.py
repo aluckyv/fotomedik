@@ -1124,6 +1124,16 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             arr = blend_seams(arr, holes, real)
         arr = np.where(holes[..., None], arr, real)
     _check(stop)
+    if "patch" in steps and holes.any():
+        from .guard import date_stamp, face_mask
+        from .patchfill import texture_holes
+
+        t0, pst = time.perf_counter(), {}
+        avoid = face_mask(arr, engine.face_det) | date_stamp(arr)
+        arr = texture_holes(arr, holes & ~keep if keep is not None else holes, avoid, pst)
+        if pst.get("textured"):
+            done.append(f"holes given the photo's own texture ({100 * pst['textured'] / max(1, int(holes.sum())):.0f} % "
+                        f"of them, like Content-Aware Fill; faces left as they were; {_took(t0)})")
     if DESTRIPE and steps & {"deblock", "thumbsr", "ai", "puzzle"}:
         t0 = time.perf_counter()
         arr, n_even = destripe(arr, thumb)

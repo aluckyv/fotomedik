@@ -25,7 +25,7 @@ from pathlib import Path
 from . import install
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".jpe", ".~cr"}  # the same as cli.IMAGE_SUFFIXES
-STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "faces")  # ai.run.STEPS
+STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces")  # ai.run.STEPS
 DEFAULT_STEPS = "puzzle,burst,deblock,thumbsr"
 FINISHED = ("done", "failed", "stopped", "cancelled", "interrupted")
 SETTINGS = "mcp.json"

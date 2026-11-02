@@ -19,6 +19,9 @@ folder) and scores the result against the good photo:
   ssim     structural similarity in the damaged area: edges and detail in the right
            places (a blur scores low, invented wrong detail too)
   faces    the same `good` inside faces the detector finds in the good photo
+  keep     ssim on the photo's own good parts: a step that softens them scores lower
+  detail   fine detail in the damaged area against the truth's (1 = as sharp, lower =
+           smeared); psnr and ssim prefer a smooth fill to a right-looking texture
 
 Nothing of the photos goes into the repository: the bench folder lives outside it.
 """
@@ -151,10 +154,18 @@ def ssim_map(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return ((2 * ma * mb + c1) * (2 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
 
 
+def _fine(img: np.ndarray) -> np.ndarray:
+    """Fine detail per pixel: how far the gray value strays from its 5x5 mean."""
+    from fotomedik.ai.patchfill import box_blur
+
+    g = img.astype(np.float32).mean(axis=-1, keepdims=True)
+    return np.abs(g - box_blur(g, 2))[..., 0]
+
+
 def score(truth: np.ndarray, got: np.ndarray | None, area: np.ndarray, faces: np.ndarray) -> dict:
     if got is None or got.shape != truth.shape:
         return {"psnr": 0.0, "good": 0.0, "stripes": 1.0, "ssim": 0.0, "faces": 0.0 if faces.any() else None,
-                "keep": 0.0}
+                "keep": 0.0, "detail": 0.0}
     err = np.abs(got.astype(np.int16) - truth.astype(np.int16)).max(axis=-1)
     mse = float(((got.astype(np.float32) - truth) ** 2).mean())
     ok = err <= TOL
@@ -170,6 +181,9 @@ def score(truth: np.ndarray, got: np.ndarray | None, area: np.ndarray, faces: np
         "faces": round(float(ok[area & faces].mean()), 4) if (area & faces).any() else None,
         # the photo's own good parts: a step that softens them scores lower here
         "keep": round(float(ss[~area].mean()), 4) if (~area).any() else 1.0,
+        # fine detail in the damaged area against the truth's: 1 = as sharp, lower = smeared
+        # (psnr and ssim prefer a smooth fill to a right-looking texture that is not pixel-exact)
+        "detail": round(float(_fine(got)[area].mean() / max(_fine(truth)[area].mean(), 1e-6)), 3) if area.any() else 1.0,
     }
 
 
@@ -272,19 +286,20 @@ def summary(rows: list[dict]) -> dict:
                       "stripes": round(float(np.mean([r["stripes"] for r in rs])), 4),
                       "ssim": round(float(np.mean([r.get("ssim", 0.0) for r in rs])), 4),
                       "keep": round(float(np.mean([r.get("keep", 0.0) for r in rs])), 4),
+                      "detail": round(float(np.mean([r.get("detail", 0.0) for r in rs])), 3),
                       "faces": round(float(np.mean(fs)), 4) if fs else None}
     out["errors"] = sum(1 for r in rows if r.get("error"))
     return out
 
 
 def print_summary(s: dict) -> None:
-    print(f"\n{'':8}{'psnr':>8}{'good':>8}{'stripes':>9}{'ssim':>8}{'keep':>8}{'faces':>8}")
+    print(f"\n{'':8}{'psnr':>8}{'good':>8}{'stripes':>9}{'ssim':>8}{'keep':>8}{'detail':>8}{'faces':>8}")
     for stage in ("naive", "repair", "ai"):
         if stage in s:
             v = s[stage]
             f = "-" if v["faces"] is None else f"{v['faces']:.3f}"
             print(f"{stage:8}{v['psnr']:8.2f}{v['good']:8.3f}{v['stripes']:9.3f}{v.get('ssim', 0):8.3f}"
-                  f"{v.get('keep', 0):8.3f}{f:>8}")
+                  f"{v.get('keep', 0):8.3f}{v.get('detail', 0):8.3f}{f:>8}")
     print(f"errors: {s['errors']}")
 
 

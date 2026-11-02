@@ -34,7 +34,7 @@ from PIL import Image
 from .. import errlog
 from ..report.report import FileReport
 
-STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "faces")
+STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces")
 STEP_NAMES = {
     "puzzle": "pieces put back by the thumbnail",
     "burst": "similar shots",
@@ -42,6 +42,7 @@ STEP_NAMES = {
     "ai": "AI healing",
     "thumbsr": "thumbnail enlarged by AI",
     "diffusion": "maximum quality (diffusion)",
+    "patch": "the photo's own texture in the holes",
     "faces": "faces",
 }
 NETWORK_STEPS = {"deblock", "ai", "thumbsr", "diffusion", "faces"}
