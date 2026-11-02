@@ -169,6 +169,138 @@ def component_planes(data: bytes, ft, comps) -> dict | None:
     return out
 
 
+TAIL_LEVELS = True  # tails after a hole get their colour level from the seams with real blocks around them
+LEVEL_MIN = 3.0  # gray levels: a smaller correction is left alone
+LEVEL_MAX = 96.0  # gray levels: a larger one is not a level error
+LEVEL_PAIRS = 16  # pixel pairs across seams a run needs on each side it is judged by
+LEVEL_AGREE = 6.0  # gray levels: the seams above and below must ask for the same shift this closely
+LEVEL_CLIP = 122.0  # level-shifted pixels this close to black or white are clipped: left out of the seams
+
+
+def tail_runs(sr, hole_mcus: np.ndarray) -> list[tuple[int, int]]:
+    """(first, end) MCU runs decoded after a hole in the same restart interval: their DC
+    chain starts from the hole's last DC, so their colour level is only an estimate (R10)
+    and moves with it."""
+    runs = []
+    for iv in sr.intervals:
+        a, b = iv.mcu_first, iv.mcu_first + iv.mcu_count
+        m, seen = a, False
+        while m < b:
+            if hole_mcus[m]:
+                seen = True
+                m += 1
+                continue
+            e = m
+            while e < b and not hole_mcus[e]:
+                e += 1
+            if seen:
+                runs.append((m, e))
+            m = e
+    return runs
+
+
+def _pairs(nb: np.ndarray, own: np.ndarray) -> np.ndarray:
+    """Differences across a seam, without clipped pixels (black or white say nothing)."""
+    ok = (np.abs(nb) < LEVEL_CLIP) & (np.abs(own) < LEVEL_CLIP)
+    return (nb - own)[ok]
+
+
+def tail_shifts(planes: dict, comps, per_row: int, hole_blocks: dict, runs: list[tuple[int, int]],
+                qdc: dict, dc: dict | None = None, sweeps: int = 12) -> tuple[dict, int]:
+    """DC shift per block (per component, in DC units) that puts every tail run on the
+    level its seams with the real blocks around it ask for - the least-absolute-error
+    level across block edges (the principle of Li, Karrenbauer, Saupe and Kuo 2011), with
+    one unknown per run, because a DC error shifts the rest of the run alike. All runs are
+    solved together: a run next to another tail sees it at that tail's own level, and
+    each sweep sets every run to the median of the pixel differences across its seams
+    (coordinate descent of the L1 cost). A run moves only when its seams above and below
+    agree (a real edge along one side does not), and only to a level its blocks can have.
+    Returns (shifts, runs moved)."""
+    shifts = {c.cid: np.zeros(hole_blocks[c.cid].shape, dtype=np.int32) for c in comps}
+    if not runs:
+        return shifts, 0
+    nrun = len(runs)
+    off = {c.cid: np.zeros(nrun) for c in comps}  # gray levels per run
+    seams = {}  # cid -> per run: list of (direction, neighbour run or -1, differences)
+    blocks_of = {}
+    for c in comps:
+        hb = hole_blocks[c.cid]
+        BR, BC = hb.shape
+        rid = np.full((BR, BC), -1, dtype=np.int64)
+        per = []
+        for k, (a, e) in enumerate(runs):
+            m = np.arange(a, e)
+            ys = np.concatenate([(m // per_row) * c.v + yy for yy in range(c.v) for _x in range(c.h)])
+            xs = np.concatenate([(m % per_row) * c.h + xx for _y in range(c.v) for xx in range(c.h)])
+            rid[ys, xs] = k
+            per.append((ys, xs))
+        blocks_of[c.cid] = per
+        pl = planes[c.cid]
+        lists = []
+        for k, (ys, xs) in enumerate(per):
+            groups: dict[tuple[int, int], list] = {}
+            for y, x in zip(ys.tolist(), xs.tolist()):
+                for d, (ny, nx) in enumerate(((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1))):
+                    if not (0 <= ny < BR and 0 <= nx < BC) or hb[ny, nx] or rid[ny, nx] == k:
+                        continue
+                    if d == 0:
+                        diff = _pairs(pl[y * 8 - 1, x * 8 : x * 8 + 8], pl[y * 8, x * 8 : x * 8 + 8])
+                    elif d == 1:
+                        diff = _pairs(pl[y * 8 + 8, x * 8 : x * 8 + 8], pl[y * 8 + 7, x * 8 : x * 8 + 8])
+                    elif d == 2:
+                        diff = _pairs(pl[y * 8 : y * 8 + 8, x * 8 - 1], pl[y * 8 : y * 8 + 8, x * 8])
+                    else:
+                        diff = _pairs(pl[y * 8 : y * 8 + 8, x * 8 + 8], pl[y * 8 : y * 8 + 8, x * 8 + 7])
+                    groups.setdefault((min(d, 2), int(rid[ny, nx])), []).append(diff)
+            lists.append([(d, j, np.concatenate(v)) for (d, j), v in groups.items()])
+        seams[c.cid] = lists
+
+    def judge(k: int, cid: int) -> float | None:
+        o = off[cid]
+        side = {0: [], 1: [], 2: []}
+        for d, j, diff in seams[cid][k]:
+            side[d].append(diff + (o[j] if j >= 0 else 0.0))
+        up = np.concatenate(side[0]) if side[0] else np.zeros(0)
+        down = np.concatenate(side[1]) if side[1] else np.zeros(0)
+        if len(up) < LEVEL_PAIRS or len(down) < LEVEL_PAIRS:
+            return None
+        mu, md = float(np.median(up)), float(np.median(down))
+        if abs(mu - md) > max(LEVEL_AGREE, 0.5 * max(abs(mu), abs(md))):
+            return None
+        val = float(np.median(np.concatenate([up, down] + side[2])))
+        if abs(val) > LEVEL_MAX:
+            return None
+        if dc is not None:  # every block's average must stay a possible colour
+            ys, xs = blocks_of[cid][k]
+            lv = dc[cid][ys, xs] * (qdc[cid] / 8.0) + val
+            if lv.min() < -LEVEL_CLIP or lv.max() > LEVEL_CLIP:
+                return None
+        return val
+
+    for _sweep in range(sweeps):
+        change = 0.0
+        for k in range(nrun):
+            got = {c.cid: judge(k, c.cid) for c in comps}
+            if any(v is None for v in got.values()):
+                continue
+            for c in comps:
+                change = max(change, abs(got[c.cid] - off[c.cid][k]))
+                off[c.cid][k] = got[c.cid]
+        if change < 0.5:
+            break
+    moved = 0
+    for k in range(nrun):
+        if not any(abs(off[c.cid][k]) >= LEVEL_MIN for c in comps):
+            continue
+        moved += 1
+        for c in comps:
+            sh = int(round(off[c.cid][k] * 8.0 / qdc[c.cid]))
+            if sh:
+                ys, xs = blocks_of[c.cid][k]
+                shifts[c.cid][ys, xs] = sh
+    return shifts, moved
+
+
 def bridge_coefficients(plane: np.ndarray, holes: np.ndarray, quant: np.ndarray, max_gap: int = BRIDGE_MAX):
     """For hole blocks inside a short vertical gap: AC coefficients (zigzag, quantised,
     DC slot 0) of a linear blend, pixel column by pixel column, between the last real
@@ -224,7 +356,7 @@ def reference_coefficients(plane: np.ndarray, holes: np.ndarray, quant: np.ndarr
 
 
 def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None, junk_mcus: np.ndarray | None = None,
-                 hole_dc: dict | None = None) -> bytes | None:
+                 hole_dc: dict | None = None, info: dict | None = None, level_tails: bool = True) -> bytes | None:
     """`data` with the given MCUs rewritten as smooth blocks, or None when the scan
     does not decode cleanly or nothing would change.
 
@@ -268,6 +400,14 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None, junk_mcus: 
         dc_of[c.cid] = arr
     planes_ok = planes is not None and all(
         planes[c.cid].shape == (sr.dc[c.cid].shape[0] * 8, sr.dc[c.cid].shape[1] * 8) for c in comps)
+    shifts = {c.cid: np.zeros(sr.dc[c.cid].shape, dtype=np.int32) for c in comps}
+    if TAIL_LEVELS and level_tails and planes_ok and reference is None:
+        qdc = {c.cid: float(ft.quant[ft.frame.component(c.cid).tq].dc) for c in comps}
+        shifts, moved = tail_shifts(planes, comps, per_row, hole_blocks, tail_runs(sr, hole_mcus), qdc, sr.dc)
+        if info is not None:
+            info["tails_levelled"] = moved
+        for c in comps:
+            dc_of[c.cid] = dc_of[c.cid] + shifts[c.cid]
     ref_planes = None
     if reference is not None and planes_ok:
         from ..reference import aligned_planes, best_candidate
@@ -292,7 +432,7 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None, junk_mcus: 
             if planes_ok and BRIDGE_MAX > 0:
                 bridged, good = bridge_coefficients(planes[c.cid], holes, quant)
                 ac = np.where(good[..., None], bridged, ac)
-        grids[c.cid] = (dcg, ac, np.rint(sr.dc[c.cid]).astype(np.int32))
+        grids[c.cid] = (dcg, ac, np.rint(sr.dc[c.cid]).astype(np.int32), shifts[c.cid])
     if not any(g[1].any() for g in grids.values()):
         return None
 
@@ -309,15 +449,17 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None, junk_mcus: 
     nxt = hole_idx + 1
     keep_dc = (nxt < total) & ~iv_end[nxt] & ~hole_mcus[np.minimum(nxt, total - 1)]
     parts = []
+    nr, nc = np.minimum(nxt, total - 1) // per_row, np.minimum(nxt, total - 1) % per_row
     for c in comps:
-        dcg, acg, decoded = grids[c.cid]
+        dcg, acg, decoded, shift = grids[c.cid]
         for yy in range(c.v):
             for xx in range(c.h):
                 ry, rx = r_all * c.v + yy, c_all * c.h + xx
                 blk = acg[ry, rx].astype(np.int32)
                 dcs = dcg[ry, rx]
                 if yy == c.v - 1 and xx == c.h - 1:  # the component's last block of the MCU
-                    dcs = np.where(keep_dc, decoded[ry, rx], dcs)
+                    # the real run after it decodes relative to this DC: moved by the run's shift
+                    dcs = np.where(keep_dc, decoded[ry, rx] + shift[nr * c.v, nc * c.h], dcs)
                 blk[:, 0] = dcs
                 parts.append(blk)
     table = np.stack(parts, axis=1)  # (n_holes, bpm, 64)
@@ -370,7 +512,7 @@ def smooth_holes(data: bytes, hole_mcus: np.ndarray, reference=None, junk_mcus: 
         return None
     for c in comps:
         real = ~hole_blocks[c.cid]
-        if not np.array_equal(sr2.dc[c.cid][real], sr.dc[c.cid][real]):
+        if not np.array_equal(sr2.dc[c.cid][real], (sr.dc[c.cid] + shifts[c.cid])[real]):
             return None
     return new
 
@@ -405,12 +547,19 @@ class SmoothHoles(Recipe):
         junk = ctx.memo.get("junk_mcus")
         if junk is not None and len(junk) != total:
             junk = None
-        new = smooth_holes(ctx.data, mask, reference, junk, ctx.memo.get("hole_dc") if junk is not None else None)
+        info: dict = {}
+        hole_dc = ctx.memo.get("hole_dc") if junk is not None else None
+        new = smooth_holes(ctx.data, mask, reference, junk, hole_dc, info)
+        if new is None and info.get("tails_levelled"):  # the levels did not re-encode: the holes still get smoothed
+            info = {}
+            new = smooth_holes(ctx.data, mask, reference, junk, hole_dc, info, level_tails=False)
         if new is None:
             ctx.note(self, "holes left flat (scan did not re-encode cleanly)")
             return
         n = int(mask.sum())
         tail = f"; {int(junk.sum())} junk MCU(s) refilled" if junk is not None and junk.any() else ""
+        if info.get("tails_levelled"):
+            tail += f"; {info['tails_levelled']} decoded run(s) after holes set to the level of their seams"
         if reference:
             ctx.memo["reference_used"] = True
             ctx.replace_data(new, self, f"{n} filled MCU(s) carry the reference picture's pixels{tail}", mcus=n,
