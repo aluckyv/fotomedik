@@ -26,7 +26,7 @@ from . import install
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".jpe", ".~cr"}  # the same as cli.IMAGE_SUFFIXES
 STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces", "rows",
-         "holemap", "sdxl", "flank", "flankjunk")  # ai.run.STEPS
+         "holemap", "sdxl", "flank")  # ai.run.STEPS
 DEFAULT_STEPS = "puzzle,burst,deblock,thumbsr"
 FINISHED = ("done", "failed", "stopped", "cancelled", "interrupted")
 SETTINGS = "mcp.json"

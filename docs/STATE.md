@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 144.
+Last update: 2026-11-02, build 146.
 
 ## How the work is done
 
@@ -207,6 +207,10 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   junk (over 30) about half. Build 144 experiments: `flank` takes all of them as holes
   (`flanked_runs`), `flankjunk` only those that jump against the block above or below or are
   much rougher (`flank_junk`; 2311: 36 of 188 blocks, about half of the spot).
+  Graphics card (build 145): 2311's checkerboard and coloured dots gone with `flank`
+  (`flankjunk` left the dots); dense-head psnr 15.24 -> 15.25, stripes 0.4647 -> 0.4625 (better
+  on 10, worse on 3, worst -0.11 dB); dense-nothumb 13.07 -> 13.06, even. The owner made
+  `flank` default (build 146, `FLANK = True`); `flankjunk` removed.
   A server started before build 125 has no `update_app` at all: Claude has to be restarted once.
 - Claude's screen control of the owner's computer lapses after 30 minutes without use and needs
   the owner's approval again: do not plan unattended installs on it.
@@ -290,7 +294,7 @@ first run was started then. The app does not use it yet.
 
 Known problems:
 - Rotted decoded rows the stripe detection misses stay in the enhanced copy as thin light or
-  dark lines (100_2311: a light line across the legs, already in the repair).
+  dark lines (100_2311's was a short stretch between two holes: `flank`, build 146).
 - The Enhancer fails on repaired files that do not open (header wholly destroyed).
 - GUI and CLI treat rescued thumbnails differently (enhanced copy or not).
 - (fixed in build 127: onnxruntime warnings off, job log lines cleaned)

@@ -34,9 +34,10 @@ from PIL import Image
 from .. import errlog
 from ..report.report import FileReport
 
-# holemap, sdxl (diffusion with SDXL), flank, flankjunk: experiments, off unless asked for; rows: on by default since build 139 (the name still works)
+# holemap, sdxl (diffusion with SDXL): experiments, off unless asked for; rows (build 139) and flank (146):
+# on by default (the names still work)
 STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces", "rows", "holemap", "sdxl",
-         "flank", "flankjunk")
+         "flank")
 STEP_NAMES = {
     "puzzle": "pieces put back by the thumbnail",
     "burst": "similar shots",
@@ -47,8 +48,7 @@ STEP_NAMES = {
     "patch": "the photo's own texture in the holes",
     "faces": "faces",
     "rows": "faint rows evened by the rescued thumbnail (on by default)",
-    "flank": "short decoded stretches between two holes taken as holes (experiment)",
-    "flankjunk": "the same, only those that look like junk (experiment)",
+    "flank": "short decoded stretches between two holes taken as holes (on by default)",
     "sdxl": "maximum quality with Stable Diffusion XL (experiment)",
     "holemap": "clean-up told where the holes are without a thumbnail, as before build 134 (experiment)",
 }
