@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02 (night), build 131.
+Last update: 2026-11-02 (night), build 132.
 
 ## How the work is done
 
@@ -108,21 +108,28 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   - `blend_seams`: the colour step at every hole border is spread through the fill as a smooth
     field on the 8x8 grid: fewer sky bands where real and filled rows alternate.
   - both use numpy only (no OpenCV needed).
-  - `bridge_thin` (build 128): holes up to 32 px tall between real rows are blended column by
-    column from the real pixel above and below (the thumbnail cannot know a 16-px row: flat
-    bands across legs and shop fronts, 100_0239).
+  - `bridge_thin` (build 128, **off since build 132**, `enhance.BRIDGE = False`): holes up to
+    32 px tall between real rows blended column by column from the real pixel above and below
+    (meant for flat bands across legs and shop fronts, 100_0239). It smeared feet, floors and
+    beams into vertical streaks where LaMa or the guided network had drawn them well: bench (6
+    photos) psnr 28.69 -> 29.64 and stripes 0.0252 -> 0.0203 with it off, better on every
+    photo; 100_2311 lost its "ghost legs". Do not switch it on again without a bench.
   - `destripe` (build 126, on again, numpy only): bands on flat surfaces evened against the
     thumbnail, or only where a rescued thumbnail is real (`rescued_picture`). Small effect.
   - `TEXTURE_WITH_FILL` (build 126): the patch step's texture runs after thumbsr/ai/diffusion
     without being asked for. Owner to confirm in the morning; switch back if it looks wrong.
     Build 130: texture is looked for near the hole first (`patchfill.NEAR`), and only close
     matches are taken (`MATCH_MAX = 10`): build 128 copied wrong texture from far away.
-  - guided-network path (build 129): rotted stripes along the holes are taken out and thin holes
-    bridged there too (before, only the thumbnail and LaMa paths did it).
+  - guided-network path (build 129): rotted stripes along the holes are taken out there too
+    (before, only the thumbnail and LaMa paths did it). Bench: no measurable effect.
   - `seam_guard` (build 131): per run of hole blocks in a row, the new fill is compared with the
     fill the photo came with (repair or jigsaw) at the real rows above and below; where the new
     one meets them worse (`SEAM_PREF = 0.75`, `SEAM_MIN = 4.0`), the earlier fill stays. Meant
-    for the dark bars and flat bands of 100_0239; not yet tried on the graphics card.
+    for the dark bars and flat bands of 100_0239; not yet tried on the graphics card. On the
+    bench and on 100_2311 it kept nothing (no harm, no effect so far).
+  - Bench of the night's steps (6 photos, one off at a time, against build 131): texture costs
+    0.08 dB psnr and 0.012 ssim, gives detail 0.65 -> 0.74; destripe and the guided-path stripes
+    change nothing measurable; bridging was the loss (above).
   - diffusion (SD 1.5, build 126): faces, skin (with a margin) and the date stamp are never
     repainted; they keep the earlier fill.
 - Photos with no whole thumbnail: the GUI skips their enhanced copy, the CLI/MCP path makes it.
@@ -213,6 +220,8 @@ SDXL inpainting for the diffusion step: no ready ONNX export exists (checked 202
 release; starting it needs the owner's OK (publishing model files; OpenRAIL++-M terms pass on).
 
 Known problems:
+- Rotted decoded rows the stripe detection misses stay in the enhanced copy as thin light or
+  dark lines (100_2311: a light line across the legs, already in the repair).
 - The Enhancer fails on repaired files that do not open (header wholly destroyed).
 - GUI and CLI treat rescued thumbnails differently (enhanced copy or not).
 - (fixed in build 127: onnxruntime warnings off, job log lines cleaned)

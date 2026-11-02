@@ -703,6 +703,9 @@ def _hole_distance(holes: np.ndarray, far: int) -> np.ndarray:
 
 
 BRIDGE_THIN = 32  # pixels: a hole this thin between real rows is bridged from the rows above and below
+# Off (build 132): bridging column by column smeared feet, floors and beams into vertical streaks
+# where LaMa or the guided network had drawn them well (bench -0.95 dB, more stripes; 100_2311)
+BRIDGE = False
 
 
 def bridge_thin(arr: np.ndarray, holes: np.ndarray, real: np.ndarray, most: int = BRIDGE_THIN) -> tuple[np.ndarray, int]:
@@ -1251,7 +1254,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
                 arr = sharpen_holes(arr, holes, engine, report("Real-ESRGAN tile"), stop=stop, stats=st)
                 arr = keep_block_means(arr, filled_arr, holes, holes & ~unknown)
                 done.append(f"holes sharpened (Real-ESRGAN, {st.get('tiles', 0)} tiles, {_took(t0)})")
-        if BRIDGE_THIN:
+        if BRIDGE:
             arr, n_thin = bridge_thin(arr, holes, real)
             if n_thin:
                 done.append(f"thin holes bridged from the rows above and below ({100 * n_thin / max(1, int(holes.sum())):.0f} % of the holes)")
