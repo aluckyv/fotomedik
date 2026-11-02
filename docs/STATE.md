@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 154.
+Last update: 2026-11-02, build 155.
 
 ## How the work is done
 
@@ -177,6 +177,16 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
     change nothing measurable; bridging was the loss (above).
   - diffusion (SD 1.5, build 126): faces, skin (with a margin) and the date stamp are never
     repainted; they keep the earlier fill.
+  - `flat_ground` (build 155, photos without a whole thumbnail): blocks flat in the repaired
+    copy, flat in the enhanced copy too, of the same tone (per channel: a pink junk row
+    healed to gray differs) and on flat ground around keep the repaired copy's pixels,
+    feathered 6 px; runs after the texture step, before destripe and rows. Why: on 100_0270
+    (no thumbnail, 53 % holes) the sky, smooth in the repaired copy, came out banded: LaMa
+    paints each wide hole band up to 8 levels lighter (the holes are unknown, so
+    `keep_block_means` left their tones), real sky rows were healed as "wrongly coloured
+    stripes", and the texture step copied lines in. 45 % of 0270 went back; people, poles and
+    benches kept the AI's work. The LaMa path also pins unknown holes' block means to the
+    fill's where the fill and the ground around are flat (`flat_holes`, not for junk rows).
 - Photos with no whole thumbnail: the GUI skips their enhanced copy, the CLI/MCP path makes it.
 
 ## FotoMedik for Claude (MCP)
