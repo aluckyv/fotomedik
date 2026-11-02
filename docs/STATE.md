@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 136.
+Last update: 2026-11-02, build 137.
 
 ## How the work is done
 
@@ -116,6 +116,15 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
     the owner's graphics card). On 100_0223, `rowsnear` changed almost nothing: its stripes are
     stacked, so the rows around are off too. `rows` calmed its sky a lot; faces and skin are
     left out (build 136: without that, a face passed for a flat surface and went blotchy).
+  - Graphics card results, build 136 (2026-11-02): `rowsnear` changed nothing anywhere (0223:
+    0.04 % of pixels; dense-head and dense-nothumb benches identical to 134) and was removed
+    (build 137). `rows` on dense-head: psnr 15.23 -> 15.25, good 0.422 -> 0.428 (better on 13
+    of the 14 photos it touched), ssim 0.6016 -> 0.6010; on 100_0226 it put white and grey blots
+    into clouds and darkened a tree, because the rescued thumbnail's blurred colour was taken as
+    the target where the thumbnail itself changes. Build 137: the correction fades out where
+    the reference spreads 6..14 levels over 5x5 blocks (soft, 12 px), so only plain sky moves.
+    `holemap` (the old behaviour) on dense-nothumb: 13.06 vs 13.07 dB, equal; build 134 stays
+    for 0223's sake.
   - `level_real` (build 133, `LEVEL_FROM_NET`): the guided network moves decoded rows of a
     rotted level (too bright, tinted; the repair kept them) to the thumbnail's level;
     protect_real used to put them back between its fill as bands (100_0239: dark and light
@@ -163,6 +172,10 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   to the newest GitHub build; a code-only build is swapped in at once (new jobs use it), a new
   base is staged for the launcher. The running server keeps its old code until Claude restarts
   it: `app_info` shows `build` (the server's) and `installed_build` (on disk, what jobs run).
+  A staged base is NOT put in by restarting Claude: Claude starts `app\base\FotoMedik.exe`
+  itself, not the launcher, and holds its files. The owner closes Claude fully, opens
+  FotoMedik once from its shortcut (the launcher swaps the parts in), then opens Claude.
+  The base id hashes `pip freeze`, so a floating dependency on the build machine can change it.
   A server started before build 125 has no `update_app` at all: Claude has to be restarted once.
 - Claude's screen control of the owner's computer lapses after 30 minutes without use and needs
   the owner's approval again: do not plan unattended installs on it.

@@ -25,7 +25,7 @@ from pathlib import Path
 from . import install
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".jpe", ".~cr"}  # the same as cli.IMAGE_SUFFIXES
-STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces", "rows", "rowsnear",
+STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces", "rows",
          "holemap")  # ai.run.STEPS
 DEFAULT_STEPS = "puzzle,burst,deblock,thumbsr"
 FINISHED = ("done", "failed", "stopped", "cancelled", "interrupted")
@@ -523,8 +523,10 @@ def update_program(install_it: bool = True) -> dict:
     parts = install.stage(rel)
     if "base" in parts:
         return {**out, "updated": False, "staged": parts,
-                "note": "the new build changes the program's base; it is put in the next time FotoMedik "
-                        "starts (open it once, or restart Claude)"}
+                "note": "the new build changes the program's base; it is put in when FotoMedik is opened "
+                        "from its own shortcut while Claude is closed (Claude starts the program "
+                        "itself, not through the launcher): close Claude fully, open FotoMedik "
+                        "once, then open Claude again"}
     install.apply_pending()
     return {**out, "updated": True, "installed_build": rel.build,
             "note": "new jobs use the new build; this connection keeps the old code until Claude restarts it"}

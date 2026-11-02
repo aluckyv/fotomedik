@@ -971,25 +971,38 @@ def destripe(arr: np.ndarray, thumb: np.ndarray | None = None,
 
 
 ROW_OFF = 6.0  # gray levels a run of blocks must stray to be evened (destripe asks for 14)
-ROW_AGREE = 3.0  # the rows above and below must agree this well (neighbour mode)
 ROW_RUN = 4  # blocks in a row a run needs
 ROW_FLAT = 6.0  # luma spread inside a block below which it is flat
+# Where the reference itself changes (clouds, branches) its blurred colour is no target: the
+# correction fades from full where the reference spreads under ROW_REF_LO levels across 5x5
+# blocks to none above ROW_REF_HI (build 136 put white and grey blots in 100_0226's clouds).
+ROW_REF_LO, ROW_REF_HI = 6.0, 14.0
+ROW_FADE = 12  # px, softening of that fade, so no edge shows where it starts
 
 
-def even_rows(arr: np.ndarray, ref: np.ndarray | None = None, ref_real: np.ndarray | None = None,
+def _spread5(t: np.ndarray) -> np.ndarray:
+    """max - min over 5x5 blocks around each block, the largest of the channels."""
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    p = np.pad(t, ((2, 2), (2, 2), (0, 0)), mode="edge")
+    win = sliding_window_view(p, (5, 5), axis=(0, 1))
+    return (win.max(axis=(-2, -1)) - win.min(axis=(-2, -1))).max(axis=-1)
+
+
+def even_rows(arr: np.ndarray, ref: np.ndarray, ref_real: np.ndarray | None = None,
               avoid: np.ndarray | None = None) -> tuple[np.ndarray, int]:
     """Short rows of blocks a shade too bright or dark on a flat surface (a sky): decoded runs
-    of a rotted level the repair kept, too faint for `destripe`. With `ref` (a thumbnail
-    rescued in part, `ref_real` where it is real) a run moves to the reference's colour,
-    allowing for its own colour offset around; without one, to the rows right above and below
-    when those agree with each other. `avoid` (faces, skin): blocks touching it are never
-    moved (a face is flat enough to pass for sky; 100_0223 went dark). Returns (rgb, blocks evened)."""
+    of a rotted level the repair kept, too faint for `destripe`. A run moves to the colour of
+    `ref` (a thumbnail rescued in part, `ref_real` where it is real), allowing for its own
+    colour offset around, and only where the reference is flat too. `avoid` (faces, skin):
+    blocks touching it are never moved (a face is flat enough to pass for sky; 100_0223 went
+    dark). Returns (rgb, blocks evened)."""
     from ..recipes.r12_smooth import surface
     from .patchfill import box_blur
 
     h, w = arr.shape[:2]
     bh, bw = h // 8, w // 8
-    if bh < 8 or bw < 8:
+    if bh < 8 or bw < 8 or ref is None or ref.shape[:2] != arr.shape[:2]:
         return arr, 0
     a = arr[: bh * 8, : bw * 8].astype(np.float32)
     m = a.reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
@@ -997,41 +1010,31 @@ def even_rows(arr: np.ndarray, ref: np.ndarray | None = None, ref_real: np.ndarr
     flat = luma.reshape(bh, 8, bw, 8).std(axis=(1, 3)) < ROW_FLAT
     if avoid is not None and avoid.shape[:2] == arr.shape[:2]:
         flat &= ~avoid[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).any(axis=(1, 3))
-    if ref is not None:
-        if ref.shape[:2] != arr.shape[:2]:
-            return arr, 0
-        t = ref[: bh * 8, : bw * 8].astype(np.float32).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
-        known = np.ones((bh, bw), bool)
-        if ref_real is not None and ref_real.shape[:2] == arr.shape[:2]:
-            known = ref_real[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).mean(axis=(1, 3)) > 0.99
-        d = m - t
-        wgt = (flat & known & (np.abs(d).max(axis=-1) < 4 * ROW_OFF)).astype(np.float32)
-        r = STRIPE_BIAS // 2
-        den = box_blur(wgt[..., None], r)
-        target = t + box_blur(d * wgt[..., None], r) / np.maximum(den, 1e-6)
-        valid = flat & known & (den[..., 0] > 1e-6)
-    else:
-        up, dn = np.empty_like(m), np.empty_like(m)
-        up[1:], up[0] = m[:-1], m[0]
-        dn[:-1], dn[-1] = m[1:], m[-1]
-        fu, fd = np.zeros_like(flat), np.zeros_like(flat)
-        fu[1:], fd[:-1] = flat[:-1], flat[1:]
-        target = (up + dn) / 2
-        valid = flat & fu & fd & (np.abs(up - dn).max(axis=-1) < ROW_AGREE)
+    t = ref[: bh * 8, : bw * 8].astype(np.float32).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+    known = np.ones((bh, bw), bool)
+    if ref_real is not None and ref_real.shape[:2] == arr.shape[:2]:
+        known = ref_real[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).mean(axis=(1, 3)) > 0.99
+    d = m - t
+    wgt = (flat & known & (np.abs(d).max(axis=-1) < 4 * ROW_OFF)).astype(np.float32)
+    r = STRIPE_BIAS // 2
+    den = box_blur(wgt[..., None], r)
+    target = t + box_blur(d * wgt[..., None], r) / np.maximum(den, 1e-6)
+    valid = flat & known & (den[..., 0] > 1e-6)
     off = np.abs(m - target).max(axis=-1)
     cand = valid & (off > ROW_OFF) & (off < 4 * ROW_OFF)
     bad = _runs(cand, ROW_RUN, 1)
     if not bad.any():
         return arr, 0
-    if ref is not None:  # the reference's offset again, without the runs themselves pulling it
-        wgt = wgt * ~bad
-        den = box_blur(wgt[..., None], r)
-        target = np.where(den > 1e-6, t + box_blur(d * wgt[..., None], r) / np.maximum(den, 1e-6), target)
+    wgt = wgt * ~bad  # the reference's offset again, without the runs themselves pulling it
+    den = box_blur(wgt[..., None], r)
+    target = np.where(den > 1e-6, t + box_blur(d * wgt[..., None], r) / np.maximum(den, 1e-6), target)
     corr_b = np.where(bad[..., None], target - m, 0.0)
     corr = np.stack([surface(corr_b[..., c]) for c in range(3)], axis=-1)
+    fade_b = np.clip((ROW_REF_HI - _spread5(t)) / (ROW_REF_HI - ROW_REF_LO), 0, 1).astype(np.float32)
+    fade = box_blur(np.repeat(np.repeat(fade_b, 8, 0), 8, 1)[..., None], ROW_FADE)
     out = arr.astype(np.float32)
-    out[: bh * 8, : bw * 8] += corr[: bh * 8, : bw * 8]
-    return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(bad.sum())
+    out[: bh * 8, : bw * 8] += corr[: bh * 8, : bw * 8] * fade
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8), int((bad & (fade_b > 0)).sum())
 
 
 def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray,
@@ -1404,15 +1407,12 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         if n_even:
             done.append(f"{n_even} block(s) of bands and lines on flat surfaces evened out ({_took(t0)})")
         n_rows = 0
-        if thumb is None and ("rows" in steps and ref is not None or "rowsnear" in steps):
+        if thumb is None and "rows" in steps and ref is not None:
             from .guard import face_mask
             from .patchfill import skin
 
             people = face_mask(arr, engine.face_det) | skin(arr)
-            if "rows" in steps and ref is not None:
-                arr, n_rows = even_rows(arr, ref, ref_real, people)
-            else:
-                arr, n_rows = even_rows(arr, avoid=people)
+            arr, n_rows = even_rows(arr, ref, ref_real, people)
         if n_rows:
                 done.append(f"{n_rows} block(s) of faint rows on flat surfaces evened out")
     if "faces" in steps and engine.face_s is not None:

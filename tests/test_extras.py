@@ -386,18 +386,23 @@ def test_level_real_puts_a_wrongly_bright_row_on_the_networks_level_and_keeps_it
     assert (out[holes] == real[holes]).all()  # holes are not this step's business
 
 
-def test_even_rows_moves_a_faint_run_to_the_reference_or_to_the_rows_around():
+def test_even_rows_moves_a_faint_run_to_the_reference_only_where_the_reference_is_flat():
     from fotomedik.ai.enhance import even_rows
 
     sky = np.zeros((96, 160, 3), np.uint8)
     sky[:] = (120, 160, 210)
     off = sky.copy()
     off[40:48, 24:120] = (130, 170, 220)  # a run of 12 blocks ten levels too bright
-    for kw in ({"ref": sky}, {}):  # without a reference the rows above and below agree, so they decide
-        out, n = even_rows(off, **kw)
-        run = out[40:48, 40:100].astype(float)
-        assert n >= 10 and np.abs(run.mean(axis=(0, 1)) - sky[0, 0]).max() <= 1.5  # the run's average is back
-        assert np.abs(run - sky[40:48, 40:100]).max() <= 4  # smoothly, no new step
+    out, n = even_rows(off, sky)
+    run = out[40:48, 40:100].astype(float)
+    assert n >= 10 and np.abs(run.mean(axis=(0, 1)) - sky[0, 0]).max() <= 1.5  # the run's average is back
+    assert np.abs(run - sky[40:48, 40:100]).max() <= 4  # smoothly, no new step
     real_ref = np.zeros(sky.shape[:2], bool)  # a rescued thumbnail that is real nowhere says nothing
-    out, n = even_rows(off, ref=sky, ref_real=real_ref)
+    out, n = even_rows(off, sky, real_ref)
     assert n == 0 and (out == off).all()
+    cloud = sky.astype(int)  # where the reference changes (a cloud) its blurred colour is no target
+    for by in range(12):
+        for bx in range(10, 20):
+            cloud[by * 8: by * 8 + 8, bx * 8: bx * 8 + 8] += 9 if (by + bx) % 2 else -9
+    out, n = even_rows(off, cloud.astype(np.uint8))
+    assert n <= 6 and (out[:, 96:] == off[:, 96:]).all()
