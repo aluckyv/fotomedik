@@ -19,8 +19,37 @@ def _code_on_path() -> None:
 
 _code_on_path()
 
+def _crash_log():
+    """Where an error that ends the program is written (the windowed program has no console):
+    FotoMedik-crash.txt in the program's home; a hard crash goes there too (faulthandler)."""
+    import faulthandler
+    import os
+
+    try:
+        base = os.environ.get("FOTOMEDIK_HOME") or os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"), "FotoMedik")
+        os.makedirs(base, exist_ok=True)
+        f = open(os.path.join(base, "FotoMedik-crash.txt"), "w", encoding="utf-8")  # noqa: SIM115
+        faulthandler.enable(f, all_threads=True)
+        return f
+    except OSError:
+        return None
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()  # worker processes of the packaged app start here
+    crash = _crash_log()
     from fotomedik.gui.app import main
 
-    sys.exit(main())
+    try:
+        rc = main()
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+
+        if crash is not None:
+            crash.write(traceback.format_exc())
+            crash.flush()
+        raise
+    sys.exit(rc)
