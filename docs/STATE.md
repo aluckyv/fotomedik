@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02 (night), build 128.
+Last update: 2026-11-02 (night), build 131.
 
 ## How the work is done
 
@@ -115,6 +115,14 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
     thumbnail, or only where a rescued thumbnail is real (`rescued_picture`). Small effect.
   - `TEXTURE_WITH_FILL` (build 126): the patch step's texture runs after thumbsr/ai/diffusion
     without being asked for. Owner to confirm in the morning; switch back if it looks wrong.
+    Build 130: texture is looked for near the hole first (`patchfill.NEAR`), and only close
+    matches are taken (`MATCH_MAX = 10`): build 128 copied wrong texture from far away.
+  - guided-network path (build 129): rotted stripes along the holes are taken out and thin holes
+    bridged there too (before, only the thumbnail and LaMa paths did it).
+  - `seam_guard` (build 131): per run of hole blocks in a row, the new fill is compared with the
+    fill the photo came with (repair or jigsaw) at the real rows above and below; where the new
+    one meets them worse (`SEAM_PREF = 0.75`, `SEAM_MIN = 4.0`), the earlier fill stays. Meant
+    for the dark bars and flat bands of 100_0239; not yet tried on the graphics card.
   - diffusion (SD 1.5, build 126): faces, skin (with a margin) and the date stamp are never
     repainted; they keep the earlier fill.
 - Photos with no whole thumbnail: the GUI skips their enhanced copy, the CLI/MCP path makes it.
@@ -127,6 +135,9 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   to the newest GitHub build; a code-only build is swapped in at once (new jobs use it), a new
   base is staged for the launcher. The running server keeps its old code until Claude restarts
   it: `app_info` shows `build` (the server's) and `installed_build` (on disk, what jobs run).
+  A server started before build 125 has no `update_app` at all: Claude has to be restarted once.
+- Claude's screen control of the owner's computer lapses after 30 minutes without use and needs
+  the owner's approval again: do not plan unattended installs on it.
 - The window's **Check for updates** button (next to Connect to Claude) asks GitHub on demand.
 - Build numbers are GitHub run numbers (failed runs count too): main went 121 -> 124.
 - Jobs: JSON files in `%LOCALAPPDATA%\FotoMedik\jobs`, run one at a time by a detached runner
