@@ -173,6 +173,8 @@ class DiffusionXL(Diffusion):
         """((1, 77, 2048) hidden states, (1, 1280) pooled) for `prompt`."""
         key = " ".join(prompt.lower().split()) if (prompt and self.tokenizer is not None) else ""
         if key not in self._emb2:
+            if self.text is None:  # released: a prompt not worked out before is painted without one
+                return self.embedding2("")
             parts, pooled = [], None
             for net, pad in ((self.text, EOS), (self.text2, 0)):  # the second one pads with "!"
                 inp = net.get_inputs()[0]
@@ -184,6 +186,13 @@ class DiffusionXL(Diffusion):
                     pooled = res["text_embeds"].astype(np.float32)
             self._emb2[key] = (np.concatenate(parts, axis=-1), pooled)
         return self._emb2[key]
+
+    def release_text(self, prompts) -> None:
+        """Work out the embeddings of `prompts` (and of no prompt), then let the two text
+        encoders go: 1.6 GB of the graphics card's memory back for the UNet."""
+        for p in list(prompts) + [""]:
+            self.embedding2(p or "")
+        self.text = self.text2 = None
 
     def condition(self, prompt: str, size: int) -> dict[str, np.ndarray]:
         ins = {i.name: i for i in self.unet.get_inputs()}
@@ -251,6 +260,8 @@ def repaint_holes(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
 
     divisor, steps = PRESETS[quality or DEFAULT_PRESET]
     prompt = DEFAULT_PROMPT if prompt is None else prompt
+    if hasattr(engine.sd, "release_text") and getattr(engine.sd, "text", None) is not None:
+        engine.sd.release_text([prompt])
     h, w = holes.shape
     divisor = working_divisor(max(h, w), divisor)
     st: dict = {}

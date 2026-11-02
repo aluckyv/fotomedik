@@ -191,6 +191,12 @@ class Engine:
                 avail = [p for p in avail if p not in ("CUDAExecutionProvider", "TensorrtExecutionProvider")]
         gpu = [p for p in GPU_PROVIDERS if p in avail]
         providers = gpu + ["CPUExecutionProvider"]
+        if "sdxl" in steps and "CUDAExecutionProvider" in providers:
+            # SDXL's 5 GB network has to fit beside the others on the card: every network takes
+            # only the memory it asks for (by default CUDA's pool grows in doublings and keeps
+            # it), or the card overflows into shared memory and runs ten times slower
+            providers = [("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"})
+                         if p == "CUDAExecutionProvider" else p for p in providers]
 
         def make(path):
             so = ort.SessionOptions()

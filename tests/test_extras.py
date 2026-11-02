@@ -250,6 +250,10 @@ def test_diffusion_fill_keeps_real_pixels():
     assert seen["time_ids"] == [64, 64, 0, 0, 64, 64]
     assert seen["ids"][0][:3] == [49406, 49407, 49407] and seen["ids"][1][:3] == [49406, 49407, 0]  # "!" pads the 2nd
     assert DiffusionXL.window == 1024
+    xl.release_text(["a sharp photo"])  # the text encoders go once their embeddings are known
+    assert xl.text is None and xl.text2 is None
+    out = diffusion_fill(arr, holes, np.zeros_like(holes), xl, size=64, steps=3, prompt="a sharp photo")
+    assert np.array_equal(out[~holes], arr[~holes])
 
 
 def test_wrongly_coloured_stripes_next_to_holes_are_healed_too():
