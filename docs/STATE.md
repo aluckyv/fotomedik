@@ -196,7 +196,10 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   updates), and keeps the id's text as `base_id.txt` with the build's files, to diff when a
   build brings a new base again. Builds 135, 136 and 137 each brought one without a change of ours;
   139 -> 140 -> 141 were code-only, but 142 brought one again (cause unknown: the artifact with
-  `base_id.txt` cannot be fetched from here, so the build log now prints it too).
+  `base_id.txt` cannot be fetched from here, so the build log now prints it too). Build 143's log
+  showed the cause: `pip freeze` also listed the build machine's own pipx, argcomplete,
+  filelock, platformdirs, userpath and colorama, which its image updates. Since build 144 the id
+  takes only the packages pinned in `base-constraints.txt` (`scripts/base_freeze.py`).
   A server started before build 125 has no `update_app` at all: Claude has to be restarted once.
 - Claude's screen control of the owner's computer lapses after 30 minutes without use and needs
   the owner's approval again: do not plan unattended installs on it.

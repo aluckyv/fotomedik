@@ -110,7 +110,7 @@ jobs:
           Get-ChildItem code_stage -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
           Compress-Archive -Path code_stage\fotomedik -DestinationPath assets\fotomedik-code.zip -Force
           Copy-Item dist_launcher\FotoMedik.exe assets\FotoMedik.exe
-          $freeze = (pip freeze | Where-Object { $_ -notmatch '^-e |fotomedik' }) -join "`n"
+          $freeze = (python scripts/base_freeze.py base-constraints.txt) -join "`n"
           $id_text = (python --version) + "`n" + $freeze + "`n" + (Get-Content -Raw base_manifest.txt) + (Get-Content -Raw fotomedik.spec) + (Get-Content -Raw fotomedik_app.py)
           # kept with the build's files, to see what changed when a build brings a new base
           $id_text | Set-Content -Encoding utf8 assets\base_id.txt
