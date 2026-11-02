@@ -286,7 +286,7 @@ class Enhancer:
         self.say(f"Enhanced copies stopped after repeated errors (see {errlog.LOG_NAME})")
 
     def _work(self) -> None:
-        from ..runner import is_lost
+        from ..runner import is_lost, picture_damage
         from .enhance import Engine
 
         errlog.log_line(self.out, "--- " + errlog.system_info() + f"; steps: {', '.join(self.steps)}")
@@ -325,7 +325,7 @@ class Enhancer:
                         photos.add(i, rep, self.sources[i])
                         if (rep.output_name and rep.fallback is None and i not in self.skip
                                 and (not is_lost(rep) or self._lost_but_worth_it(rep))
-                                and (rep.holes or (whole_picture and rep.findings))):
+                                and (rep.holes or (whole_picture and picture_damage(rep)))):
                             pending.append(i)
                     ready = None
                     if pending and not in_hand:

@@ -12,3 +12,14 @@ def test_summary_says_how_the_run_went(tmp_path):
     assert "Photos: 3 of 3" in text and "partly recovered: 1" in text and "lost: 1" in text
     assert "Recovered on average: 57 %" in text and "2 min 5 s" in text
     assert "Errors: 2" in text and "FotoMedik-greske.txt" in text and "Enhanced copies made: 0" in text
+
+
+def test_preview_damage_alone_is_no_picture_damage():
+    from fotomedik.report.report import FileReport
+    from fotomedik.runner import picture_damage
+
+    rep = FileReport(name="a.jpg", output_name="a.jpg", size_in=10, size_out=10, recovered_pct=100.0,
+                     findings=[{"kind": "thumbnail_damaged", "severity": "low"}])
+    assert not picture_damage(rep)  # no whole-picture clean-up of an untouched photo
+    rep.findings.append({"kind": "scan_error", "severity": "high"})
+    assert picture_damage(rep)

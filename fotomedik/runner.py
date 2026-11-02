@@ -89,6 +89,15 @@ def is_lost(rep: FileReport) -> bool:
     return verdict(rep) in LOST
 
 
+NOT_PICTURE = {"thumbnail_damaged"}  # findings about the header's preview, not the picture
+
+
+def picture_damage(rep: FileReport) -> bool:
+    """The picture itself was found damaged (a rotted Exif preview alone is no reason to
+    clean up a whole 16 MP picture: build 159 made such copies of untouched photos)."""
+    return any(f.get("kind") not in NOT_PICTURE for f in rep.findings)
+
+
 @dataclass
 class Step:
     title: str
