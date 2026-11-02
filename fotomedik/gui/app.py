@@ -1089,7 +1089,9 @@ def main(argv: list[str] | None = None) -> int:
     if args:
         w._set_inputs([Path(a) for a in args])
     w.show()
-    return app.exec()
+    rc = app.exec()
+    _settle(w, app)
+    return rc
 
 
 def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, ai: bool = False) -> int:
@@ -1167,5 +1169,19 @@ def _smoke(app: QApplication, w: MainWindow, src: Path, out: Path, shot: Path, a
     t.timeout.connect(poll)
     t.start(200)
     app.exec()
+    _settle(w, app)
     print(f"smoke: {len(w.results)}/{w.total} photos, exit {code['v']}")
     return code["v"]
+
+
+def _settle(w: MainWindow, app: QApplication) -> None:
+    """Let the repair thread end and the window close before Qt is torn down: a QThread
+    still running when the program ends aborts it ("Fatal Python error: Aborted", builds
+    149-153 in CI, right after the self-test had passed)."""
+    if w.worker is not None:
+        w.worker.stop.set()
+    if w.thread is not None and w.thread.isRunning():
+        w.thread.quit()
+        w.thread.wait(10000)
+    w.close()
+    app.processEvents()
