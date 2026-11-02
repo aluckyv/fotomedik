@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 121.
+Last update: 2026-11-02, build 122.
 
 ## How the work is done
 
@@ -60,7 +60,7 @@ Last update: 2026-11-02, build 121.
 | R9 | lost intervals | holes filled (thumbnail-guided DC field, smooth surface, not flat squares) |
 | R10 | intact tail after a rotted stretch | tail scan in C, cut where colours step away from the thumbnail |
 | R11 | intact stretches in the middle of damage | placed by the thumbnail, or by their own seam without one |
-| R12 | holes | smooth surface (`surface()`) |
+| R12 | holes | smooth surface (`surface()`); tails after a hole set to the level of their seams (`tail_shifts`, see below) |
 | R13 | orientation | portrait photos upright |
 | R14 | decoded garbage (patterns, saturated patches, another photo's data) | becomes a hole and is filled again |
 
@@ -68,16 +68,34 @@ Also: damaged thumbnails are rescued (header borrowed from a healthy thumbnail o
 camera, `dcfield._rescue_thumbnail`); the jigsaw puts the pieces of photos with restart
 markers back by the thumbnail (`ai/puzzle.py`, used as the `puzzle` step).
 
+Tail levels (R12, build 122): a run decoded after a hole in the same interval has a DC level
+that is only R10's estimate. `tail_shifts` sets every such run to the median of the pixel
+differences across its seams with real blocks (L1, the principle of Li, Karrenbauer, Saupe,
+Kuo 2011; one unknown per run, all runs solved together by coordinate descent), only when the
+seams above and below agree and the blocks stay possible colours; the shift goes into the
+hole's last DC, the run's bits are copied as they are. Small gain: on the bench DC-type
+errors 3358 -> 3213 blocks; most of the rest lie in runs with holes above and below.
+
 Real damage in the owner's photos is mostly *dense rot*: about 30 % of the card sectors are
 someone else's data. Bit guessing cannot bring that back; it is skipped on dense damage.
 
 ## The enhanced copy (`<name>_enhanced.jpg`)
 
-Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffusion`, `faces`.
-The default for jobs is `puzzle,burst,deblock,thumbsr`.
+Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffusion`, `patch`,
+`faces`. The default for jobs is `puzzle,burst,deblock,thumbsr` (`patch` is not on by default yet).
 
 - `puzzle`: jigsaw by the thumbnail (or a rescued thumbnail as a map); junk blocks of a piece
-  (far off the thumbnail's colour, `puzzle.BLOCK_OFF = 40`) are left out.
+  (far off the thumbnail's colour, `puzzle.BLOCK_OFF = 40`) are left out. Build 122: whole
+  regions of rows the repair put 8, 16, 24 rows off are moved first (`row_shifts`,
+  `shift_regions`): rows compared with the thumbnail at shifts of 8, clear rows decided, rows
+  between two that moved alike move alike, a lone decision not followed. Before, moved pieces
+  and unmoved repair rows (a sky fits anywhere) interleaved into stripes (100_0223 lost 24
+  rows at the top). Bench: 16 of 17 moved rows right; DSC_4537 psnr 28.86 -> 29.10.
+- `patch` (build 122, off by default): holes given the photo's own texture like Content-Aware
+  Fill (`ai/patchfill.py`): PatchMatch on a ~1000 px copy matched by the coarse look, voting
+  for coherence, only clipped fine detail carried onto the fill's coarse picture, none on
+  edges; faces, date stamp and skin neither textured nor taken from. Bench detail 0.66 -> 0.87
+  and 0.56 -> 0.84 of the truth's; psnr -0.3/-0.5, ssim -0.02/-0.035 (they prefer smooth).
 - `burst`: colours from similar shots of the set.
 - `deblock`: FBCNN JPEG clean-up; a fine-tuned and a guided variant (guided sees the thumbnail
   and the holes). The fine-tuned one is used only on photos of the size it learnt on.
@@ -131,7 +149,8 @@ CUDA build is gone: the AI runtime for the graphics card is downloaded by the ap
 Good photos are damaged like real cards and recoveries (`make --kind mixed|dense|dense-head|
 dense-nothumb|dense-rst|dense-rst-lost`), repaired, and scored against the truth (`score` for
 pictures made by the app). Metrics: `psnr`, `good`, `stripes`, `ssim`, `keep` (SSIM on the
-photo's own undamaged parts: did a step blur real detail), `faces`. The bench folder lives
+photo's own undamaged parts: did a step blur real detail), `detail` (fine detail in the damaged
+area against the truth's: 1 = as sharp, lower = smeared), `faces`. The bench folder lives
 outside the repository and has to be made again in a new environment.
 
 Last result, 12 photos of a dense-rst-lost bench (1600 px), steps `puzzle,burst,deblock,thumbsr`:

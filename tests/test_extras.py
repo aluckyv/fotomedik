@@ -287,3 +287,32 @@ def test_destripe_leaves_detail_lone_blocks_and_photos_without_a_thumbnail():
     assert n == 0 and (out == arr).all()
     same, n0 = destripe(arr, None)
     assert n0 == 0 and same is arr
+
+
+def test_texture_holes_gives_a_smooth_fill_the_photo_grain_and_leaves_the_rest():
+    from fotomedik.ai.patchfill import texture_holes
+
+    rng = np.random.default_rng(3)
+    base = np.full((256, 384, 3), (60, 120, 70), np.float32)  # grass
+    arr = np.clip(base + rng.normal(0, 10, base.shape), 0, 255).astype(np.uint8)
+    holes = np.zeros((256, 384), bool)
+    holes[96:144, :] = True  # a band the earlier steps filled smooth
+    arr[holes] = (60, 120, 70)
+    out = texture_holes(arr, holes)
+    assert (out[~holes] == arr[~holes]).all()  # the real pixels do not move
+    band = out[100:140, 20:360].astype(np.float32)
+    assert band.std(axis=(0, 1)).mean() > 4  # grain, not a flat colour
+    assert np.abs(band.mean(axis=(0, 1)) - (60, 120, 70)).max() < 4  # the fill's colour kept
+
+
+def test_texture_holes_leaves_skin_alone():
+    from fotomedik.ai.patchfill import texture_holes
+
+    rng = np.random.default_rng(4)
+    arr = np.clip(np.full((256, 384, 3), (60, 120, 70), np.float32) + rng.normal(0, 10, (256, 384, 3)), 0, 255)
+    arr = arr.astype(np.uint8)
+    holes = np.zeros((256, 384), bool)
+    holes[96:144, :] = True
+    arr[holes] = (205, 160, 135)  # an arm the fill made smooth
+    out = texture_holes(arr, holes)
+    assert (out[holes] == arr[holes]).all()
