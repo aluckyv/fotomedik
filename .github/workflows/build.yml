@@ -130,9 +130,10 @@ jobs:
           FOTOMEDIK_ASSETS: ${{ github.workspace }}\assets
           FOTOMEDIK_NO_WINDOW: "1"
         run: |
-          $p = Start-Process -FilePath assets\FotoMedik.exe -ArgumentList "--smoke","demo","demo_out_exe","shot_exe.png" -PassThru -Wait
+          $p = Start-Process -FilePath assets\FotoMedik.exe -ArgumentList "--smoke","demo","demo_out_exe","shot_exe.png" -PassThru -Wait -RedirectStandardError smoke_err.txt -RedirectStandardOutput smoke_out.txt
           Write-Host "exit code $($p.ExitCode)"
           if (Test-Path shot_exe.txt) { Get-Content shot_exe.txt | ForEach-Object { Write-Host "::notice title=smoke (installed)::$_" } }
+          foreach ($f in @("smoke_out.txt", "smoke_err.txt")) { if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) { Write-Host "--- $f ---"; Get-Content $f } }
           if ($p.ExitCode -ne 0) { exit 1 }
           if (!(Test-Path inst\app\base\FotoMedik.exe)) { exit 1 }
           if (!(Test-Path demo_out_exe\healthy.jpg)) { exit 1 }
