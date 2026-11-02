@@ -457,3 +457,28 @@ def test_even_rows_moves_a_faint_run_to_the_reference_only_where_the_reference_i
             cloud[by * 8: by * 8 + 8, bx * 8: bx * 8 + 8] += 9 if (by + bx) % 2 else -9
     out, n = even_rows(off, cloud.astype(np.uint8))
     assert n <= 6 and (out[:, 96:] == off[:, 96:]).all()
+
+
+def test_flanked_runs_finds_short_decoded_stretches_between_holes_only():
+    from fotomedik.ai.enhance import flanked_runs
+
+    holes = np.zeros((32, 400), bool)
+    holes[8:16, :80] = True
+    holes[8:16, 128:] = True  # a 6-block stretch (80..128) between two holes: taken
+    holes[24:32, :40] = True  # a stretch with a hole on one side only: left
+    f = flanked_runs(holes)
+    assert f[8:16, 80:128].all() and f.sum() == 8 * 48
+    holes[8:16, 128:] = False
+    holes[8:16, 300:] = True  # now 220 px = 27 blocks: too long to be the decoder's guess
+    assert not flanked_runs(holes).any()
+
+
+def test_flank_junk_keeps_a_plain_stretch_and_takes_a_checkerboard():
+    from fotomedik.ai.enhance import flank_junk
+
+    arr = np.full((32, 128, 3), 140, np.uint8)
+    arr[8:16, 64:72] = np.indices((8, 8)).sum(axis=0)[..., None] % 2 * 255  # a checkerboard block
+    flank = np.zeros((32, 128), bool)
+    flank[8:16, 32:96] = True
+    j = flank_junk(arr, flank)
+    assert j[8:16, 64:72].all() and not j[8:16, 32:64].any()

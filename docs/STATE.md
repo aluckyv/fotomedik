@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 142.
+Last update: 2026-11-02, build 144.
 
 ## How the work is done
 
@@ -200,6 +200,13 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   showed the cause: `pip freeze` also listed the build machine's own pipx, argcomplete,
   filelock, platformdirs, userpath and colorama, which its image updates. Since build 144 the id
   takes only the packages pinned in `base-constraints.txt` (`scripts/base_freeze.py`).
+- 100_2311's light line (2026-11-02): across a hole the whole photo wide, the repair kept a
+  6-block decoded stretch (black, checkerboard, coloured dots) as real; the junk check caught
+  one block of it. On the benches (dh, dn, dense, rstl) decoded stretches of up to 16 blocks
+  with holes on both sides in their row were right (within 8 levels) only 5 % of the time,
+  junk (over 30) about half. Build 144 experiments: `flank` takes all of them as holes
+  (`flanked_runs`), `flankjunk` only those that jump against the block above or below or are
+  much rougher (`flank_junk`; 2311: 36 of 188 blocks, about half of the spot).
   A server started before build 125 has no `update_app` at all: Claude has to be restarted once.
 - Claude's screen control of the owner's computer lapses after 30 minutes without use and needs
   the owner's approval again: do not plan unattended installs on it.

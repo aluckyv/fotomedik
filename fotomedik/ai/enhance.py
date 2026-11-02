@@ -503,6 +503,8 @@ STRIPE_TOL = (40.0, 12.0)  # gray levels (luma, chroma) a block may differ from 
 STRIPE_RUN = 3  # blocks side by side that make a stripe
 JUNK_TOL = (50.0, 18.0)  # the same for decoded blocks next to a hole (the end of a rotted stretch)
 JUNK_NEAR = 16  # pixels from a hole within which decoded blocks are checked
+FLANK_JUNK_STEP = 25.0  # luma levels a stretch between two holes may differ from the block above or below
+FLANK_JUNK_RUFF = 10.0  # and how much rougher it may be than both (a checkerboard)
 STRIPE_EDGE = 48  # pixels above and below a rotted stripe where hole blocks off the thumbnail join it (thumbsr)
 LIGHT_LUMA = 200.0  # block brightness of a lamp or window, where the stripe test is not used (thumbsr)
 EDGE_AGREE = (10.0, 6.0)  # off the thumbnail by more than this (luma, chroma): still the stripe's edge
@@ -1240,6 +1242,58 @@ def rotted_stripes(before: np.ndarray, holes: np.ndarray, known: np.ndarray, thu
     return stripes, junk
 
 
+FLANK_MAX = 16  # blocks: a decoded stretch this short with holes on both sides in its row
+
+
+def flanked_runs(holes: np.ndarray, max_blocks: int = FLANK_MAX) -> np.ndarray:
+    """Decoded stretches of at most `max_blocks` blocks (8 px rows) with holes right and left
+    in the same row: the decoder's guess between two lost stretches. On the benches only 5 %
+    of them were right (within 8 levels), half were junk (100_2311: a checkerboard)."""
+    h, w = holes.shape
+    bh, bw = h // 8, w // 8
+    out = np.zeros_like(holes)
+    if bh == 0 or bw == 0:
+        return out
+    hb = holes[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).mean(axis=(1, 3)) > 0.5
+    rb = np.zeros_like(hb)
+    for y in np.nonzero(hb.any(axis=1))[0]:
+        row = hb[y]
+        x = 0
+        while x < bw:
+            if row[x]:
+                x += 1
+                continue
+            s = x
+            while x < bw and not row[x]:
+                x += 1
+            if s > 0 and x < bw and x - s <= max_blocks:
+                rb[y, s:x] = True
+    out[: bh * 8, : bw * 8] = np.repeat(np.repeat(rb, 8, 0), 8, 1)
+    return out & ~holes
+
+
+def flank_junk(arr: np.ndarray, flank: np.ndarray) -> np.ndarray:
+    """Blocks of `flank` that look like junk: their average jumps against the block above or
+    below (the edge of a stripe), or they are much rougher than both (a checkerboard)."""
+    h, w = flank.shape
+    bh, bw = h // 8, w // 8
+    out = np.zeros_like(flank)
+    if bh < 3 or bw == 0:
+        return out
+    luma = (arr[: bh * 8, : bw * 8].astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32))
+    b = luma.reshape(bh, 8, bw, 8)
+    mean, rough = b.mean(axis=(1, 3)), b.std(axis=(1, 3))
+    up_m, dn_m, up_r, dn_r = (np.empty_like(mean) for _ in range(4))
+    up_m[1:], up_m[0] = mean[:-1], mean[0]
+    dn_m[:-1], dn_m[-1] = mean[1:], mean[-1]
+    up_r[1:], up_r[0] = rough[:-1], rough[0]
+    dn_r[:-1], dn_r[-1] = rough[1:], rough[-1]
+    jb = (np.maximum(np.abs(mean - up_m), np.abs(mean - dn_m)) > FLANK_JUNK_STEP) \
+        | (rough > 2 * np.maximum(up_r, dn_r) + FLANK_JUNK_RUFF)
+    out[: bh * 8, : bw * 8] = np.repeat(np.repeat(jb, 8, 0), 8, 1)
+    return out & flank
+
+
 def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engine: Engine, steps,
                   burst=None, progress=None, quality: str | None = None, stop=None,
                   prompt: str | None = None, thumb: np.ndarray | None = None,
@@ -1270,6 +1324,15 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             real = np.where(filled[..., None], arr, real)
             holes = holes & ~filled
             unknown = unknown & ~filled
+    if {"flank", "flankjunk"} & steps and holes.any():  # experiments (build 144), see flanked_runs
+        flank = flanked_runs(holes)
+        if "flankjunk" in steps:  # only those that look like junk
+            flank &= flank_junk(arr, flank)
+        if flank.any():
+            holes = holes | flank
+            if keep is not None:  # after the jigsaw keep is every real pixel: these are no longer
+                keep = keep & ~flank
+            done.append(f"{int(flank.sum()) // 64} block(s) decoded between two holes taken as holes too")
     _check(stop)
     st: dict = {}
     file = engine.deblock_model.file if engine.deblock_model is not None else ""
