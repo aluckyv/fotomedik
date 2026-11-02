@@ -458,6 +458,8 @@ def puzzle(original: bytes, repaired: bytes, small: np.ndarray | None,
     holes = ~np.repeat(np.repeat(have.reshape(rows, cols), mh, 0), mw, 1)[:h, :w]
     base = ref
     if small_real is not None and rep_px is not None:
-        base = rep_px  # a rescued thumbnail's colours are not trusted in the holes: the repair's fill
+        # a rescued thumbnail's real part has the right colours (and follows the moved rows,
+        # which the repair's fill does not); its rotted rest is no map: the repair's fill there
+        base = np.where((vm > 250)[..., None], ref, rep_px)
     rgb = np.where(holes[..., None], base, canvas[:h, :w]).astype(np.uint8)
     return Placed(rgb, holes, placed, share, repair_share, shifted)

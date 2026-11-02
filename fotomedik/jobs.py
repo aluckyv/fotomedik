@@ -494,3 +494,35 @@ def latest() -> dict | None:
     jobs = all_jobs()
     running = [j for j in jobs if j.get("state") == "running"]
     return (running or jobs or [None])[-1]
+
+
+# ----------------------------------------------------------------------------- updating the program
+
+
+def update_program(install_it: bool = True) -> dict:
+    """Bring the installed FotoMedik up to the newest build on GitHub (for Claude, through
+    the MCP tool update_app). Only between jobs. Most builds change only the code part:
+    it is swapped in at once and every new job uses it (this server keeps the code it
+    started with until Claude restarts it). A build with a new base (Python, Qt...) is
+    downloaded and put in by the launcher the next time FotoMedik starts."""
+    from . import install
+
+    have = install.installed()
+    if have is None:
+        raise JobError("this is not the installed FotoMedik (run from source): nothing to update")
+    rel = install.Release()
+    out = {"installed_build": int(have.get("build", 0)), "newest_build": rel.build}
+    if not install.needs_update(rel, have):
+        return {**out, "updated": False, "note": "already the newest build"}
+    if not install_it:
+        return {**out, "updated": False, "note": "a newer build is available"}
+    if runner_alive():
+        raise JobError("a job is running: update after it (or stop it first)")
+    parts = install.stage(rel)
+    if "base" in parts:
+        return {**out, "updated": False, "staged": parts,
+                "note": "the new build changes the program's base; it is put in the next time FotoMedik "
+                        "starts (open it once, or restart Claude)"}
+    install.apply_pending()
+    return {**out, "updated": True, "installed_build": rel.build,
+            "note": "new jobs use the new build; this connection keeps the old code until Claude restarts it"}

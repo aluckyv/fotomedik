@@ -22,7 +22,8 @@ INSTRUCTIONS = (
     "FotoMedik repairs damaged JPEG photos on this computer. start_job queues a folder; jobs run one "
     "after another in the background (minutes per photo for the enhanced copies), so check them "
     "with job_status now and then instead of waiting. Originals are never changed: the output must "
-    "be another folder, and protected places set by the person are refused."
+    "be another folder, and protected places set by the person are refused. update_app brings the program "
+    "up to the newest build between jobs."
 )
 
 TOOLS = [
@@ -74,6 +75,14 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
     },
     {
+        "name": "update_app",
+        "description": ("Bring FotoMedik up to the newest build on GitHub, between jobs (refused while one runs). "
+                        "With install false only says whether a newer build exists. New jobs use the update at "
+                        "once; app_info shows installed_build."),
+        "inputSchema": {"type": "object", "properties": {
+            "install": {"type": "boolean", "description": "download and put it in (default true)", "default": True}}},
+    },
+    {
         "name": "app_info",
         "description": ("The FotoMedik build, where it keeps its files, the AI models and runtimes it has, "
                         "whether an NVIDIA driver is present, the protected places, and whether a job runs."),
@@ -113,6 +122,10 @@ def stop_job(job_id: str) -> dict:
     return {"result": jobs.stop(job_id)}
 
 
+def update_app(install: bool = True) -> dict:
+    return jobs.update_program(bool(install))
+
+
 def app_info() -> dict:
     from . import _build, install
     from .ai.cuda import nvidia_present
@@ -122,8 +135,10 @@ def app_info() -> dict:
     models = sorted(f"{p.name} ({p.stat().st_size >> 20} MB)" for p in md.glob("*.onnx")) if md.is_dir() else []
     rt = md.parent / "runtime"
     runtimes = sorted(p.name for p in rt.iterdir() if p.is_dir()) if rt.is_dir() else []
+    have = install.installed() or {}
     return {
         "build": _build.BUILD, "commit": _build.COMMIT[:7], "flavor": getattr(_build, "FLAVOR", "") or "",
+        "installed_build": have.get("build"),  # on disk: what new jobs run (the build above is this server's)
         "packaged": bool(getattr(sys, "frozen", False)), "home": str(install.home()),
         "models_dir": str(md), "models": models, "ai_runtimes_downloaded": runtimes,
         "nvidia_driver": nvidia_present(), "protected": jobs.settings()["protected"],
@@ -132,7 +147,7 @@ def app_info() -> dict:
 
 
 HANDLERS = {"start_job": start_job, "job_status": job_status, "list_jobs": list_jobs, "stop_job": stop_job,
-            "app_info": app_info}
+            "update_app": update_app, "app_info": app_info}
 
 
 def call_tool(name: str, args: dict) -> dict:
