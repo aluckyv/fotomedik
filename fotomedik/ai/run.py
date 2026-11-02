@@ -34,7 +34,8 @@ from PIL import Image
 from .. import errlog
 from ..report.report import FileReport
 
-STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces")
+# rows, rowsnear, holemap: experiments, off unless asked for (compared on the graphics card)
+STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces", "rows", "rowsnear", "holemap")
 STEP_NAMES = {
     "puzzle": "pieces put back by the thumbnail",
     "burst": "similar shots",
@@ -44,6 +45,9 @@ STEP_NAMES = {
     "diffusion": "maximum quality (diffusion)",
     "patch": "the photo's own texture in the holes",
     "faces": "faces",
+    "rows": "faint rows evened by the rescued thumbnail (experiment)",
+    "rowsnear": "faint rows evened by the rows around them (experiment)",
+    "holemap": "clean-up told where the holes are without a thumbnail, as before build 134 (experiment)",
 }
 NETWORK_STEPS = {"deblock", "ai", "thumbsr", "diffusion", "faces"}
 NEAR_FILES = 10  # photos this close in the list may be the same scene when their time is unknown

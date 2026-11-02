@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 134.
+Last update: 2026-11-02, build 135.
 
 ## How the work is done
 
@@ -109,6 +109,12 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
     only cleans what the repair and the jigsaw put in the holes. Before, it guessed grey and
     brown bands into skies (100_0223) and LaMa took its block colours from that guess. Photos
     with a thumbnail (the whole bench) are not affected.
+  - Experiments as steps (build 135, off unless named in `steps`): `rows` evens faint runs of
+    blocks on flat surfaces against a rescued thumbnail's real part (`even_rows`, 6 levels, runs
+    of 4 blocks); `rowsnear` against the rows above and below when those agree; `holemap` gives
+    the clean-up network the hole map without a thumbnail, as before build 134 (for A/B tests on
+    the owner's graphics card). On 100_0223, `rowsnear` changed almost nothing: its stripes are
+    stacked, so the rows around are off too.
   - `level_real` (build 133, `LEVEL_FROM_NET`): the guided network moves decoded rows of a
     rotted level (too bright, tinted; the repair kept them) to the thumbnail's level;
     protect_real used to put them back between its fill as bands (100_0239: dark and light

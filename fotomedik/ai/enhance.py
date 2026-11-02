@@ -970,8 +970,6 @@ def destripe(arr: np.ndarray, thumb: np.ndarray | None = None,
     return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(bad.sum())
 
 
-ROWS_RESCUED = False  # experiment: rows a shade off evened against a rescued thumbnail's real part
-ROWS_NEIGHBOURS = False  # experiment: rows a shade off evened against the rows above and below
 ROW_OFF = 6.0  # gray levels a run of blocks must stray to be evened (destripe asks for 14)
 ROW_AGREE = 3.0  # the rows above and below must agree this well (neighbour mode)
 ROW_RUN = 4  # blocks in a row a run needs
@@ -1022,6 +1020,10 @@ def even_rows(arr: np.ndarray, ref: np.ndarray | None = None,
     bad = _runs(cand, ROW_RUN, 1)
     if not bad.any():
         return arr, 0
+    if ref is not None:  # the reference's offset again, without the runs themselves pulling it
+        wgt = wgt * ~bad
+        den = box_blur(wgt[..., None], r)
+        target = np.where(den > 1e-6, t + box_blur(d * wgt[..., None], r) / np.maximum(den, 1e-6), target)
     corr_b = np.where(bad[..., None], target - m, 0.0)
     corr = np.stack([surface(corr_b[..., c]) for c in range(3)], axis=-1)
     out = arr.astype(np.float32)
@@ -1054,7 +1056,6 @@ def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known:
 
 
 DEBLOCK_TILE = 512
-DEBLOCK_HOLES_WITHOUT_THUMB = False  # the hole map for the network without a thumbnail (before build 134)
 DEBLOCK_PAD = 16
 
 
@@ -1083,7 +1084,8 @@ def guided_max_side(session) -> int:
 
 
 def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: dict | None = None,
-            holes: np.ndarray | None = None, thumb_small: np.ndarray | None = None) -> np.ndarray:
+            holes: np.ndarray | None = None, thumb_small: np.ndarray | None = None,
+            holemap: bool = False) -> np.ndarray:
     """Remove JPEG blocking and ringing from the whole picture (FBCNN), tile by tile. The
     guided network (fine-tuned with the thumbnail, four inputs) also gets the thumbnail at a
     quarter size and the holes per 8x8 block, and rebuilds the holes from them."""
@@ -1110,7 +1112,7 @@ def deblock(arr: np.ndarray, engine: Engine, progress=None, stop=None, stats: di
         # without the thumbnail the network is not told where the holes are: it only cleans what
         # the repair and the jigsaw put there (a rescued thumbnail's colours) instead of guessing
         # grey and brown bands into a sky that LaMa then kept (100_0223)
-        if (g is not None or DEBLOCK_HOLES_WITHOUT_THUMB) and holes is not None and holes.any():
+        if (g is not None or holemap) and holes is not None and holes.any():
             hm = holes[: h // 8 * 8, : w // 8 * 8]
             hb = hm.reshape(h // 8, 8, w // 8, 8).any(axis=(1, 3)).astype(np.float32)
         hb = np.pad(hb, ((p // 8, (p + T) // 8 + 2), (p // 8, (p + T) // 8 + 2)), mode="edge")
@@ -1244,7 +1246,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         done.append("JPEG clean-up left out: the photo is larger than the fine-tuned network learnt on")
     elif "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
-        arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small)
+        arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small, "holemap" in steps)
         n_lev = 0
         if PROTECT_REAL:  # the file's own pixels stay sharp: the clean-up works on the holes
             cleaned = arr
@@ -1399,9 +1401,9 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         if n_even:
             done.append(f"{n_even} block(s) of bands and lines on flat surfaces evened out ({_took(t0)})")
         n_rows = 0
-        if thumb is None and ROWS_RESCUED and ref is not None:
+        if thumb is None and "rows" in steps and ref is not None:
             arr, n_rows = even_rows(arr, ref, ref_real)
-        elif thumb is None and ROWS_NEIGHBOURS:
+        elif thumb is None and "rowsnear" in steps:
             arr, n_rows = even_rows(arr)
         if n_rows:
                 done.append(f"{n_rows} block(s) of faint rows on flat surfaces evened out")

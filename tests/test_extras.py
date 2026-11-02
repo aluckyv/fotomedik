@@ -384,3 +384,20 @@ def test_level_real_puts_a_wrongly_bright_row_on_the_networks_level_and_keeps_it
     assert row.std() > 4  # its own detail kept
     assert (out[8:24, 30:98] == real[8:24, 30:98]).all()  # a row at the right level is not touched
     assert (out[holes] == real[holes]).all()  # holes are not this step's business
+
+
+def test_even_rows_moves_a_faint_run_to_the_reference_or_to_the_rows_around():
+    from fotomedik.ai.enhance import even_rows
+
+    sky = np.zeros((96, 160, 3), np.uint8)
+    sky[:] = (120, 160, 210)
+    off = sky.copy()
+    off[40:48, 24:120] = (130, 170, 220)  # a run of 12 blocks ten levels too bright
+    for kw in ({"ref": sky}, {}):  # without a reference the rows above and below agree, so they decide
+        out, n = even_rows(off, **kw)
+        run = out[40:48, 40:100].astype(float)
+        assert n >= 10 and np.abs(run.mean(axis=(0, 1)) - sky[0, 0]).max() <= 1.5  # the run's average is back
+        assert np.abs(run - sky[40:48, 40:100]).max() <= 4  # smoothly, no new step
+    real_ref = np.zeros(sky.shape[:2], bool)  # a rescued thumbnail that is real nowhere says nothing
+    out, n = even_rows(off, ref=sky, ref_real=real_ref)
+    assert n == 0 and (out == off).all()
