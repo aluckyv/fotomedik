@@ -27,8 +27,10 @@ jobs:
           python-version: "3.11"
       - name: Install
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install "diffusers==0.31.0" "transformers==4.46.3" "optimum[exporters]==1.23.3" "onnx==1.17.0" "onnxruntime==1.20.1" onnxconverter-common accelerate safetensors
+          # torch and torchvision from the same CPU index, pinned together: a torchvision from PyPI
+          # (pulled in by optimum[exporters]) fails with "operator torchvision::nms does not exist"
+          pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch==2.5.1" "torchvision==0.20.1" "diffusers==0.31.0" "transformers==4.46.3" "optimum[exporters]==1.23.3" "onnx==1.17.0" "onnxruntime==1.20.1" onnxconverter-common accelerate safetensors
       - name: Export (fp32)
         run: |
           cd /mnt && sudo chown -R "$USER" /mnt
