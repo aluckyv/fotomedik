@@ -1098,6 +1098,20 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         # the guided network rebuilt the holes from the whole thumbnail itself, better than the
         # enlarged thumbnail would (bench: 31.5 dB alone, 31.0 with the thumbnail step after it)
         done.append("thumbnail step skipped: the guided network already rebuilt the holes from the thumbnail")
+        from .guard import date_stamp, face_mask
+
+        # decoded stripes of wrong colour along the holes (rotted data the repair kept) go too, and
+        # thin holes take the rows above and below rather than the thumbnail's guess (100_0239)
+        stamp = date_stamp(arr)
+        faces = face_mask(arr, engine.face_det) & ~stamp
+        _stripes, junk = rotted_stripes(arr, holes, holes & ~unknown, thumb, faces, stamp)
+        if junk.any():
+            holes = (holes | junk) & ~stamp
+            done.append(f"{int(junk.sum()) // 64} block(s) of wrongly coloured stripes taken out")
+        if BRIDGE_THIN:
+            arr, n_thin = bridge_thin(arr, holes, real)
+            if n_thin:
+                done.append(f"thin holes bridged from the rows above and below ({100 * n_thin / max(1, int(holes.sum())):.0f} % of the holes)")
         if BLEND_SEAMS:
             arr = blend_seams(arr, holes, arr)
     elif holes.any():
