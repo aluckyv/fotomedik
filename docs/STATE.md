@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02 (night), build 133.
+Last update: 2026-11-02, build 134.
 
 ## How the work is done
 
@@ -105,6 +105,10 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
 - After the steps (in `enhance.py`, landed 2026-11-02):
   - `protect_real`: the clean-up result stays only in the holes and fades over 8 px into the
     untouched pixels: real detail is no longer blurred.
+  - deblock without a whole thumbnail (build 134): the guided network gets no hole map, so it
+    only cleans what the repair and the jigsaw put in the holes. Before, it guessed grey and
+    brown bands into skies (100_0223) and LaMa took its block colours from that guess. Photos
+    with a thumbnail (the whole bench) are not affected.
   - `level_real` (build 133, `LEVEL_FROM_NET`): the guided network moves decoded rows of a
     rotted level (too bright, tinted; the repair kept them) to the thumbnail's level;
     protect_real used to put them back between its fill as bands (100_0239: dark and light
