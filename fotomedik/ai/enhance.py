@@ -837,6 +837,46 @@ def blend_seams(out: np.ndarray, holes: np.ndarray, real: np.ndarray) -> np.ndar
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)
 
 
+LEVEL_FROM_NET = True  # decoded rows on the guided network's level, their own detail kept
+LEVEL_RY, LEVEL_RX = 3, 24  # pixels: the window of the level, flat and wide (a decoded run is a row)
+LEVEL_LO, LEVEL_HI = 6.0, 16.0  # gray levels: below LO the row keeps its level, from HI it takes the network's
+
+
+def _box2(img: np.ndarray, ry: int, rx: int) -> np.ndarray:
+    """Mean over a (2ry+1) x (2rx+1) window, edges repeated; float32."""
+    a = img.astype(np.float32)
+    for axis, r in ((0, ry), (1, rx)):
+        if r <= 0:
+            continue
+        pad = [(0, 0)] * a.ndim
+        pad[axis] = (r + 1, r)
+        c = np.cumsum(np.pad(a, pad, mode="edge"), axis=axis, dtype=np.float64)
+        n = a.shape[axis]
+        hi = np.take(c, np.arange(2 * r + 1, 2 * r + 1 + n), axis=axis)
+        lo = np.take(c, np.arange(0, n), axis=axis)
+        a = ((hi - lo) / (2 * r + 1)).astype(np.float32)
+    return a
+
+
+def level_real(net: np.ndarray, real: np.ndarray, holes: np.ndarray) -> tuple[np.ndarray, int]:
+    """Decoded rows the guided network moved to another level (a rotted DC the repair kept,
+    too bright or tinted: the thumbnail says otherwise) take the network's level and keep
+    their own detail. Rows the network left at their level are not touched. Without this the
+    real rows went back between the network's fill as bands (100_0239).
+    Returns (rgb, real pixels moved)."""
+    if not holes.any() or holes.all():
+        return real, 0
+    known = (~holes).astype(np.float32)
+    k3 = known[..., None]
+    w = np.maximum(_box2(known, LEVEL_RY, LEVEL_RX)[..., None], 1e-3)
+    lr = _box2(real.astype(np.float32) * k3, LEVEL_RY, LEVEL_RX) / w
+    ln = _box2(net.astype(np.float32) * k3, LEVEL_RY, LEVEL_RX) / w
+    off = ln - lr
+    a = np.clip((np.abs(off).max(axis=-1) - LEVEL_LO) / (LEVEL_HI - LEVEL_LO), 0.0, 1.0) * known
+    out = real.astype(np.float32) + a[..., None] * off
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8), int((a > 0.5).sum())
+
+
 def protect_real(cleaned: np.ndarray, real: np.ndarray, holes: np.ndarray) -> np.ndarray:
     """The real picture back where the JPEG clean-up only softened it: the cleaned pixels
     stay in the holes and fade over PROTECT_FEATHER pixels into the untouched ones."""
@@ -1142,14 +1182,23 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
     elif "deblock" in steps and engine.deblock_s is not None:
         t0, st = time.perf_counter(), {}
         arr = deblock(arr, engine, report("JPEG clean-up tile"), stop, st, holes, thumb_small)
+        n_lev = 0
         if PROTECT_REAL:  # the file's own pixels stay sharp: the clean-up works on the holes
+            cleaned = arr
             arr = protect_real(arr, real, holes & ~keep if keep is not None else holes)
+            if LEVEL_FROM_NET and st.get("guided", False):
+                arr, n_lev = level_real(cleaned, arr, holes)
+                if keep is not None:
+                    arr = np.where(keep[..., None], real, arr)
         elif keep is not None:
             arr = np.where(keep[..., None], real, arr)
         real = arr.copy()  # the cleaned picture is the base from here on
         which = {"fbcnn-fotomedik.onnx": "FBCNN fine-tuned on your photos, ",
                  "fbcnn-fotomedik-guided.onnx": "FBCNN guided by the thumbnail, fine-tuned on your photos, "}.get(file, "")
         done.append(f"JPEG blocks and noise removed ({which}{st.get('tiles', 0)} tiles, {_took(t0)})")
+        if n_lev:
+            done.append(f"decoded rows of a wrong brightness or tint set to the thumbnail's "
+                        f"({100 * n_lev / max(1, int((~holes).sum())):.0f} % of the real picture)")
     guided = "deblock" in steps and engine.deblock_s is not None and st.get("guided", False)
     if holes.any() and guided and "thumbsr" in steps and "diffusion" not in steps and "ai" not in steps:
         # the guided network rebuilt the holes from the whole thumbnail itself, better than the

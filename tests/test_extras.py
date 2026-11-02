@@ -365,3 +365,22 @@ def test_seam_guard_keeps_the_earlier_fill_where_the_new_one_fits_worse():
     better = real.copy()
     out, kept = seam_guard(better, old, holes, real)
     assert kept == 0
+
+
+def test_level_real_puts_a_wrongly_bright_row_on_the_networks_level_and_keeps_its_detail():
+    from fotomedik.ai.enhance import level_real
+
+    rng = np.random.default_rng(3)
+    detail = rng.integers(-10, 11, (96, 128, 1))
+    net = np.full((96, 128, 3), 100.0)  # the guided network: the thumbnail's level everywhere
+    real = np.clip(100 + detail, 0, 255).repeat(3, axis=2).astype(np.uint8)
+    holes = np.zeros((96, 128), bool)
+    holes[32:48] = holes[64:80] = True
+    real[48:64] = np.clip(real[48:64].astype(int) + [30, 20, 35], 0, 255)  # a decoded run too bright, bluish
+    out, moved = level_real(net.astype(np.uint8), real, holes)
+    assert moved > 0
+    row = out[52:60, 30:98].astype(int)
+    assert abs(row.mean() - 100) < 3  # back on the level
+    assert row.std() > 4  # its own detail kept
+    assert (out[8:24, 30:98] == real[8:24, 30:98]).all()  # a row at the right level is not touched
+    assert (out[holes] == real[holes]).all()  # holes are not this step's business
