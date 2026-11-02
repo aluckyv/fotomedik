@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 148.
+Last update: 2026-11-02, build 149.
 
 ## How the work is done
 
@@ -231,6 +231,12 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   `look_at_folder` (Claude sees the same numbers before starting a job). Synthetic files: a
   colour photo without a thumbnail got a thumbnail "rescued" from its own scan (Pillow's tables
   match the set's thumbnails); real cameras' did not (Sarimsakli: 13 of 38 came out "none").
+- **Enhance again…** (build 149, `gui/again_dialog.py`): another enhanced copy of the selected
+  photo with other steps (the dialog starts from the steps it had; enlarger, diffusion preset,
+  scene too). The photo is run again on its own with the set's learned headers kept; the copy
+  is saved as `<name>_enhanced_2.jpg`, `_3`... (`options["ai_suffix"]`, `run.free_suffix`) and
+  comes in as a new row "(again_2: steps)", so tries sit side by side; the Enhanced box's
+  caption names the steps. The first copy is never overwritten.
 - At start the packaged window brings an installed extension up to date on its own
   (`claude_connect.connect(quiet=True)`, build 147): nothing is asked, written or shown when
   FotoMedik is not in Claude yet. Program > Check for updates asks GitHub on demand.
@@ -311,7 +317,7 @@ owner's card). The GitHub export workflow dies on memory; `scripts/export_sdxl.b
 on the owner's computer.
 
 Tidying the program (owner's plan, 2026-11-02, in this order): 4. connect to Claude at start
-(build 147), 1. menu and presets (147), 2. the quick look before the repair (148), 3. after a result: redo one photo's enhanced copy with other steps and
+(build 147), 1. menu and presets (147), 2. the quick look before the repair (148), 3. Enhance again (149); after a result: redo one photo's enhanced copy with other steps and
 compare. Then faces: GFPGAN alone helps little (sharper eyes on fair faces, the worst faces
 left alone by `agrees`, three non-faces touched); next is recognition of the owner's people
 across photos (ArcFace) plus a face network fine-tuned on them, as a night job on his card.

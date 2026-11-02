@@ -67,6 +67,15 @@ def enhanced_name(output_name: str, suffix: str = "") -> str:
 ai_name = enhanced_name  # older name
 
 
+def free_suffix(output) -> str:
+    """The first free "_2", "_3"... for another enhanced copy of the repaired file `output`."""
+    output = Path(output)
+    n = 2
+    while (output.parent / Path(enhanced_name(output.name, f"_{n}")).name).exists():
+        n += 1
+    return f"_{n}"
+
+
 # ----------------------------------------------------------------------------- engine
 
 

@@ -62,3 +62,14 @@ def test_look_at_folder_gives_claude_the_numbers(tmp_path, monkeypatch):
     assert out["photos"] == 3 and out["damaged"] == 2 and out["thumbnail_whole"] == 1 and out["thumbnail_none"] == 1
     assert out["suggested_preset"] == "standard" and out["suggested_steps"] == jobs.DEFAULT_STEPS
     assert {p["photo"] for p in out["list"]} == {"healthy.jpg", "holes_thumb.jpg", "holes_plain.jpg"}
+
+
+def test_another_enhanced_copy_gets_the_next_free_name(tmp_path):
+    from fotomedik.ai.run import enhanced_name, free_suffix
+
+    assert enhanced_name("sub/x.jpg") == "sub/x_enhanced.jpg" and enhanced_name("x.JPG", "_2") == "x_enhanced_2.jpg"
+    out = tmp_path / "x.jpg"
+    out.write_bytes(b"")
+    assert free_suffix(out) == "_2"
+    (tmp_path / "x_enhanced_2.jpg").write_bytes(b"")
+    assert free_suffix(out) == "_3"

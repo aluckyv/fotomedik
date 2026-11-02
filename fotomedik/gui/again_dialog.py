@@ -19,17 +19,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..ai.run import STEP_NAMES, enhanced_name
+from ..ai.run import STEP_NAMES, enhanced_name, free_suffix as next_suffix
 
 STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "patch", "faces", "diffusion")
-
-
-def next_suffix(output: Path) -> str:
-    """The first free "_2", "_3"... for another enhanced copy of this repaired file."""
-    n = 2
-    while (output.parent / Path(enhanced_name(output.name, f"_{n}")).name).exists():
-        n += 1
-    return f"_{n}"
 
 
 class AgainDialog(QDialog):
