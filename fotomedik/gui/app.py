@@ -138,15 +138,18 @@ class UpdateChecker(QObject):
     """Asks GitHub for a newer build without blocking the window."""
 
     found = Signal(object)
+    checked = Signal(object, str)  # (update or None, error text) - for the button
 
     def start(self) -> None:
         def work():
+            err = ""
             try:
                 upd = updater.check_any()
-            except Exception:
-                upd = None  # offline or not reachable: no update offered
+            except Exception as e:  # noqa: BLE001
+                upd, err = None, f"{type(e).__name__}: {e}"  # offline or not reachable: no update offered
             if upd is not None:
                 self.found.emit(upd)
+            self.checked.emit(upd, err)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -190,6 +193,11 @@ class MainWindow(QMainWindow):
                                    "queue folders, follow the repairs and stop them. Originals are never changed,\n"
                                    "and nothing is written into the protected places (mcp.json).")
         self.claude_btn.clicked.connect(self._connect_claude)
+        self.check_btn = QPushButton("Check for updates")
+        self.check_btn.setToolTip("Ask GitHub for a newer build of FotoMedik (Claude can also update it\n"
+                                  "through its connection, between repairs).")
+        self.check_btn.clicked.connect(self._check_updates)
+        headrow.addWidget(self.check_btn, 0, Qt.AlignmentFlag.AlignTop)
         headrow.addWidget(self.claude_btn, 0, Qt.AlignmentFlag.AlignTop)
         outer.addLayout(headrow)
 
@@ -212,6 +220,8 @@ class MainWindow(QMainWindow):
         self.pending_update = None
         self.checker = UpdateChecker()
         self.checker.found.connect(self._offer_update)
+        self.checker.checked.connect(self._checked)
+        self.checking = False  # the button asked: say the outcome in the status bar
         if updater.is_packaged():
             updater.cleanup_old()
             self.checker.start()
@@ -727,6 +737,27 @@ class MainWindow(QMainWindow):
             subprocess.Popen(["xdg-open", str(d)])
 
     # ------------------------------------------------------------------ updates
+    def _check_updates(self) -> None:
+        if not updater.is_packaged():
+            self.stat.setText("Run from source: updates come with git, not from here.")
+            return
+        self.checking = True
+        self.check_btn.setEnabled(False)
+        self.stat.setText("Asking GitHub for a newer build…")
+        self.checker.start()
+
+    def _checked(self, upd, err: str) -> None:
+        if not self.checking:
+            return  # the check at start: only a newer build is shown (the banner)
+        self.checking = False
+        self.check_btn.setEnabled(True)
+        if err:
+            self.stat.setText(f"GitHub could not be reached ({err}).")
+        elif upd is None:
+            self.stat.setText(f"You have the newest build ({updater.current_build()}).")
+        else:
+            self.stat.setText(f"Build {upd.build} is available: press \"Update and restart\" above.")
+
     def _offer_update(self, upd) -> None:
         self.pending_update = upd
         if upd.flavor == "folder":

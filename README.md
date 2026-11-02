@@ -24,10 +24,11 @@ From source: `pip install -e . pyside6`, then `python -m fotomedik.gui`.
 Claude extension up to date when it is installed (or sees a FotoMedik entry in Claude's
 settings), and says so in the status bar. When FotoMedik is not in Claude yet, it writes
 `FotoMedik.mcpb` and shows it in Explorer: drag it once into Claude's Settings > Extensions.
-The extension starts FotoMedik's MCP server (`FotoMedik.exe --mcp`) with Claude's own
-Node.js. Claude can then queue folders for repair on this computer
-(`start_job`), follow them (`job_status`, `list_jobs`), stop them (`stop_job`) and
-see what the program has (`app_info`). The jobs run one after another in processes
+Claude starts the installed program as the extension's MCP server (`FotoMedik.exe --mcp`).
+Claude can then queue folders for repair on this computer
+(`start_job`), follow them (`job_status`, `list_jobs`), stop them (`stop_job`),
+see what the program has (`app_info`) and bring it up to the newest build between
+jobs (`update_app`). **Check for updates** (next to Connect to Claude) asks GitHub too. The jobs run one after another in processes
 of their own, on this computer's graphics card, and go on when Claude is closed;
 `skip_done` continues a stopped job. Originals are never changed: the output folder
 is never the source, inside it or around it, never one of the folders and drives

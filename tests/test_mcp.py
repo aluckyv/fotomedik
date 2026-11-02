@@ -114,7 +114,7 @@ def test_server_speaks_mcp_over_stdio(home, photos, tmp_path):
     assert init["protocolVersion"] == "2025-06-18" and init["serverInfo"]["name"] == "fotomedik"
     assert "tools" in init["capabilities"]
     names = {t["name"] for t in replies[2]["result"]["tools"]}
-    assert names == {"start_job", "job_status", "list_jobs", "stop_job", "app_info"}
+    assert names == {"start_job", "job_status", "list_jobs", "stop_job", "update_app", "app_info"}
     for t in replies[2]["result"]["tools"]:
         assert t["inputSchema"]["type"] == "object" and t["description"]
     info = replies[3]["result"]
@@ -312,3 +312,57 @@ def test_the_program_picks_its_mode(monkeypatch, capsys):
     monkeypatch.setattr(fotomedik.cli, "main", boom)
     assert dispatch(["--cli", "batch"]) == 1  # an error ends the mode (no message box in the packaged program)
     assert "UnicodeEncodeError" in capsys.readouterr().err
+
+
+def _fake_install(home: Path, build: int, base_id: str = "b1") -> None:
+    (home / "app" / "base").mkdir(parents=True)
+    (home / "app" / "base" / "FotoMedik.exe").write_bytes(b"exe")
+    (home / "app" / "code" / "fotomedik").mkdir(parents=True)
+    (home / "app" / "code" / "fotomedik" / "old.py").write_text("# build 1")
+    (home / "app" / "version.json").write_text(json.dumps({"build": build, "base_id": base_id}))
+
+
+def _fake_release(folder: Path, build: int, base_id: str = "b1") -> None:
+    import zipfile
+
+    folder.mkdir(parents=True)
+    with zipfile.ZipFile(folder / "fotomedik-code.zip", "w") as z:
+        z.writestr("fotomedik/new.py", f"# build {build}")
+    with zipfile.ZipFile(folder / "fotomedik-base.zip", "w") as z:
+        z.writestr("FotoMedik.exe", "exe2")
+    (folder / "version.json").write_text(json.dumps({"build": build, "base_id": base_id}))
+
+
+def test_update_app_brings_the_code_up_to_the_newest_build(home, tmp_path, monkeypatch):
+    _fake_install(home, 3)
+    _fake_release(tmp_path / "rel", 5)
+    monkeypatch.setenv("FOTOMEDIK_ASSETS", str(tmp_path / "rel"))
+    res = mcp_server.call_tool("update_app", {"install": False})["structuredContent"]
+    assert res == {"installed_build": 3, "newest_build": 5, "updated": False, "note": "a newer build is available"}
+    res = mcp_server.call_tool("update_app", {})["structuredContent"]
+    assert res["updated"] and res["installed_build"] == 5
+    assert (home / "app" / "code" / "fotomedik" / "new.py").exists()
+    assert not (home / "app" / "code" / "fotomedik" / "old.py").exists()
+    assert (home / "app" / "base" / "FotoMedik.exe").read_bytes() == b"exe"  # the base did not change
+    assert json.loads((home / "app" / "version.json").read_text())["build"] == 5
+    again = mcp_server.call_tool("update_app", {})["structuredContent"]
+    assert not again["updated"] and again["note"] == "already the newest build"
+
+
+def test_update_app_leaves_a_new_base_to_the_launcher_and_waits_for_jobs(home, tmp_path, monkeypatch):
+    _fake_install(home, 3)
+    _fake_release(tmp_path / "rel", 6, base_id="b2")
+    monkeypatch.setenv("FOTOMEDIK_ASSETS", str(tmp_path / "rel"))
+    monkeypatch.setattr(jobs, "runner_alive", lambda: True)
+    res = mcp_server.call_tool("update_app", {})
+    assert res["isError"] and "a job is running" in res["content"][0]["text"]
+    monkeypatch.setattr(jobs, "runner_alive", lambda: False)
+    res = mcp_server.call_tool("update_app", {})["structuredContent"]
+    assert not res["updated"] and res["staged"] == ["base", "code"]
+    assert (home / "app" / "base.new").is_dir() and (home / "app" / "version.new.json").exists()
+    assert (home / "app" / "base" / "FotoMedik.exe").read_bytes() == b"exe"  # the running base is untouched
+
+
+def test_update_app_from_source_says_so(home, monkeypatch):
+    res = mcp_server.call_tool("update_app", {})
+    assert res["isError"] and "not the installed FotoMedik" in res["content"][0]["text"]
