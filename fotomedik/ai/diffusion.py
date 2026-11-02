@@ -54,6 +54,10 @@ class Diffusion:
     step runs the network with and without the prompt and goes `guidance` times further
     in the prompt's direction); without one the painting is unconditioned."""
 
+    latent_scale = LATENT_SCALE
+    window = WINDOW  # the size it was trained at
+    name = "Stable Diffusion"
+
     def __init__(self, unet, vae_enc, vae_dec, text, tokenizer=None):
         self.unet, self.vae_enc, self.vae_dec, self.text = unet, vae_enc, vae_dec, text
         self.tokenizer = tokenizer
@@ -78,30 +82,36 @@ class Diffusion:
         lat = self.vae_enc.run(None, {inp.name: x})[0].astype(np.float32)
         if lat.shape[1] == 8:  # moments (mean, logvar): take the mean
             lat = lat[:, :4]
-        return lat * LATENT_SCALE
+        return lat * self.latent_scale
 
     def decode(self, lat: np.ndarray) -> np.ndarray:
         inp = self.vae_dec.get_inputs()[0]
-        x = self.vae_dec.run(None, {inp.name: (lat / LATENT_SCALE).astype(_dtype(inp))})[0].astype(np.float32)
+        x = self.vae_dec.run(None, {inp.name: (lat / self.latent_scale).astype(_dtype(inp))})[0].astype(np.float32)
         return np.clip(np.rint((x[0].transpose(1, 2, 0) + 1.0) * 127.5), 0, 255).astype(np.uint8)
 
-    def _noise(self, sample_n: str, t_n: str, enc_n: str, model_in, t: int, embs: list) -> list:
-        """The network's noise estimate for every embedding in `embs` (one batch when it can)."""
+    def condition(self, prompt: str, size: int) -> dict[str, np.ndarray]:
+        """The network's inputs besides the picture and the time step, for `prompt`."""
+        ins = {i.name: i for i in self.unet.get_inputs()}
+        names = list(ins)
+        enc_n = next((n for n in names if "hidden" in n or "encoder" in n), names[2])
+        return {enc_n: self.embedding(prompt).astype(_dtype(ins[enc_n]))}
+
+    def _noise(self, sample_n: str, t_n: str, model_in, t: int, conds: list[dict]) -> list:
+        """The network's noise estimate for every conditioning in `conds` (one batch when it can)."""
         ins = {i.name: i for i in self.unet.get_inputs()}
         tt = np.array([t], dtype=_dtype(ins[t_n]))
-        if len(embs) > 1 and self._pair_ok is not False:
+        if len(conds) > 1 and self._pair_ok is not False:
             try:
-                batch = np.concatenate([model_in] * len(embs), axis=0)
-                emb = np.concatenate(embs, axis=0).astype(_dtype(ins[enc_n]))
-                out = self.unet.run(None, {sample_n: batch, t_n: tt, enc_n: emb})[0].astype(np.float32)
-                if out.shape[0] == len(embs):
+                feed = {sample_n: np.concatenate([model_in] * len(conds), axis=0), t_n: tt}
+                feed.update({k: np.concatenate([c[k] for c in conds], axis=0) for k in conds[0]})
+                out = self.unet.run(None, feed)[0].astype(np.float32)
+                if out.shape[0] == len(conds):
                     self._pair_ok = True
-                    return [out[i : i + 1] for i in range(len(embs))]
+                    return [out[i : i + 1] for i in range(len(conds))]
             except Exception:
                 pass
             self._pair_ok = False
-        return [self.unet.run(None, {sample_n: model_in, t_n: tt, enc_n: e.astype(_dtype(ins[enc_n]))})[0]
-                .astype(np.float32) for e in embs]
+        return [self.unet.run(None, {sample_n: model_in, t_n: tt, **c})[0].astype(np.float32) for c in conds]
 
     def inpaint(self, img: np.ndarray, mask: np.ndarray, steps: int = STEPS, strength: float = STRENGTH,
                 seed: int = 0, prompt: str | None = None, guidance: float = GUIDANCE) -> np.ndarray:
@@ -123,14 +133,13 @@ class Diffusion:
         ins = {i.name: i for i in self.unet.get_inputs()}
         names = list(ins)
         sample_n = next((n for n in names if "sample" in n), names[0])
-        t_n = next((n for n in names if "time" in n), names[1])
-        enc_n = next((n for n in names if "hidden" in n or "encoder" in n), names[2])
+        t_n = next((n for n in names if n in ("timestep", "t") or ("time" in n and "ids" not in n)), names[1])
         guided = bool(prompt) and self.tokenizer is not None and guidance > 1.0
-        embs = [self.embedding(prompt), self.embedding("")] if guided else [self.embedding("")]
+        conds = [self.condition(prompt, s), self.condition("", s)] if guided else [self.condition("", s)]
         for t in timesteps:
             t = int(t)
             model_in = np.concatenate([lat, lm, masked], axis=1).astype(_dtype(ins[sample_n]))
-            eps_all = self._noise(sample_n, t_n, enc_n, model_in, t, embs)
+            eps_all = self._noise(sample_n, t_n, model_in, t, conds)
             eps = eps_all[1] + guidance * (eps_all[0] - eps_all[1]) if guided else eps_all[0]
             a_t = self.alphas[t]
             prev = t - ratio
@@ -139,6 +148,50 @@ class Diffusion:
             lat = np.sqrt(a_prev) * x0_pred + np.sqrt(1 - a_prev) * eps
         out = self.decode(lat)
         return np.where(mask[..., None], out, img)
+
+
+class DiffusionXL(Diffusion):
+    """Stable Diffusion XL inpainting (experiment, step "sdxl"): two text encoders, whose
+    second-to-last layers together condition the network, the second one's pooled output
+    and the picture's size as extra inputs; trained at 1024 x 1024."""
+
+    latent_scale = 0.13025
+    window = 1024
+    name = "Stable Diffusion XL"
+
+    def __init__(self, unet, vae_enc, vae_dec, text, text2, tokenizer=None):
+        super().__init__(unet, vae_enc, vae_dec, text, tokenizer)
+        self.text2 = text2
+        self._emb2: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _ids(self, key: str, pad: int) -> list[int]:
+        ids = self.tokenizer.encode(key) if key else [BOS] + [EOS] * 76
+        end = ids.index(EOS) + 1
+        return ids[:end] + [pad] * (len(ids) - end)
+
+    def embedding2(self, prompt: str = "") -> tuple[np.ndarray, np.ndarray]:
+        """((1, 77, 2048) hidden states, (1, 1280) pooled) for `prompt`."""
+        key = " ".join(prompt.lower().split()) if (prompt and self.tokenizer is not None) else ""
+        if key not in self._emb2:
+            parts, pooled = [], None
+            for net, pad in ((self.text, EOS), (self.text2, 0)):  # the second one pads with "!"
+                inp = net.get_inputs()[0]
+                outs = [o.name for o in net.get_outputs()]
+                res = dict(zip(outs, net.run(None, {inp.name: np.array([self._ids(key, pad)], dtype=_dtype(inp))})))
+                layers = sorted((n for n in outs if n.startswith("hidden_states.")), key=lambda n: int(n.split(".")[1]))
+                parts.append(res[layers[-2]].astype(np.float32))  # the second-to-last layer
+                if "text_embeds" in res:
+                    pooled = res["text_embeds"].astype(np.float32)
+            self._emb2[key] = (np.concatenate(parts, axis=-1), pooled)
+        return self._emb2[key]
+
+    def condition(self, prompt: str, size: int) -> dict[str, np.ndarray]:
+        ins = {i.name: i for i in self.unet.get_inputs()}
+        hidden, pooled = self.embedding2(prompt)
+        ids = np.array([[size, size, 0, 0, size, size]], dtype=np.float32)  # made at, cropped at, wanted at
+        return {"encoder_hidden_states": hidden.astype(_dtype(ins["encoder_hidden_states"])),
+                "text_embeds": pooled.astype(_dtype(ins["text_embeds"])),
+                "time_ids": ids.astype(_dtype(ins["time_ids"]))}
 
 
 def windows(holes: np.ndarray, size: int = WINDOW, stride: int = STRIDE) -> list[tuple[int, int]]:
@@ -154,11 +207,12 @@ def windows(holes: np.ndarray, size: int = WINDOW, stride: int = STRIDE) -> list
 
 
 def diffusion_fill(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, sd: Diffusion, progress=None,
-                   size: int = WINDOW, steps: int = STEPS, stop=None, stats: dict | None = None,
+                   size: int | None = None, steps: int = STEPS, stop=None, stats: dict | None = None,
                    prompt: str | None = None) -> np.ndarray:
-    """Holes of `arr` repainted window by window; real pixels stay."""
+    """Holes of `arr` repainted window by window (the network's own size); real pixels stay."""
     from .enhance import _check, _soft
 
+    size = size or getattr(sd, "window", WINDOW)
     h, w = holes.shape
     pad_h, pad_w = max(0, size - h), max(0, size - w)
     work = np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect") if pad_h or pad_w else arr.copy()

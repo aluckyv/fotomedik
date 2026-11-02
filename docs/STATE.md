@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 139.
+Last update: 2026-11-02, build 140.
 
 ## How the work is done
 
@@ -129,6 +129,13 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
     dense-head psnr 15.23 -> 15.24, good 0.4221 -> 0.4232, ssim 0.6016 -> 0.6018 (better on 9 of
     the 10 photos it touches, DSC_4524 ssim -0.002). The owner made it default: build 139,
     `EVEN_ROWS = True` (photos without a whole thumbnail that have a rescued one).
+  - SDXL (build 140, step `sdxl`, an experiment): the GitHub export machine died converting
+    the UNet to fp16 (out of memory, no log kept); `scripts/export_sdxl.bat` did it on the
+    owner's computer (64 GB) in about an hour, all five parts load. `DiffusionXL` in
+    `diffusion.py`: the two text encoders' second-to-last layers joined (2048), the second's
+    pooled `text_embeds`, `time_ids` (size, crop 0, size), latents x 0.13025, 1024 windows,
+    the same DDIM loop. The fp16 folder goes into the models folder as `sdxl-inpaint`
+    (`enhance.SDXL_DIR`); without it the step falls back to SD 1.5 with a note.
   - `level_real` (build 133, `LEVEL_FROM_NET`): the guided network moves decoded rows of a
     rotted level (too bright, tinted; the repair kept them) to the thumbnail's level;
     protect_real used to put them back between its fill as bands (100_0239: dark and light

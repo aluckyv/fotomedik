@@ -34,8 +34,8 @@ from PIL import Image
 from .. import errlog
 from ..report.report import FileReport
 
-# holemap: an experiment, off unless asked for; rows: on by default since build 139 (the name still works)
-STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces", "rows", "holemap")
+# holemap, sdxl (diffusion with SDXL): experiments, off unless asked for; rows: on by default since build 139 (the name still works)
+STEPS = ("puzzle", "burst", "deblock", "ai", "thumbsr", "diffusion", "patch", "faces", "rows", "holemap", "sdxl")
 STEP_NAMES = {
     "puzzle": "pieces put back by the thumbnail",
     "burst": "similar shots",
@@ -46,6 +46,7 @@ STEP_NAMES = {
     "patch": "the photo's own texture in the holes",
     "faces": "faces",
     "rows": "faint rows evened by the rescued thumbnail (on by default)",
+    "sdxl": "maximum quality with Stable Diffusion XL (experiment)",
     "holemap": "clean-up told where the holes are without a thumbnail, as before build 134 (experiment)",
 }
 NETWORK_STEPS = {"deblock", "ai", "thumbsr", "diffusion", "faces"}
@@ -216,7 +217,7 @@ class Enhancer:
         self.quality = quality
         self.half = half
         self.prompt = prompt
-        steps = [s for s in STEPS if s in set(steps)]
+        steps = [s for s in STEPS if s in set(steps) | ({"diffusion"} if "sdxl" in steps else set())]
         if "diffusion" in steps and "ai" in steps:
             steps.remove("ai")  # diffusion does the holes
         if "diffusion" in steps and "thumbsr" in steps:

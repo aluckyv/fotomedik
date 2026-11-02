@@ -204,6 +204,53 @@ def test_diffusion_fill_keeps_real_pixels():
     assert out.shape == arr.shape
     assert np.array_equal(out[~holes], arr[~holes])
 
+    # SDXL: two text encoders (second-to-last layers joined, the second's pooled output) and
+    # the picture's size go to the network besides the picture
+    from fotomedik.ai.diffusion import DiffusionXL
+
+    seen = {}
+
+    class _Out:
+        def __init__(self, name):
+            self.name = name
+
+    class TextXL:
+        def __init__(self, width, pooled):
+            self.width, self.pooled = width, pooled
+
+        def get_inputs(self):
+            return [_In("input_ids", [1, 77])]
+
+        def get_outputs(self):
+            names = ["last_hidden_state"] + [f"hidden_states.{i}" for i in range(4)]
+            return [_Out(n) for n in (["text_embeds"] + names if self.pooled else names)]
+
+        def run(self, _o, f):
+            seen.setdefault("ids", []).append(f["input_ids"][0].tolist())
+            layers = [np.full((1, 77, self.width), i, np.float32) for i in range(4)]
+            out = [np.zeros((1, 77, self.width), np.float32)] + layers
+            return ([np.ones((1, 1280), np.float32)] + out) if self.pooled else out
+
+    class UnetXL(Unet):
+        def get_inputs(self):
+            return [_In("sample", [1, 9, "h", "w"]), _In("timestep", [1]), _In("encoder_hidden_states", [1, 77, 2048]),
+                    _In("text_embeds", [1, 1280]), _In("time_ids", [1, 6])]
+
+        def run(self, _o, f):
+            seen["feed"] = {k: v.shape for k, v in f.items()}
+            seen["hidden"] = float(f["encoder_hidden_states"].mean())
+            seen["time_ids"] = f["time_ids"][0].tolist()
+            return [np.zeros_like(f["sample"][:, :4])]
+
+    xl = DiffusionXL(UnetXL(), Enc(), Dec(), TextXL(768, False), TextXL(1280, True))
+    out = diffusion_fill(arr, holes, np.zeros_like(holes), xl, size=64, steps=3)
+    assert np.array_equal(out[~holes], arr[~holes])
+    assert seen["feed"]["encoder_hidden_states"] == (1, 77, 2048) and seen["feed"]["text_embeds"] == (1, 1280)
+    assert seen["hidden"] == 2.0  # layer 2 of 0..3 from both encoders
+    assert seen["time_ids"] == [64, 64, 0, 0, 64, 64]
+    assert seen["ids"][0][:3] == [49406, 49407, 49407] and seen["ids"][1][:3] == [49406, 49407, 0]  # "!" pads the 2nd
+    assert DiffusionXL.window == 1024
+
 
 def test_wrongly_coloured_stripes_next_to_holes_are_healed_too():
     from fotomedik.ai.enhance import JUNK_TOL, _grow, colour_stripes

@@ -270,8 +270,23 @@ class Engine:
                 raise
             except Exception as e:
                 self.notes.append(f"Stable Diffusion paints without a prompt (tokenizer files: {e})")
-            self.sd = Diffusion(session(models.SD_UNET), session(models.SD_VAE_ENC), session(models.SD_VAE_DEC),
-                                session(models.SD_TEXT), tok)
+            xl = models.model_dir() / SDXL_DIR
+            if "sdxl" in steps and (xl / "unet" / "model.onnx").exists():  # experiment: SDXL, exported by hand
+                from .diffusion import DiffusionXL
+
+                def local(part):
+                    s = make(xl / part / "model.onnx")
+                    prov = s.get_providers()[0] if hasattr(s, "get_providers") else "CPUExecutionProvider"
+                    self.devices[f"SDXL {part}"] = DEVICE_NAMES.get(prov, prov)
+                    return s
+
+                self.sd = DiffusionXL(local("unet"), local("vae_encoder"), local("vae_decoder"),
+                                      local("text_encoder"), local("text_encoder_2"), tok)
+            else:
+                if "sdxl" in steps:
+                    self.notes.append(f"Stable Diffusion XL is not in {xl}: Stable Diffusion 1.5 paints instead")
+                self.sd = Diffusion(session(models.SD_UNET), session(models.SD_VAE_ENC), session(models.SD_VAE_DEC),
+                                    session(models.SD_TEXT), tok)
         self.loaded |= steps
         on_gpu = [d for d in self.devices.values() if d != "CPU"]
         self.device = on_gpu[0] if on_gpu else "CPU"
@@ -970,6 +985,10 @@ def destripe(arr: np.ndarray, thumb: np.ndarray | None = None,
     return np.clip(np.rint(out), 0, 255).astype(np.uint8), int(bad.sum())
 
 
+# Stable Diffusion XL inpainting (step "sdxl", an experiment): the ONNX fp16 export of
+# scripts/export_sdxl.bat (its fp16 folder), put into the models folder under this name
+SDXL_DIR = "sdxl-inpaint"
+
 # On by default since build 139 (the owner's choice after the graphics card comparison); the
 # "rows" step name is still accepted.
 EVEN_ROWS = True
@@ -1314,7 +1333,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             else:
                 what = "nothing to repaint outside people"
             kept = int((holes & people).sum())
-            done.append(f"holes repainted (Stable Diffusion, follows the thumbnail; {what}, {_took(t0)})"
+            done.append(f"holes repainted ({engine.sd.name}, follows the thumbnail; {what}, {_took(t0)})"
                         + (f"; people left as they were ({100 * kept / max(1, int(holes.sum())):.0f} % of the holes)"
                            if kept else ""))
         elif "thumbsr" in steps and (engine.thumb_sr or engine.sr) is not None and thumb_small is not None:
