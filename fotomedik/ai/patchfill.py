@@ -26,7 +26,10 @@ TEXTURE_W = 0.5  # weight of the texture already voted in (from the second round
 MIN_REAL = 0.05  # share of real pixels below which there is too little to take texture from
 DETAIL_MAX = 20.0  # gray levels: the carried detail is grain and texture, never a new edge
 EDGE_LO, EDGE_HI = 6.0, 18.0  # slope of the coarse picture (levels per working pixel): flat gets all the detail, an edge none
-MATCH_MAX = 14.0  # gray levels (rms of the coarse look): a worse match carries nothing
+MATCH_MAX = 10.0  # gray levels (rms of the coarse look): a worse match carries nothing
+NEAR = 0.2  # share of the working copy's long side: the texture is looked for this near first
+NEAR_W = 300.0  # cost of a match NEAR away (and four times that at twice the distance): a texture
+#                 from far off is more likely another thing of the same colour (straw for sand)
 SEED = 1234
 
 
@@ -75,8 +78,15 @@ class _Matcher:
         self.h, self.w = valid.shape
         self.ty, self.tx = np.nonzero(targets)
         vy, vx = np.nonzero(valid)
-        pick = rng.integers(0, len(vy), len(self.ty))
-        self.sy, self.sx = vy[pick].astype(np.int64), vx[pick].astype(np.int64)
+        self.near = max(8, int(NEAR * max(self.h, self.w)))
+        # start near: a random place within reach, else anywhere valid
+        sy = self.ty + rng.integers(-self.near, self.near + 1, len(self.ty))
+        sx = self.tx + rng.integers(-self.near, self.near + 1, len(self.ty))
+        sy, sx = np.clip(sy, 0, self.h - 1), np.clip(sx, 0, self.w - 1)
+        bad = ~valid[sy, sx]
+        pick = rng.integers(0, len(vy), int(bad.sum()))
+        sy[bad], sx[bad] = vy[pick], vx[pick]
+        self.sy, self.sx = sy.astype(np.int64), sx.astype(np.int64)
         self.tex = None  # the voted picture (texture term), None in the first round
         self.rng = rng
         self.cost = self.costs(self.sy, self.sx)
@@ -86,6 +96,8 @@ class _Matcher:
     def costs(self, sy: np.ndarray, sx: np.ndarray) -> np.ndarray:
         d = self.feat[self.ty, self.tx] - self.feat[sy, sx]
         c = GUIDE_W * (d * d).sum(-1)
+        far = ((sy - self.ty) ** 2 + (sx - self.tx) ** 2) / float(self.near * self.near)
+        c = c + NEAR_W * far
         if self.tex is not None:
             t = np.zeros_like(c)
             for dy in (-RADIUS, 0, RADIUS):
@@ -129,7 +141,7 @@ class _Matcher:
                     ok = nb >= 0
                     nbc = np.maximum(nb, 0)
                     self._try(self.sy[nbc] + dy, self.sx[nbc] + dx, ok)
-            r = max(self.h, self.w) // 2
+            r = self.near
             while r >= 1:
                 oy = self.rng.integers(-r, r + 1, len(self.ty))
                 ox = self.rng.integers(-r, r + 1, len(self.ty))
