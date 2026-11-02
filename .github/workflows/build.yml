@@ -114,6 +114,7 @@ jobs:
           $id_text = (python --version) + "`n" + $freeze + "`n" + (Get-Content -Raw base_manifest.txt) + (Get-Content -Raw fotomedik.spec) + (Get-Content -Raw fotomedik_app.py)
           # kept with the build's files, to see what changed when a build brings a new base
           $id_text | Set-Content -Encoding utf8 assets\base_id.txt
+          Write-Host "--- base id text ---"; Write-Host $id_text; Write-Host "--- end of base id text ---"
           $sha = [System.Security.Cryptography.SHA256]::Create()
           $base_id = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($id_text)))).Replace("-","").ToLower()
           $info = [ordered]@{ build = ${{ github.run_number }}; commit = "${{ github.sha }}"; base_id = $base_id;

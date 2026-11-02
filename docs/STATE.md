@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-02, build 140.
+Last update: 2026-11-02, build 142.
 
 ## How the work is done
 
@@ -136,6 +136,10 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
     pooled `text_embeds`, `time_ids` (size, crop 0, size), latents x 0.13025, 1024 windows,
     the same DDIM loop. The fp16 folder goes into the models folder as `sdxl-inpaint`
     (`enhance.SDXL_DIR`); without it the step falls back to SD 1.5 with a note.
+    Result (build 141, RTX 4070 12 GB, 100_0223): 2106 s for 12 windows (SD 1.5: 36 s), and
+    not better: more dark streaks in the sky, horizontal lines across the faces' area. Build
+    142 lets the text encoders go and keeps CUDA pools as small as asked (untested). The owner
+    left it as an option and stopped there (2026-11-02).
   - `level_real` (build 133, `LEVEL_FROM_NET`): the guided network moves decoded rows of a
     rotted level (too bright, tinted; the repair kept them) to the thumbnail's level;
     protect_real used to put them back between its fill as bands (100_0239: dark and light
@@ -190,7 +194,9 @@ Steps (`ai/run.py STEPS`): `puzzle`, `burst`, `deblock`, `ai`, `thumbsr`, `diffu
   build 138 the Windows build pins Python 3.12.10 and every base package (`base-constraints.txt`,
   including click and packaging, which the build machine's Python already carries and its image
   updates), and keeps the id's text as `base_id.txt` with the build's files, to diff when a
-  build brings a new base again. Builds 135, 136 and 137 each brought one without a change of ours.
+  build brings a new base again. Builds 135, 136 and 137 each brought one without a change of ours;
+  139 -> 140 -> 141 were code-only, but 142 brought one again (cause unknown: the artifact with
+  `base_id.txt` cannot be fetched from here, so the build log now prints it too).
   A server started before build 125 has no `update_app` at all: Claude has to be restarted once.
 - Claude's screen control of the owner's computer lapses after 30 minutes without use and needs
   the owner's approval again: do not plan unattended installs on it.
