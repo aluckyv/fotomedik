@@ -49,7 +49,7 @@ STEP_NAMES = {
     "sdxl": "maximum quality with Stable Diffusion XL (experiment)",
     "holemap": "clean-up told where the holes are without a thumbnail, as before build 134 (experiment)",
 }
-NETWORK_STEPS = {"deblock", "ai", "thumbsr", "diffusion", "faces"}
+NETWORK_STEPS = {"deblock", "ai", "thumbsr", "diffusion", "faces", "sdxl"}
 NEAR_FILES = 10  # photos this close in the list may be the same scene when their time is unknown
 PROGRESS_EVERY = 1.0  # seconds between progress lines of a slow step
 RESTARTS = 3  # times the enhanced copies start again after an unexpected error
