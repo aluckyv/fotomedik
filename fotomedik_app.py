@@ -70,5 +70,9 @@ if __name__ == "__main__":
         import ctypes
 
         k32 = ctypes.windll.kernel32
+        # the pseudo handle is -1 as a pointer: without these types ctypes passed it as a
+        # 32-bit int, TerminateProcess refused it and os._exit crashed as before (build 158)
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint)
         k32.TerminateProcess(k32.GetCurrentProcess(), int(rc or 0))
     os._exit(int(rc or 0))
