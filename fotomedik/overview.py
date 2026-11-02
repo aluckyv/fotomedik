@@ -31,6 +31,7 @@ class PhotoFacts:
     recovered: float | None = None  # share of the scan that decodes (None when the header is damaged)
     thumb: str = "none"  # whole | part | none
     thumb_real: float = 0.0
+    thumb_damaged: bool = False  # the Exif preview rotted (the copy gets a fresh one)
     faces: int | None = None  # None: not looked for (no face finder here)
     taken: datetime | None = None
     error: str = ""
@@ -68,9 +69,14 @@ class Overview:
         """(preset key, the reasons in short lines). Presets: see gui.app.PRESETS."""
         d = self.damaged
         why: list[str] = []
+        previews = self.count(lambda p: p.thumb_damaged)
         if not d:
-            why.append("no damaged photo found: only the repaired copies are made" if self.photos
-                       else "no JPEG photos found")
+            if previews:
+                why.append(f"the pictures are whole; {previews} with a damaged preview (Exif thumbnail): "
+                           "the copies get a fresh one")
+            else:
+                why.append("no damaged photo found: only the repaired copies are made" if self.photos
+                           else "no JPEG photos found")
             return "faithful", why
         whole = sum(1 for p in d if p.thumb == "whole")
         part = sum(1 for p in d if p.thumb == "part")
@@ -92,6 +98,8 @@ class Overview:
             why.append(f"{b} group(s) of similar shots: real pixels lent between them")
         if unread:
             why.append(f"{unread} file(s) cannot be read as JPEG at all")
+        if previews:
+            why.append(f"{previews} with a damaged preview (Exif thumbnail): the copies get a fresh one")
         return "standard", why
 
     def text(self, gpu: bool = False) -> str:
@@ -104,7 +112,7 @@ def _facts(args) -> dict:
     """Worker: the facts of one photo (plain types for the process pool)."""
     path, rel, thumb_refs, face_model = args
     out = {"name": rel, "size": 0, "width": None, "height": None, "state": "unreadable", "recovered": None,
-           "thumb": "none", "thumb_real": 0.0, "faces": None, "taken": None, "error": ""}
+           "thumb": "none", "thumb_real": 0.0, "thumb_damaged": False, "faces": None, "taken": None, "error": ""}
     try:
         data = Path(path).read_bytes()
     except OSError as e:
@@ -116,6 +124,7 @@ def _facts(args) -> dict:
 
         d = scan_bytes(data, Path(rel).name)
         out["width"], out["height"] = d.width, d.height
+        out["thumb_damaged"] = d.has("thumbnail_damaged")
         if d.openable:
             out["recovered"] = float(d.recovered_fraction)
             out["state"] = "healthy" if d.bad_intervals == 0 and d.recovered_fraction >= 0.999 else "damaged"

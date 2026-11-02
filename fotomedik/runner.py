@@ -148,6 +148,8 @@ STEP_HELP = {
                   "from the embedded thumbnail.",
     "smooth_holes": "The filled holes get a soft surface instead of flat 8x8 squares. Real data is not touched.",
     "thumbnail_fallback": "Almost nothing of the picture survived, so the small embedded preview is saved instead.",
+    "thumbnail_renew": "The small preview in the header (what Explorer and galleries show) was damaged; a fresh one "
+                       "is made from the picture. The picture itself is not touched.",
     "notes": "Repairs that were tried but did not apply.",
     "enhanced": "The separate enhanced copy (similar shots, AI steps). Detail added by AI is invented.",
 }

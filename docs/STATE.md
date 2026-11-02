@@ -55,7 +55,7 @@ Last update: 2026-11-02, build 157.
 | R4 | foreign (blank) card sectors inside the scan | cut out |
 | R5 | flipped bits in the image data | bit guessing between restart markers, kept only when the thumbnail agrees |
 | R6 | foreign data after the image | cut + EOI |
-| R7 | destroyed header | transplant from a camera profile; header voted bit by bit from every photo of the set |
+| R7 | destroyed header | transplant from a camera profile; header voted bit by bit from every photo of the set. A header that parses is kept unless a reference decodes clearly further (build 157: photos saved with their own optimised Huffman tables look "near" each other's; with dense rot every header stopped at the first rotted sector and 5 of 15 got another photo's tables) |
 | R8 | nothing of the image | the Exif thumbnail |
 | R9 | lost intervals | holes filled (thumbnail-guided DC field, smooth surface, not flat squares) |
 | R10 | intact tail after a rotted stretch | tail scan in C, cut where colours step away from the thumbnail |
@@ -63,6 +63,7 @@ Last update: 2026-11-02, build 157.
 | R12 | holes | smooth surface (`surface()`); tails after a hole set to the level of their seams (`tail_shifts`, see below) |
 | R13 | orientation | portrait photos upright |
 | R14 | decoded garbage (patterns, saturated patches, another photo's data) | becomes a hole and is filled again |
+| R15 | rotted Exif thumbnail (the preview galleries show) in a whole or repaired picture | a fresh one from the picture, written into the Exif block in place (`jpeg/exifthumb.py`); the scanner reports `thumbnail_damaged`, the overview counts them |
 
 Also: damaged thumbnails are rescued (header borrowed from a healthy thumbnail of the same
 camera, `dcfield._rescue_thumbnail`); the jigsaw puts the pieces of photos with restart
@@ -311,6 +312,30 @@ Last result, 12 photos of a dense-rst-lost bench (1600 px), steps `puzzle,burst,
 | build 132 (bridging off) | 29.75 | 0.940 | 0.013 | 0.855 | 0.920 |
 | build 133 (+ level_real) | 29.80 | 0.941 | 0.013 | 0.855 | 0.920 |
 
+### Full-size test: the wedding set (2026-11-02, build 154)
+
+15 photos of 16 MP (4948x3280, saved with optimised Huffman tables, a 160x120 thumbnail),
+once with the thumbnail's scan rotted and the picture whole, once with the picture's scan
+rotted (dense rot, 18-38 % of the sectors) and the thumbnail whole; repaired by the app on the
+owner's card, scored against the originals (the set lives outside the repository).
+
+- Thumbnail rotted: the picture comes out byte-identical (good), but the app called the photos
+  healthy and left the rotted preview in the copy. Build 157: R15 and the `thumbnail_damaged`
+  finding.
+- Picture rotted: psnr 23.6 / 26.4 (repair / enhanced), good 0.77 / 0.84, detail 0.38 / 0.55.
+  Colours and shapes are right, detail is half the truth's. Two causes, measured per MCU
+  against the truth (scripts in the session's scratch, `mcu_audit`, `chain_audit`, `placer_audit`):
+  1. R7 gave 5 of 15 photos another photo's Huffman tables (fixed, build 157).
+  2. The decoder finds and syncs 95 % of the MCUs that survived in intact stretches, but at
+     16 MP only 4 % of the stretches with detail land at their place, 14 % one to three rows
+     off, 82 % are left out. The placer's reference is the 160x120 thumbnail: one of its
+     pixels covers 2.6 MCU rows, so the best fit is the true place in only 30-50 % of the
+     searches (a whole number of rows off otherwise), and the DISTINCT rule (a winner must
+     beat every place more than 3 MCUs away) accepts 1-5 %. On the 1600 px bench the same
+     rule accepts 66 % and the best fit is the true place in 94 %. The cost at the true place
+     passes ACCEPT in 58-92 % of the stretches: the reference recognises them, it cannot tell
+     the row.
+
 ## Tried, and what was learnt
 
 - **Destripe without a thumbnail** (judging a block by its neighbours): made photos worse,
@@ -327,6 +352,12 @@ Last result, 12 photos of a dense-rst-lost bench (1600 px), steps `puzzle,burst,
 - SwinIR in a batch mixed the tiles (scan-line noise): it enlarges one tile at a time.
 
 ## Open
+
+Next (owner's choice, 2026-11-02): the placer at full size (R11). The row from the byte
+count (R11 has it, within a row or two) and from the seams with real rows above and below,
+the thumbnail for the column only, DISTINCT compared inside the chosen row, ACCEPT scaled by
+the thumbnail-to-picture ratio. Measure on the wedding set (stretches at their place: 4 %
+today) and on the dh/dn benches (no regression).
 
 Waiting for the owner's choice (proposed, not started):
 1. Rescued thumbnail: let the thumbnail step, `destripe` and the hole colours use its real part.

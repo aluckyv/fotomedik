@@ -130,3 +130,29 @@ def test_r8_not_used_when_image_is_mostly_fine(image):
     data = _with_exif(image)
     ctx = run_pipeline(Context(data=data, name="t.jpg"), recipes=[ThumbnailFallback()])
     assert ctx.fallback is None and ctx.data == data
+
+
+def _optimised_jpeg(seed: int) -> bytes:
+    """A photo saved with Huffman tables optimised for it (every photo of such a set has
+    its own DHT, a few bits away from its neighbours')."""
+    buf = io.BytesIO()
+    make_image(1600, 1200, seed=seed).save(buf, format="JPEG", quality=85, subsampling="4:2:0", optimize=True)
+    return buf.getvalue()
+
+
+def test_r7_keeps_own_optimised_tables_under_dense_rot():
+    from fotomedik.train.damage import dense_rot
+
+    own, others = _optimised_jpeg(1), [_optimised_jpeg(s) for s in (2, 3)]
+    res = M.parse_segments(own)
+    dht = lambda d: b"".join(sg.payload for sg in M.parse_segments(d).all(M.DHT))  # noqa: E731
+    assert all(dht(o) != dht(own) for o in others)
+    rotted, _ = dense_rot(own, seed=5)
+    profs = [CameraProfile.from_jpeg(o) for o in others]
+    ctx = Context(data=rotted, name="o.jpg", options={"ref_candidates": profs})
+    run_pipeline(ctx, recipes=[ReferenceHeader()])
+    # the own header decodes up to the first rotted sector (about 1 % of a big photo),
+    # another photo's tables no further: the header stays as it is (before, every header
+    # was within MIN_GAIN of the own one and a foreign one won)
+    assert "reference_header" not in ctx.applied
+    assert ctx.data[: res.scan_start] == own[: res.scan_start]

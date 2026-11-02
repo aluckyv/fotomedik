@@ -35,6 +35,7 @@ STRINGS = {
             "garbage_tail": "tuđi sadržaj na kraju fajla",
             "no_eoi": "nedostaje završni marker",
             "damaged_rst": "oštećeni restart markeri",
+            "thumbnail_damaged": "oštećena ugrađena sličica (pregled koji prikazuju galerije)",
             "internal_error": "greška u programu pri obradi ovog fajla",
         },
         "recipe": {
@@ -49,6 +50,7 @@ STRINGS = {
             "foreign_sectors": "izbačeni sektori koji nisu deo slike (nule, tekst, drugi fajlovi)",
             "orientation": "vraćena orijentacija (uspravna slika)",
             "junk_blocks": "dekodirano smeće pretvoreno u rupe",
+            "thumbnail_renew": "upisana nova ugrađena sličica (iz same slike)",
         },
         "reason": {
             "damaged": "oštećeno",
@@ -83,6 +85,7 @@ STRINGS = {
             "garbage_tail": "foreign data at the end of the file",
             "no_eoi": "end marker missing",
             "damaged_rst": "damaged restart markers",
+            "thumbnail_damaged": "damaged embedded thumbnail (the preview galleries show)",
             "internal_error": "program error while processing this file",
         },
         "recipe": {
@@ -97,6 +100,7 @@ STRINGS = {
             "foreign_sectors": "foreign sectors blanked (zeros, text, other files)",
             "orientation": "orientation restored (photo shows upright)",
             "junk_blocks": "decoded garbage turned into holes",
+            "thumbnail_renew": "fresh embedded thumbnail written (from the picture)",
         },
         "reason": {
             "damaged": "damaged",

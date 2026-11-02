@@ -125,4 +125,12 @@ def scan_bytes(data: bytes, name: str = "") -> Diagnosis:
     if tail is not None:
         d.add("garbage_tail", "medium", tail, f"{len(data) - tail} bytes of non-image data at the end", bytes=len(data) - tail)
 
+    # the Exif preview rots with the header while the picture may be whole: viewers show
+    # the preview, so it counts (the repair writes a fresh one; the picture stays as it is)
+    from ..jpeg.exifthumb import find_slot, thumbnail_damaged
+
+    slot = find_slot(data)
+    if slot is not None and thumbnail_damaged(data, slot):
+        d.add("thumbnail_damaged", "low", slot.start, "embedded thumbnail (the preview viewers show) is damaged")
+
     return d

@@ -8,7 +8,7 @@ SEVERITIES = ("low", "medium", "high", "fatal")
 
 # Finding kinds (stable identifiers; the report maps them to sr/en text):
 #   not_jpeg, cardrecovery_xor, header_error, missing_tables, unsupported_progressive,
-#   scan_error, truncated, garbage_tail, no_eoi, damaged_rst
+#   scan_error, truncated, garbage_tail, no_eoi, damaged_rst, thumbnail_damaged
 
 
 @dataclass

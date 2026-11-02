@@ -23,6 +23,13 @@ MAX_SOS_MISMATCH = 0.25  # fraction of bits allowed to differ when locating the 
 MIN_GAIN = 0.02
 MIN_MATCH = 3  # profile.matches(): 10 = same Exif model, 3 = same dimensions
 CLOSE_SOS = 0.15  # fraction of differing bits for a certain SOS match
+# A header that parses is replaced only by one that decodes clearly further than it: this
+# many MCUs more, and this share more. Photos saved with optimised Huffman tables differ
+# from their neighbours' by a few bits (they look like "silently damaged" tables), and with
+# dense rot every header, right or wrong, stops at the first rotted sector; before, the
+# rounded decoded share tied at 0.00 on 16 MP photos and 5 of 15 got another photo's tables.
+STRICT_MCUS = 4
+STRICT_SHARE = 0.25
 
 _POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.int32)
 
@@ -72,10 +79,14 @@ def _recovered(data: bytes) -> tuple[float, D.ScanResult | None]:
     return sr.recovered_fraction, sr
 
 
-def _tables_near(data: bytes, prof: CameraProfile) -> bool:
-    """True when the file's tables differ from the profile's by a few bits (silent damage)."""
+def _tables_near(data: bytes, prof: CameraProfile, kinds=(M.DQT, M.DHT)) -> bool:
+    """True when the file's tables differ from the profile's by a few bits (silent damage).
+    Huffman tables optimised per photo pass this test too (neighbouring shots differ by a
+    few bits), so a DHT match alone is only a reason to look, not to replace."""
     res = M.parse_segments(data)
     for kind, refs in ((M.DQT, prof.dqt), (M.DHT, prof.dht)):
+        if kind not in kinds:
+            continue
         segs = res.all(kind)
         if len(segs) != len(refs):
             continue
@@ -106,17 +117,23 @@ class ReferenceHeader(Recipe):
             return None
         d = ctx.data
         needs = not _header_healthy(d)
+        ctx.memo["reference_strict"] = False
         if not needs:
-            # a header that parses is replaced only when its tables are a few flipped bits
-            # away from a reference, or when nothing decodes and no reference has its tables
+            # a header that parses is replaced when its quantisation tables are a few flipped
+            # bits away from a reference; when only its Huffman tables are near one, or no
+            # reference has its tables and almost nothing decodes, a reference is tried but
+            # kept only if it decodes clearly further (fix: the own tables may be the right
+            # ones, optimised for this photo)
             res = M.parse_segments(d)
             own = ([sg.payload for sg in res.all(M.DQT)], [sg.payload for sg in res.all(M.DHT)])
             known = any((p.dqt, p.dht) == own for p in profiles)
-            if any(_tables_near(d, p) for p in profiles):
+            if any(_tables_near(d, p, (M.DQT,)) for p in profiles):
                 needs = True
-            elif not known:
+            else:
                 cur, _ = _recovered(d)
-                needs = cur < 0.05
+                near_dht = any(_tables_near(d, p, (M.DHT,)) for p in profiles)
+                needs = cur < 0.05 and (near_dht or not known)
+                ctx.memo["reference_strict"] = True
         if not needs:
             return None
         # An explicit --ref is trusted; auto-learned candidates must look like the same
@@ -140,7 +157,9 @@ class ReferenceHeader(Recipe):
         ctx.memo["reference_tried"] = True
         d = ctx.data
         parse = M.parse_segments(d)
-        current, _ = _recovered(d)
+        current, own_sr = _recovered(d)
+        own_mcus = own_sr.decoded_mcus if own_sr is not None else 0
+        strict = bool(ctx.memo.get("reference_strict"))
 
         # dimensions the damaged SOF still states, if plausible
         sof_dims = None
@@ -183,19 +202,23 @@ class ReferenceHeader(Recipe):
                     p2 = M.parse_segments(cand)
                     misfit = row_misfit(sr, FrameTables.from_parse(p2))
                     clean_ivs = sum(1 for iv in sr.intervals if iv.ok) if len(sr.intervals) > 1 else 0
-                    trials.append((frac, misfit, prof.votes, cand, start, prof, (w, h), clean_ivs))
+                    trials.append((frac, misfit, prof.votes, cand, start, prof, (w, h), clean_ivs, sr.decoded_mcus))
         if not trials:
             ctx.note(self, "reference header did not produce a decodable file")
             return
 
         def rank(t):
-            frac, misfit, votes, clean_ivs = t[0], t[1], t[2], t[7]
+            frac, misfit, votes, clean_ivs, mcus = t[0], t[1], t[2], t[7], t[8]
             # restart intervals that decode cleanly from marker to marker prove the row
             # length (a wrong one fails every interval, however much of each prefix decodes);
-            # then the decoded share (coarsely), rows that line up, the commoner header
-            return (clean_ivs, round(frac, 2), -(misfit if misfit is not None else 1e9), votes)
+            # then the decoded MCUs (the share rounds to nothing on a big photo whose first
+            # pass stops at the first rotted sector), rows that line up, the commoner header
+            return (clean_ivs, mcus, -(misfit if misfit is not None else 1e9), votes)
 
-        frac, _misfit, _votes, cand, start, prof, (w, h), _clean = max(trials, key=rank)
+        frac, _misfit, _votes, cand, start, prof, (w, h), _clean, mcus = max(trials, key=rank)
+        if strict and mcus <= own_mcus + max(STRICT_MCUS, STRICT_SHARE * own_mcus):
+            ctx.note(self, f"own header kept: it decodes {own_mcus} MCU(s), the best reference {mcus}")
+            return
         if frac + MIN_GAIN < current:
             ctx.note(self, f"reference header kept aside: {frac:.1%} vs current {current:.1%}")
             return
