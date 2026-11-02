@@ -1065,6 +1065,74 @@ def even_rows(arr: np.ndarray, ref: np.ndarray, ref_real: np.ndarray | None = No
     return np.clip(np.rint(out), 0, 255).astype(np.uint8), int((bad & (fade_b > 0)).sum())
 
 
+FLAT_FILL = 3.0  # luma spread inside a block of the repair's fill below which the fill is flat
+FLAT_AROUND = 6.0  # and how much the real blocks around (7x7) may differ from each other
+FLAT_INSIDE = 4.0  # and how rough those real blocks may be inside (sky, wall, water: not leaves)
+FLAT_TONE = 24.0  # a block the AI painted this far from the fill's tone drew something (a pole): kept
+FLAT_GROUND = True  # build 155: on flat ground the enhanced copy keeps the repaired copy's pixels
+FLAT_FEATHER = 6.0  # px, the edge of such a patch
+
+
+def flat_ground(arr: np.ndarray, came: np.ndarray) -> tuple[np.ndarray, float]:
+    """Blocks that are flat in the repaired copy, flat in the enhanced copy too (no pole, no
+    leaf drawn through them) and on flat ground around keep the repaired copy's pixels. On a
+    photo without a thumbnail the AI has nothing to add to a sky or a wall, and what it added
+    on 100_0270 was bands: LaMa's tones, healed "stripes" that were real rows, copied texture.
+    Returns (rgb, share of the picture that went back)."""
+    from .patchfill import box_blur
+
+    h, w = arr.shape[:2]
+    bh, bw = h // 8, w // 8
+    if bh < 8 or bw < 8:
+        return arr, 0.0
+    wts = np.array([0.299, 0.587, 0.114], np.float32)
+    lc = (came[: bh * 8, : bw * 8].astype(np.float32) @ wts).reshape(bh, 8, bw, 8)
+    la = (arr[: bh * 8, : bw * 8].astype(np.float32) @ wts).reshape(bh, 8, bw, 8)
+    mean, std_c, std_a = lc.mean(axis=(1, 3)), lc.std(axis=(1, 3)), la.std(axis=(1, 3))
+    m1 = box_blur(mean[..., None], 3)[..., 0]
+    m2 = box_blur((mean * mean)[..., None], 3)[..., 0]
+    around = np.sqrt(np.maximum(m2 - m1 * m1, 0.0))
+    inside = box_blur(std_c[..., None], 3)[..., 0]
+    # the tone is compared per channel: a pink junk row healed to gray has the same luma
+    tone = np.abs(arr[: bh * 8, : bw * 8].astype(np.float32).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))
+                  - came[: bh * 8, : bw * 8].astype(np.float32).reshape(bh, 8, bw, 8, 3).mean(axis=(1, 3))).max(axis=-1)
+    flat = (std_c < FLAT_FILL) & (std_a < FLAT_FILL) & (tone < FLAT_TONE) & (around < FLAT_AROUND) & (inside < FLAT_INSIDE)
+    if not flat.any():
+        return arr, 0.0
+    mask = np.zeros((h, w), bool)
+    mask[: bh * 8, : bw * 8] = np.repeat(np.repeat(flat, 8, 0), 8, 1)
+    a = _soft(mask, FLAT_FEATHER)[..., None]
+    out = arr.astype(np.float32) * (1 - a) + came.astype(np.float32) * a
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8), float(mask.mean())
+
+
+def flat_holes(fill: np.ndarray, holes: np.ndarray) -> np.ndarray:
+    """Hole pixels where the repair's smooth fill is as good a tone as any: the fill is flat
+    and the real picture around is flat too (a sky, a wall). LaMa paints such a stretch a
+    shade lighter or darker than the rows around it, and on 100_0270 the sky, fine in the
+    repaired copy, came out banded; here the fill's block averages are kept instead."""
+    from .patchfill import box_blur
+
+    h, w = holes.shape
+    bh, bw = h // 8, w // 8
+    out = np.zeros_like(holes)
+    if bh < 8 or bw < 8:
+        return out
+    luma = (fill[: bh * 8, : bw * 8].astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32))
+    b = luma.reshape(bh, 8, bw, 8)
+    mean, std = b.mean(axis=(1, 3)), b.std(axis=(1, 3))
+    hb = holes[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8).mean(axis=(1, 3)) > 0.5
+    real = (~hb).astype(np.float32)
+    den = box_blur(real[..., None], 3)[..., 0]
+    m1 = box_blur((mean * real)[..., None], 3)[..., 0] / np.maximum(den, 1e-6)
+    m2 = box_blur((mean * mean * real)[..., None], 3)[..., 0] / np.maximum(den, 1e-6)
+    around = np.sqrt(np.maximum(m2 - m1 * m1, 0.0))
+    inside = box_blur((std * real)[..., None], 3)[..., 0] / np.maximum(den, 1e-6)
+    flat = hb & (std < FLAT_FILL) & (den > 0.1) & (around < FLAT_AROUND) & (inside < FLAT_INSIDE)
+    out[: bh * 8, : bw * 8] = np.repeat(np.repeat(flat, 8, 0), 8, 1)
+    return out & holes
+
+
 def keep_block_means(out: np.ndarray, ref: np.ndarray, holes: np.ndarray, known: np.ndarray,
                      spread: bool = False) -> np.ndarray:
     """Give every 8x8 block of `out` the average it has in `ref` where `known`, through
@@ -1301,6 +1369,7 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         if filled.any():
             done.append(f"similar shots: {100 * filled.sum() / max(1, holes.sum()):.0f} % of the holes ({_took(t0)})")
             real = np.where(filled[..., None], arr, real)
+            came = np.where(filled[..., None], arr, came)  # real pixels: flat_ground keeps these, not the fill
             holes = holes & ~filled
             unknown = unknown & ~filled
     if (FLANK or "flank" in steps) and holes.any():  # see flanked_runs
@@ -1425,10 +1494,15 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
             faces = face_mask(before, engine.face_det) & ~stamp
             known = holes & ~unknown
             stripes, junk = rotted_stripes(before, holes, known, thumb, faces, stamp)
+            # unknown holes on flat ground keep the fill's tone (not the junk rows: their tone is the junk's)
+            flat = flat_holes(before, holes & ~junk) & ~known & ~junk
             holes = (holes | junk) & ~stamp
             arr = heal_holes(arr, holes, engine, report("LaMa window"), stop, st)
-            arr = keep_block_means(arr, before, holes, known & ~stripes)
+            arr = keep_block_means(arr, before, holes, (known & ~stripes) | flat)
             notes = []
+            if flat.any():
+                notes.append(f"{100 * int(flat.sum()) // max(1, int(holes.sum()))} % of the holes on flat ground "
+                             "kept the repair's tone")
             if junk.any():
                 notes.append(f"{int(junk.sum()) // 64} block(s) of wrongly coloured stripes healed too")
             if stamp.any():
@@ -1466,6 +1540,11 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         if pst.get("textured"):
             done.append(f"holes given the photo's own texture ({100 * pst['textured'] / max(1, int(holes.sum())):.0f} % "
                         f"of them, like Content-Aware Fill; faces left as they were; {_took(t0)})")
+    if FLAT_GROUND and thumb is None and holes.any() and steps & {"thumbsr", "ai", "diffusion"}:
+        # no whole thumbnail: on flat ground the repaired copy is the better picture (see flat_ground)
+        arr, back = flat_ground(arr, came)
+        if back:
+            done.append(f"flat ground ({100 * back:.0f} % of the picture: sky, walls) kept as the repaired copy has it")
     if DESTRIPE and steps & {"deblock", "thumbsr", "ai", "puzzle"}:
         t0 = time.perf_counter()
         ref, ref_real = thumb, None

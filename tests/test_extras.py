@@ -472,3 +472,21 @@ def test_flanked_runs_finds_short_decoded_stretches_between_holes_only():
     holes[8:16, 300:] = True  # now 220 px = 27 blocks: too long to be the decoder's guess
     assert not flanked_runs(holes).any()
 
+
+
+def test_flat_ground_keeps_the_repaired_copy_on_flat_ground_only():
+    from fotomedik.ai.enhance import flat_ground
+
+    came = np.full((128, 256, 3), (120, 160, 210), np.uint8)  # a sky the repair filled smoothly
+    arr = came.copy()
+    arr[32:40, :] = (126, 166, 216)  # the enhanced copy: a band a shade lighter (LaMa's tone)
+    arr[64:72, :] = (115, 155, 205)
+    arr[:, 120:128] = (40, 40, 40)  # ...and a pole it drew through the sky: structure, kept
+    out, back = flat_ground(arr, came)
+    assert back > 0.5
+    assert np.abs(out[32:40, 20:100].astype(int) - came[32:40, 20:100]).max() <= 1  # the bands are gone
+    assert (out[16:112, 122:126] < 60).all()  # the pole stays
+    textured = came.astype(int) + np.random.default_rng(0).integers(-20, 20, came.shape)  # leaves: not flat ground
+    textured = np.clip(textured, 0, 255).astype(np.uint8)
+    out2, back2 = flat_ground(arr, textured)
+    assert back2 == 0.0 and (out2 == arr).all()
