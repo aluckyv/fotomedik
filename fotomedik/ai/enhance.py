@@ -1186,10 +1186,8 @@ def enhance_steps(arr: np.ndarray, holes: np.ndarray, unknown: np.ndarray, engin
         if PROTECT_REAL:  # the file's own pixels stay sharp: the clean-up works on the holes
             cleaned = arr
             arr = protect_real(arr, real, holes & ~keep if keep is not None else holes)
-            if LEVEL_FROM_NET and st.get("guided", False):
-                arr, n_lev = level_real(cleaned, arr, holes)
-                if keep is not None:
-                    arr = np.where(keep[..., None], real, arr)
+            if LEVEL_FROM_NET and st.get("guided", False):  # the jigsaw's pieces are not levelled
+                arr, n_lev = level_real(cleaned, arr, holes | keep if keep is not None else holes)
         elif keep is not None:
             arr = np.where(keep[..., None], real, arr)
         real = arr.copy()  # the cleaned picture is the base from here on
