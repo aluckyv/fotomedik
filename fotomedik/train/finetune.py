@@ -298,10 +298,18 @@ def main(argv=None) -> None:
 
     if a.resume and last.exists():
         st = torch.load(last, map_location="cpu", weights_only=False)
-        net.load_state_dict(st["net"])
-        opt.load_state_dict(st["opt"])
-        sched.load_state_dict(st["sched"])
         start = st["iter"]
+        if all(torch.isfinite(v).all() for v in st["net"].values() if v.is_floating_point()):
+            net.load_state_dict(st["net"])
+            opt.load_state_dict(st["opt"])
+            sched.load_state_dict(st["sched"])
+        else:
+            # a run that went NaN before this fix saved its broken weights: go on from the best state
+            net.load_state_dict(torch.load(a.out / "best.pt", map_location="cpu", weights_only=True))
+            for g in opt.param_groups:
+                g["initial_lr"] = g["lr"]
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=start, eta_min=a.lr * 0.1)
+            print(f"the state saved at iteration {start} was broken (NaN): going on from the best state")
         # the patches may be new (made again, more photos): the best so far is measured anew on
         # today's check patches, or no new state could ever beat a number from other patches
         p_now, p_in = psnr_of(net, va, device, a.guided)
