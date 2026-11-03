@@ -537,6 +537,34 @@ def _same_shape(small: np.ndarray, shape) -> bool:
     return abs((small.shape[1] / small.shape[0]) / (w / h) - 1.0) <= 0.03
 
 
+PREVIEW_BLOCK = 16  # pixels of the preview compared with the thumbnail at a time
+PREVIEW_AGREE = 30.0  # largest channel difference of a block's average from the thumbnail's
+
+
+def _preview_trusted(big: np.ndarray, real: np.ndarray, base: np.ndarray, base_real: np.ndarray) -> np.ndarray:
+    """The part of a repaired preview to trust. Pieces its own repair put after a rotted
+    stretch can come out on a wrong level (build 163: white bands across three photos):
+    where the thumbnail is known, blocks off its colours are dropped; without one, only the
+    rows before the first hole count (decoded from the start, on the right level)."""
+    real = real.copy()
+    if not base_real.any():
+        rows = np.flatnonzero(~real.all(axis=1))
+        if len(rows):
+            real[rows[0] :] = False
+        return real
+    b = PREVIEW_BLOCK
+    h, w = (real.shape[0] // b) * b, (real.shape[1] // b) * b
+
+    def means(a):
+        return a[:h, :w].astype(np.float32).reshape(h // b, b, w // b, b, -1).mean(axis=(1, 3))
+
+    off = np.abs(means(big) - means(base)).max(axis=2) > PREVIEW_AGREE
+    off &= means(base_real[..., None])[..., 0] > 0.5
+    bad = np.zeros_like(real)
+    bad[:h, :w] = np.kron(off, np.ones((b, b), bool))
+    return real & ~bad
+
+
 def preview_rgb(source: bytes, small: np.ndarray | None, rescued: tuple | None, shape):
     """The camera's larger FlashPix preview (Kodak: 640x480, see jpeg.fpxr) joined with
     the thumbnail: (small, rescued, note). A whole preview replaces the thumbnail; a rotted
@@ -558,12 +586,9 @@ def preview_rgb(source: bytes, small: np.ndarray | None, rescued: tuple | None, 
             return small, rescued, None
         holes, _unknown = photo_masks(ctx.data, rep.holes, rep.unknown)
         real = ~holes[: big.shape[0], : big.shape[1]]
-        share = float(real.mean())
         size = f"{big.shape[1]}x{big.shape[0]}"
-        if share >= 0.999:
+        if float(real.mean()) >= 0.999:
             return big, None, f"the camera's {size} preview used instead of the thumbnail"
-        if share < PREVIEW_MIN_REAL:
-            return small, rescued, None
         bh, bw = big.shape[:2]
         under, under_real = None, None
         if small is not None:
@@ -576,6 +601,10 @@ def preview_rgb(source: bytes, small: np.ndarray | None, rescued: tuple | None, 
             base_real = np.asarray(Image.fromarray(under_real.astype(np.uint8) * 255).resize((bw, bh))) > 127
         else:
             base, base_real = np.zeros_like(big), np.zeros((bh, bw), bool)
+        real = _preview_trusted(big, real, base, base_real)
+        share = float(real.mean())
+        if share < PREVIEW_MIN_REAL:
+            return small, rescued, None
         joined = np.where(real[..., None], big, base)
         known = real | base_real
         note = f"the camera's {size} preview used where it survived ({100 * share:.0f} % of it)"

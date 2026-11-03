@@ -69,3 +69,20 @@ def test_rotted_preview_lays_its_real_part_over_the_thumbnail():
     assert got is not None and got.shape[:2] == (img.height, img.width) and rescued is None
     got, rescued, note = preview_rgb(data, None, None, (img.height, img.width))  # no thumbnail: a rescued one
     assert got is None and rescued[1].dtype == bool and 0.1 < rescued[1].mean() < 1
+
+
+def test_preview_pieces_off_the_thumbnail_are_not_trusted():
+    """Pieces after a rotted stretch on a wrong level (white bands, build 163) are dropped;
+    without a thumbnail only the rows before the first hole count."""
+    from fotomedik.ai.enhance import _preview_trusted
+
+    img = np.asarray(make_image().convert("RGB").resize((256, 192)))
+    big = img.copy()
+    big[128:] = np.clip(big[128:].astype(int) + 70, 0, 255).astype(np.uint8)  # a piece on a wrong level
+    real = np.ones((192, 256), bool)
+    real[96:112] = False  # the rotted stretch
+    base = np.asarray(Image.fromarray(img).resize((64, 48)).resize((256, 192), Image.BICUBIC))
+    kept = _preview_trusted(big, real, base, np.ones((192, 256), bool))
+    assert kept[:96].mean() > 0.9 and kept[128:].mean() < 0.2
+    alone = _preview_trusted(big, real, np.zeros_like(big), np.zeros((192, 256), bool))
+    assert alone[:96].all() and not alone[96:].any()
