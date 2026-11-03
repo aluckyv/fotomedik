@@ -146,3 +146,33 @@ def test_scan_damaged_soi_is_header_error(healthy_jpeg_rst):
     data = b"\xbf" + healthy_jpeg_rst[1:]
     d = scan_bytes(data, "x.jpg")
     assert [f.kind for f in d.findings] == ["header_error"]
+
+
+def test_batch_learns_from_another_folder(tmp_path, healthy_jpeg):
+    """A damaged photo alone in its folder: the header comes from a healthy photo of the
+    same camera in another folder (--learn-from), which is only read."""
+    import csv as _csv
+
+    from fotomedik.jpeg import markers as M
+
+    seg = M.parse_segments(healthy_jpeg).all(M.DHT)[0]
+    bad = bytearray(healthy_jpeg)
+    bad[seg.offset + 4 : seg.offset + 24] = b"\xff" * 20  # the Huffman tables destroyed
+    src, other = tmp_path / "src", tmp_path / "other"
+    src.mkdir()
+    other.mkdir()
+    (src / "x.jpg").write_bytes(bytes(bad))
+    (other / "good.jpg").write_bytes(healthy_jpeg)
+
+    def recovered(out):
+        r = CliRunner().invoke(main, ["batch", str(src), "-o", str(out)] +
+                               (["--learn-from", str(other)] if out.name == "with" else []))
+        assert r.exit_code == 0, r.output
+        row = next(_csv.DictReader((out / "summary.csv").open(encoding="utf-8")))
+        return float(row["recovered_pct"] or 0), r.output
+
+    alone, _ = recovered(tmp_path / "alone")
+    learnt, text = recovered(tmp_path / "with")
+    assert learnt > 99 and learnt > alone
+    assert "to learn from" in text
+    assert (other / "good.jpg").read_bytes() == healthy_jpeg and not (tmp_path / "with" / "good.jpg").exists()

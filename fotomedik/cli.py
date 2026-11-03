@@ -386,8 +386,11 @@ def scan(path: Path, lang: str):
 def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budget, lang, auto_ref: bool,
                 jobs: int = 0, reports: bool = False, enhance: str = "", quality: str | None = None,
                 prompt: str | None = None, reference: Path | None = None, twins: bool = False,
-                enlarger: str | None = None, only: set[str] | None = None, skip_done: bool = False):
+                enlarger: str | None = None, only: set[str] | None = None, skip_done: bool = False,
+                learn_from: tuple[Path, ...] = ()):
     """only: the photos (paths relative to the folder, lower case) to do, the rest left out.
+    learn_from: folders of healthy photos (other trips with the same cameras) the set learns
+    headers and thumbnails from as well; they are only read, never repaired.
     skip_done: photos that have their result in `out` already get no new enhanced copy
     (they are repaired again, quickly, as burst donors for the others)."""
     if path.is_dir() and out.resolve() == path.resolve():
@@ -422,8 +425,12 @@ def _fix_common(path: Path, out: Path, ref, mark_holes, keep_damaged, time_budge
             items = [it for it, d in zip(items, done) if not d]
         click.echo(f"{sum(done)} photo(s) done already, left out")
     with Workers(jobs, len(items)) as workers:
-        if auto_ref and len(files) > 1:
-            learned = _learn_candidates(files, click.echo, jobs, workers)
+        extra = [(p, Path("learn") / str(i) / rel) for i, d in enumerate(learn_from) for p, rel in _iter_files(d)
+                 if not p.resolve().is_relative_to(out.resolve())]
+        if extra:
+            click.echo(f"{len(extra)} photo(s) to learn from in {len(learn_from)} other folder(s)")
+        if auto_ref and len(files) + len(extra) > 1:
+            learned = _learn_candidates(files + extra, click.echo, jobs, workers)
             for _p, _rel, opts in items:
                 opts["ref_candidates"], opts["thumb_refs"] = learned
         work = [(str(p), str(rel), str(out), opts, profile) for p, rel, opts in items]
@@ -530,9 +537,12 @@ def learn(good: Path, out: Path):
               help="a text file naming the photos to do, one per line (paths relative to FOLDER)")
 @click.option("--skip-done", is_flag=True,
               help="leave out photos whose enhanced copy (without --enhance: repaired copy) is in OUT already")
+@click.option("--learn-from", multiple=True, type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="a folder of healthy photos taken with the same cameras (another trip): headers and "
+                   "thumbnails are learnt from it too; only read. May be given more than once")
 @click.option("--lang", default="sr", type=click.Choice(["sr", "en"]))
 def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, jobs, reports, ai, enhance, quality,
-          scene, enlarger, reference, twins, only_file, skip_done, lang):
+          scene, enlarger, reference, twins, only_file, skip_done, learn_from, lang):
     """Repair a whole folder; healthy photos in it serve as references; writes summary.csv."""
     only = None
     if only_file is not None:
@@ -541,7 +551,7 @@ def batch(folder, out, ref, mark_holes, keep_damaged, time_budget, thorough, job
     reps = _fix_common(folder, out, ref, mark_holes, keep_damaged, 60.0 if thorough else time_budget, lang,
                        auto_ref=True, jobs=jobs, reports=reports, enhance=enhance or ("burst,ai" if ai else ""),
                        quality=quality, prompt=scene or None, reference=reference, twins=twins,
-                       enlarger=enlarger, only=only, skip_done=skip_done)
+                       enlarger=enlarger, only=only, skip_done=skip_done, learn_from=tuple(learn_from))
     with (out / "summary.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "output", "recovered_pct", "holes", "findings", "applied", "fallback"])

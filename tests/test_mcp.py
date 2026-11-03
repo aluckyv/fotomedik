@@ -368,3 +368,13 @@ def test_update_app_leaves_a_new_base_to_the_launcher_and_waits_for_jobs(home, t
 def test_update_app_from_source_says_so(home, monkeypatch):
     res = mcp_server.call_tool("update_app", {})
     assert res["isError"] and "not the installed FotoMedik" in res["content"][0]["text"]
+
+
+def test_learn_from_goes_on_the_command_line_and_is_checked(home, photos, tmp_path):
+    with pytest.raises(jobs.JobError, match="learn from does not exist"):
+        jobs.new_job(str(photos), str(tmp_path / "out"), "", learn_from=[str(tmp_path / "nowhere")])
+    with pytest.raises(jobs.JobError, match="learn from must not be"):
+        jobs.new_job(str(photos), str(tmp_path / "out"), "", learn_from=[str(tmp_path)])
+    cmd = jobs.command({"id": "j", "source": str(photos), "output": str(tmp_path / "o"), "steps": "",
+                        "learn_from": [str(tmp_path)]})
+    assert cmd[-2:] == ["--learn-from", str(tmp_path)]

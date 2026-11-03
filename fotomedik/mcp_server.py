@@ -47,6 +47,9 @@ TOOLS = [
                 "skip_done": {"type": "boolean", "description": "photos that already have their enhanced "
                               "copy in output (or repaired copy without steps) get no new one; the others are "
                               "done - a stopped or interrupted job continues this way", "default": False},
+                "learn_from": {"type": "array", "items": {"type": "string"},
+                               "description": "folders of healthy photos taken with the same cameras (other "
+                               "trips): their headers and thumbnails help repair the damaged ones; only read"},
             },
             "required": ["source", "output"],
         },
@@ -106,14 +109,14 @@ TOOLS = [
 
 
 def _short(job: dict) -> dict:
-    keys = ("id", "state", "source", "output", "steps", "photos", "to_do", "created", "started", "finished",
-            "returncode")
+    keys = ("id", "state", "source", "output", "steps", "learn_from", "photos", "to_do", "created", "started",
+            "finished", "returncode")
     return {k: job.get(k) for k in keys}
 
 
 def start_job(source: str, output: str, steps: str | None = None, only: list | None = None,
-              skip_done: bool = False) -> dict:
-    job = jobs.new_job(source, output, steps, only, skip_done)
+              skip_done: bool = False, learn_from: list | None = None) -> dict:
+    job = jobs.new_job(source, output, steps, only, skip_done, learn_from)
     ahead = [j["id"] for j in jobs.all_jobs() if j.get("state") in ("queued", "running") and j["id"] != job["id"]]
     return {**_short(job), "jobs_ahead": ahead}
 

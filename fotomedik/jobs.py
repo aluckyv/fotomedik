@@ -203,9 +203,21 @@ def _now() -> str:
 
 
 def new_job(source: str, output: str, steps: str | None = None, only: list[str] | None = None,
-            skip_done: bool = False) -> dict:
-    """Queue a job (JobError when it is not allowed) and make sure the runner works."""
+            skip_done: bool = False, learn_from: list[str] | None = None) -> dict:
+    """Queue a job (JobError when it is not allowed) and make sure the runner works.
+    learn_from: folders of healthy photos of the same cameras the repair learns from too
+    (only read)."""
     src, out = check_paths(source, output)
+    learn = []
+    for f in learn_from or []:
+        if not str(f).strip():
+            continue
+        p = _full(f)
+        if not p.is_dir():
+            raise JobError(f"the folder to learn from does not exist: {p}")
+        if _inside(p, out) or _inside(out, p):
+            raise JobError(f"the folder to learn from must not be the output folder, inside it or around it: {p}")
+        learn.append(str(p))
     st = parse_steps(steps)
     have = photos(src)
     if only:
@@ -229,7 +241,7 @@ def new_job(source: str, output: str, steps: str | None = None, only: list[str] 
         n += 1
     job = {"id": f"{stamp}-{n}", "state": "queued", "source": str(src), "output": str(out),
            "steps": ",".join(st), "only": [r for r in chosen] if only else None, "skip_done": bool(skip_done),
-           "photos": len(chosen), "to_do": len(todo), "created": _now(), "started": None,
+           "learn_from": learn or None, "photos": len(chosen), "to_do": len(todo), "created": _now(), "started": None,
            "finished": None, "pid": None, "returncode": None}
     write(job)
     ensure_runner()
@@ -247,6 +259,8 @@ def command(job: dict) -> list[str]:
         args += ["--only-file", str(lst)]
     if job.get("skip_done"):
         args.append("--skip-done")
+    for f in job.get("learn_from") or []:
+        args += ["--learn-from", f]
     test = os.environ.get("FOTOMEDIK_JOB_CMD")  # the tests run something else instead
     if test:
         return json.loads(test)
