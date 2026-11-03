@@ -395,6 +395,30 @@ def _rescue_from(head: bytes, start: int, ref):
         return frac, np.asarray(im.convert("YCbCr")), mask, first_hole >= per_row
 
 
+def with_preview(data: bytes, got, shape):
+    """The thumbnail (YCbCr pixels, mask or None) joined with the camera's larger FlashPix
+    preview where one survived (Kodak: 640x480, four times finer: one of its pixels covers
+    less than an MCU row of a 16 MP photo, where the thumbnail's covers 2.6 rows and cannot
+    tell the row of a piece). Unchanged without a usable preview."""
+    if b"FPXR" not in data[: 1 << 20]:
+        return got
+    from ..ai.enhance import preview_rgb
+
+    small = rescued = None
+    if got is not None:
+        rgb = np.asarray(Image.fromarray(np.ascontiguousarray(got[0]), "YCbCr").convert("RGB"))
+        if got[1] is None:
+            small = rgb
+        else:
+            rescued = (rgb, np.asarray(got[1]) > 0.5)
+    small, rescued, note = preview_rgb(data, small, rescued, shape)
+    if note is None:
+        return got
+    if small is not None:
+        return np.asarray(Image.fromarray(small).convert("YCbCr")), None
+    return np.asarray(Image.fromarray(rescued[0]).convert("YCbCr")), rescued[1].astype(np.float32)
+
+
 def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,
                    thumb_refs: list | None = None, reference: list | None = None,
                    twin=None) -> ThumbBase | None:
@@ -417,8 +441,10 @@ def thumbnail_base(data: bytes, ft, sr: D.ScanResult, clean_mcus: np.ndarray,
         return max(bases, key=lambda b: b.r) if bases else None
     got = thumbnail_image(data, thumb_refs, landscape=ft.frame.width >= ft.frame.height)
     if got is not None:
+        got = _crop_black_bars(got[0], got[1])
+    got = with_preview(data, got, (ft.frame.height, ft.frame.width))
+    if got is not None:
         img, mask = got
-        img, mask = _crop_black_bars(img, mask)
         base = _base_from(img, mask, ft, sr, clean_mcus, GAIN_THUMB)
         if base is not None and not base.rescued:
             return base
