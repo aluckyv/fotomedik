@@ -189,6 +189,10 @@ def detail_of(net, d: dict, device, guided: bool = False, sharp: float = 0.0, ch
     return err / max(k_n, 1), 100 * kept / max(ref, 1e-12)
 
 
+NAN_PATIENCE = 20  # NaN losses in a row (weights still finite) before going back to the best state
+CLIP = 10.0  # gradient norm limit, far above an ordinary step: only a wild batch is cut back
+
+
 def export_onnx(net, path: Path, guided: bool = False, big: bool = False) -> None:
     """The network as the program runs it: "input" (N, 3, H, W) in 0..1, H and W multiples
     of 8 (guided: also "guide" (N, 3, H/4, W/4), "has_guide" (N, 1), "holes" (N, 1, H/8,
@@ -330,6 +334,7 @@ def main(argv=None) -> None:
     l1 = torch.nn.L1Loss()
     t0 = time.time()
     it = start
+    bad = 0
     try:
         net.train()
         for it in range(start + 1, a.iters + 1):
@@ -342,7 +347,25 @@ def main(argv=None) -> None:
             if a.sharp > 0:  # outside autocast: the Fourier transform in float32
                 loss = loss + a.sharp * edge_loss(out.float(), y)
             opt.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):
+                # a NaN once took a run over for good (the owner's card, iteration 38500 of
+                # 100000: every later step NaN): skip the batch; when the weights themselves
+                # went bad, go back to the best state and on at half the learning rate
+                bad += 1
+                if bad >= NAN_PATIENCE or not all(torch.isfinite(p).all() for p in net.parameters()):
+                    net.load_state_dict(torch.load(a.out / "best.pt", map_location=device, weights_only=True))
+                    opt = torch.optim.Adam(net.parameters(), lr=opt.param_groups[0]["lr"] * 0.5)
+                    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, a.iters - it),
+                                                                       eta_min=opt.param_groups[0]["lr"] * 0.1)
+                    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+                    print(f"iteration {it}: the loss went NaN; back to the best state, learning rate "
+                          f"{opt.param_groups[0]['lr']:g}", flush=True)
+                    bad = 0
+                continue
+            bad = 0
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP)
             scaler.step(opt)
             scaler.update()
             sched.step()
@@ -363,6 +386,8 @@ def main(argv=None) -> None:
                     torch.save(net.state_dict(), a.out / "best.pt")
                     mark = "  <- best so far"
                 print(f"check at {it}: {p_net:.2f} dB (repair as it is {p_in:.2f} dB){extra}{mark}", flush=True)
+                if not np.isfinite(s):
+                    continue  # never keep a broken state to resume from
                 torch.save({"net": net.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
                             "iter": it, "best": best}, last)
     except KeyboardInterrupt:
