@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-03, build 161 (159 was the first build since 154 that passed CI: the program ends with TerminateProcess; 160: R7 margin, no enhanced copy for a rotted preview alone; 161: R7 judges an own header that decodes nothing the old way).
+Last update: 2026-11-03, build 165 (163: overwritten files skipped before any repair, no enhanced copy of a repaired file that does not open, the FlashPix preview for the enhanced copy; 164: its rotted parts off the thumbnail dropped, the preview as the placer's reference; 165: that reference only when the preview is whole. Earlier: 159 was the first build since 154 that passed CI: the program ends with TerminateProcess; 160: R7 margin, no enhanced copy for a rotted preview alone; 161: R7 judges an own header that decodes nothing the old way).
 
 ## How the work is done
 
@@ -346,6 +346,33 @@ repair kept on flat ground, no invented texture there) on photos that are mostly
 160: R2 had mended its header so it parsed, its tables decoded nothing, and the strict
 rule kept them; build 161: an own header that decodes fewer than STRICT_MIN_OWN MCUs is
 judged the old way.
+
+## The whole collection on build 161, and what followed (2026-11-03)
+
+All twelve folders of the owner's collection (384 photos) on build 161, looked at by the owner
+sheet by sheet. What came out of it:
+- Two folders and most of a third hold no photos at all: each file is one 512-byte record
+  repeated (the file's own path in UTF-16 and other bytes), as a copy or recovery tool writes
+  in place of unreadable sectors. Nothing to repair; build 163 skips them before any recipe
+  (R7 had put a learned header on them: grey copies, several byte-identical).
+- "Waxy" enhanced copies are photos with 20-40 % real pixels: the rest is the 160x120
+  thumbnail enlarged. A sharper enlargement (Real-ESRGAN detail laid into the thumbnail's
+  part) was tried on two photos and rejected by the owner; not built.
+- Kodak cameras keep a 640x480 preview in APP2 FPXR segments (`jpeg/fpxr.py`). The enhanced
+  copy uses it (whole, or its real part over the thumbnail: `ai.enhance.preview_rgb`; blocks
+  off the thumbnail's colours are not trusted - they made white bands in 163). Big gain on the
+  Kodak photos that have one (16 of 38 in one folder, 9 of 19 in another).
+- As the placer's reference (`dcfield.with_preview`) a whole 640-pixel preview takes the wedding
+  bench (16 MP, no restart markers; preview made from the truth) from 7 % to 53 % of the
+  stretches at their place. A rotted preview joined with the thumbnail placed real stretches
+  40 MCU rows too low on a real photo (164), so the placer only takes a whole one (165).
+- Almost every camera in the owner's collection writes restart markers (Kodak 180/268, iPhone
+  252), so the row of every piece is known and the placer has little to do there: the bands
+  the owner sees are data that rotted, not pieces in the wrong row. The joint placer (below)
+  matters for photos without restart markers (the wedding set), few in this collection.
+- The thumbnail rescued from damaged headers, and the 640-pixel previews, are the only
+  references; a Windows thumbnail cache (thumbcache_1024/2560) or another copy of the photos
+  would be better ones if the owner has them (not built).
 
 ## Tried, and what was learnt
 
