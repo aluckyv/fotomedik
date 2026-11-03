@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-03, build 159 (the first build since 154 that passed CI: the program ends with TerminateProcess).
+Last update: 2026-11-03, build 160 (159 was the first build since 154 that passed CI: the program ends with TerminateProcess; 160: R7 margin, no enhanced copy for a rotted preview alone).
 
 ## How the work is done
 
@@ -367,6 +367,22 @@ when the best place is the true one its runner-up is the row above or below (92 
 of its cost. What is still missing is a row test the thumbnail cannot give: the seam between
 a piece's blocks and the real blocks above and below (DC or pixels), and placing the first
 pieces after the real rows at the top by the count alone (it is within 24 MCUs there).
+Second try (the same night, not kept, patch in the scratch): pixel seams between a chain's
+edge pixels and known neighbours (the real top rows, placed pieces; `chain_pixels` with a
+frame of only the rows needed, 1 ms a chain), soft placements for flat chains (no anchor,
+the count goes on), anchors only from textured chains, a joint score (misfit + seam +
+count prior). Still no good: with the truth's own pixels as neighbours (an oracle) the seam
+tells the true row from the next one in only 66 % of textured blocks on these heavily
+compressed photos (seam 0.98 at the true row, 1.99 one row off), the count's error per gap
+is 10-30 % with a heavy tail (3x where a gap spans a change of content), and every
+decision rule loose enough to place something placed wrong rows and the anchors cascaded.
+Conclusion: on a 16 MP photo with a 160x120 thumbnail and no restart markers, the row of
+a piece is not locally decidable; a joint solution over the whole sequence of chains
+(the count's gap estimates with heavy-tailed tolerance, the thumbnail misfit and the seams
+scored together, dynamic programming like `place_sequence`) is the remaining route, a
+multi-day piece of work. Measuring tools in the session's scratch: `eval_place.py`
+(stretches at their place), `seam_debug.py` (every decision against the truth),
+`seam_oracle.py`.
 
 Waiting for the owner's choice (proposed, not started):
 1. Rescued thumbnail: let the thumbnail step, `destripe` and the hole colours use its real part.
