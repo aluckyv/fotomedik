@@ -33,6 +33,8 @@ CLOSE_SOS = 0.15  # fraction of differing bits for a certain SOS match
 # in; a right header for silently damaged tables decodes hundreds further.
 STRICT_MCUS = 64
 STRICT_SHARE = 1.0
+STRICT_MIN_OWN = 8  # an own header that decodes fewer MCUs than this is judged the old way (build 160 kept a
+# header whose repaired tables decoded nothing, DSC_4403 of the dense-head bench, and the photo came out broken)
 
 _POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.int32)
 
@@ -219,6 +221,8 @@ class ReferenceHeader(Recipe):
             return (clean_ivs, mcus, -(misfit if misfit is not None else 1e9), votes)
 
         frac, _misfit, _votes, cand, start, prof, (w, h), _clean, mcus = max(trials, key=rank)
+        if own_sr is None or own_mcus < STRICT_MIN_OWN:
+            strict = False  # the own tables decode nothing: they are not the right ones
         if strict and mcus <= own_mcus + max(STRICT_MCUS, STRICT_SHARE * own_mcus):
             ctx.note(self, f"own header kept: it decodes {own_mcus} MCU(s), the best reference {mcus}")
             return

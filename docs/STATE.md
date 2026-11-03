@@ -336,6 +336,17 @@ owner's card, scored against the originals (the set lives outside the repository
      passes ACCEPT in 58-92 % of the stretches: the reference recognises them, it cannot tell
      the row.
 
+Build 160 on the wedding set: picture rotted, repair good 0.89 / detail 0.50, enhanced
+good 0.92 / detail 0.82 (154: 0.77/0.38 and 0.84/0.55); thumbnail rotted: all 15 copies
+byte-identical pictures with a fresh preview, no enhanced copy. On the 1600 px benches
+(enhanced): dh good 0.42 -> 0.44, ssim 0.60 -> 0.62, detail 0.61 -> 0.48; dn unchanged
+(detail 0.61 -> 0.59). The detail drop is flat_ground doing what it is for (the smooth
+repair kept on flat ground, no invented texture there) on photos that are mostly lost
+(good 0.02-0.18); psnr/good/ssim did not move. One dh photo (DSC_4403) came out broken in
+160: R2 had mended its header so it parsed, its tables decoded nothing, and the strict
+rule kept them; build 161: an own header that decodes fewer than STRICT_MIN_OWN MCUs is
+judged the old way.
+
 ## Tried, and what was learnt
 
 - **Destripe without a thumbnail** (judging a block by its neighbours): made photos worse,
