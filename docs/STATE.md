@@ -4,7 +4,7 @@ Read this first in a new session. It says how the work is done, what the program
 what was tried and did not work, and what is open. Keep it up to date when something lands.
 (The repository is public: no personal photos, folder names or paths in here.)
 
-Last update: 2026-11-03, build 160 (159 was the first build since 154 that passed CI: the program ends with TerminateProcess; 160: R7 margin, no enhanced copy for a rotted preview alone).
+Last update: 2026-11-03, build 161 (159 was the first build since 154 that passed CI: the program ends with TerminateProcess; 160: R7 margin, no enhanced copy for a rotted preview alone; 161: R7 judges an own header that decodes nothing the old way).
 
 ## How the work is done
 
