@@ -529,10 +529,68 @@ def thumbnail_rgb(data: bytes) -> np.ndarray | None:
         return None
 
 
-def thumbnail_picture(data: bytes, shape) -> np.ndarray | None:
+PREVIEW_MIN_REAL = 0.10  # share of a rotted FlashPix preview that must be real for it to count
+
+
+def _same_shape(small: np.ndarray, shape) -> bool:
+    h, w = shape[:2]
+    return abs((small.shape[1] / small.shape[0]) / (w / h) - 1.0) <= 0.03
+
+
+def preview_rgb(source: bytes, small: np.ndarray | None, rescued: tuple | None, shape):
+    """The camera's larger FlashPix preview (Kodak: 640x480, see jpeg.fpxr) joined with
+    the thumbnail: (small, rescued, note). A whole preview replaces the thumbnail; a rotted
+    one is repaired like any photo and its real part laid over the thumbnail enlarged to
+    its size (with no thumbnail, its real part alone is a rescued thumbnail: RGB and mask).
+    Without a usable preview the inputs come back unchanged and the note is None."""
+    try:
+        from ..cli import repair_bytes
+        from ..jpeg.fpxr import screennail
+
+        blob = screennail(source)
+        if blob is None:
+            return small, rescued, None
+        ctx, rep = repair_bytes(blob, "preview.jpg", {})
+        img = Image.open(io.BytesIO(ctx.data))
+        img.load()
+        big = np.asarray(img.convert("RGB"))
+        if not _same_shape(big, shape) or (small is not None and big.shape[1] <= small.shape[1]):
+            return small, rescued, None
+        holes, _unknown = photo_masks(ctx.data, rep.holes, rep.unknown)
+        real = ~holes[: big.shape[0], : big.shape[1]]
+        share = float(real.mean())
+        size = f"{big.shape[1]}x{big.shape[0]}"
+        if share >= 0.999:
+            return big, None, f"the camera's {size} preview used instead of the thumbnail"
+        if share < PREVIEW_MIN_REAL:
+            return small, rescued, None
+        bh, bw = big.shape[:2]
+        under, under_real = None, None
+        if small is not None:
+            under, under_real = small, np.ones(small.shape[:2], bool)
+        elif rescued is not None:
+            under = rescued[0]
+            under_real = np.ones(under.shape[:2], bool) if rescued[1] is None else rescued[1]
+        if under is not None and _same_shape(under, shape):
+            base = np.asarray(Image.fromarray(under).resize((bw, bh), Image.BICUBIC))
+            base_real = np.asarray(Image.fromarray(under_real.astype(np.uint8) * 255).resize((bw, bh))) > 127
+        else:
+            base, base_real = np.zeros_like(big), np.zeros((bh, bw), bool)
+        joined = np.where(real[..., None], big, base)
+        known = real | base_real
+        note = f"the camera's {size} preview used where it survived ({100 * share:.0f} % of it)"
+        if known.all():
+            return joined, None, note
+        return None, (joined, known), note
+    except Exception:  # noqa: BLE001 - only a better map; the thumbnail still serves
+        return small, rescued, None
+
+
+def thumbnail_picture(data: bytes, shape, small: np.ndarray | None = None) -> np.ndarray | None:
     """The photo's embedded thumbnail (RGB) brought to `shape` (h, w), or None. It only
-    says where colours are: a stripe the thumbnail shows too is part of the picture."""
-    small = thumbnail_rgb(data)
+    says where colours are: a stripe the thumbnail shows too is part of the picture.
+    `small`: that thumbnail already in hand (e.g. the camera's larger preview)."""
+    small = thumbnail_rgb(data) if small is None else small
     if small is None:
         return None
     h, w = shape[:2]

@@ -402,7 +402,7 @@ class Enhancer:
         return True
 
     def _enhance(self, i: int, engine, steps, photos: _Photos) -> None:
-        from .enhance import Stopped, enhance_steps, photo_masks, save_jpeg, thumbnail_picture, thumbnail_rgb
+        from .enhance import Stopped, enhance_steps, photo_masks, preview_rgb, save_jpeg, thumbnail_picture, thumbnail_rgb
 
         rep = self.repaired[i]
         name = Path(rep.output_name).name
@@ -451,10 +451,16 @@ class Enhancer:
                     first.append(f"pieces put back by the thumbnail: {moved}{placed.pieces} stretches, "
                                  f"{100 * placed.share:.0f} % of the photo (the repair had "
                                  f"{100 * placed.repair_share:.0f} %; {time.perf_counter() - t0:.1f} s)")
+            rescued = rep.thumb if small is None else None
+            if source is not None and holes.any():
+                # Kodak cameras keep a 640x480 preview besides the thumbnail (the jigsaw above
+                # still works on the thumbnail it was measured on)
+                small, rescued, note = preview_rgb(Path(source).read_bytes(), small, rescued, arr.shape)
+                if note:
+                    first.append(note)
             burst = photos.burst_for(i, self.say) if "burst" in steps else None
             new, done = enhance_steps(arr, holes, unknown, engine, steps, burst, progress, self.quality, self.stop,
-                                      self.prompt, thumbnail_picture(data, arr.shape), small, keep,
-                                      rep.thumb if small is None else None)
+                                      self.prompt, thumbnail_picture(data, arr.shape, small), small, keep, rescued)
             done = first + done if done or first else done
         except Stopped:
             return
