@@ -52,7 +52,11 @@ def _dims(data: bytes) -> tuple[int | None, int | None]:
 def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | None = None) -> tuple[Context, FileReport]:
     diag = scan_bytes(data, name)
     ctx = Context(data=data, name=name, ref=ref, options=dict(options))
-    run_pipeline(ctx)
+    if not diag.has("overwritten"):
+        # a file overwritten by a repeated record holds no photo data: a header learned from
+        # the set made a grey "photo" of it (build 161: 11 such copies in one folder, several
+        # byte-identical), while lone files of the same kind were skipped
+        run_pipeline(ctx)
     w, h = _dims(ctx.data)
     rep = FileReport.from_context(ctx, findings_before=[f.to_dict() for f in diag.findings], width=w, height=h)
     rep.unknown = _unknown_holes(ctx)

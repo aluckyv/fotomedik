@@ -29,7 +29,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from .. import errlog
 from ..report.report import FileReport
@@ -419,9 +419,15 @@ class Enhancer:
         src = self.out / rep.output_name
         try:
             data = src.read_bytes()
-            img = Image.open(io.BytesIO(data))
-            exif = img.info.get("exif")
-            arr = np.asarray(img.convert("RGB"))
+            try:
+                img = Image.open(io.BytesIO(data))
+                exif = img.info.get("exif")
+                arr = np.asarray(img.convert("RGB"))
+            except (UnidentifiedImageError, OSError, ValueError):
+                # the repair could not make it a picture (build 161: six such files were
+                # logged as failures of the enhanced copy); nothing to enhance
+                self.say(f"Enhanced copy of {name} skipped: the repaired file does not open as a picture")
+                return
             holes, unknown = photo_masks(data, rep.holes, rep.unknown)
             small = thumbnail_rgb(data)
             keep, first = None, []

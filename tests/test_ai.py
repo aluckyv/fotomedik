@@ -93,6 +93,19 @@ def test_run_ai_writes_copy_next_to_repair(tmp_path, healthy_jpeg_rst):
     Image.open(tmp_path / "sub" / "x_enhanced.jpg").load()
 
 
+def test_run_ai_skips_a_repaired_file_that_does_not_open(tmp_path, healthy_jpeg_rst):
+    """No error is logged for a 'repaired' file that is still no picture (build 161: six)."""
+    from fotomedik import errlog
+
+    _ctx, rep = repair_bytes(_damaged(healthy_jpeg_rst), "x.jpg", {"time_budget": 0.0})
+    rep.holes = [{"mcu_first": 3, "mcu_count": 5, "reason": "test"}]
+    rep.output_name = "x.jpg"
+    (tmp_path / "x.jpg").write_bytes(b"\xff\xd8\xff\xdb" + bytes(5000))
+    run_ai([rep], tmp_path, engine=Engine(FakeSR(), FakeLama(), "CPU"))
+    assert rep.ai_output is None
+    assert not (tmp_path / errlog.LOG_NAME).exists() or errlog.count(tmp_path) == 0
+
+
 def test_block_means_are_kept_in_known_holes():
     from fotomedik.ai.enhance import keep_block_means
 

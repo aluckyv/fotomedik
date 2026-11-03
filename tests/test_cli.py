@@ -124,6 +124,22 @@ def test_cli_overwritten_file_gets_report_only(tmp_path):
     assert (out / "P0001.report.json").exists()
 
 
+def test_batch_overwritten_file_gets_no_copy_beside_healthy_ones(tmp_path, healthy_jpeg):
+    """Healthy photos teach the set a header; it must not be put on an overwritten file
+    (build 161 made grey 'photos' of them, several byte-identical)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.jpg").write_bytes(healthy_jpeg)
+    (src / "b.jpg").write_bytes(healthy_jpeg)
+    record = "\\\\?\\D:\\Photos\\P0001.JPG".encode("utf-16-le") + b"\x00\x00" + bytes(range(200))
+    (src / "P0001.JPG").write_bytes(record * 2000)
+    out = tmp_path / "out"
+    r = CliRunner().invoke(main, ["batch", str(src), "-o", str(out)])
+    assert r.exit_code == 0, r.output
+    assert (out / "a.jpg").exists()
+    assert not (out / "P0001.JPG").exists()
+
+
 def test_scan_damaged_soi_is_header_error(healthy_jpeg_rst):
     from fotomedik.scan.scanner import scan_bytes
 
