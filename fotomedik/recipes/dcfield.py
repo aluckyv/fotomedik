@@ -396,10 +396,10 @@ def _rescue_from(head: bytes, start: int, ref):
 
 
 def with_preview(data: bytes, got, shape):
-    """The thumbnail (YCbCr pixels, mask or None) joined with the camera's larger FlashPix
-    preview where one survived (Kodak: 640x480, four times finer: one of its pixels covers
-    less than an MCU row of a 16 MP photo, where the thumbnail's covers 2.6 rows and cannot
-    tell the row of a piece). Unchanged without a usable preview."""
+    """The camera's larger FlashPix preview in place of the thumbnail (YCbCr pixels, mask
+    or None) when the preview is whole (Kodak: 640x480, four times finer: one of its pixels
+    covers less than an MCU row of a 16 MP photo, where the thumbnail's covers 2.6 rows and
+    cannot tell the row of a piece). Unchanged otherwise."""
     if b"FPXR" not in data[: 1 << 20]:
         return got
     from ..ai.enhance import preview_rgb
@@ -412,7 +412,10 @@ def with_preview(data: bytes, got, shape):
         else:
             rescued = (rgb, np.asarray(got[1]) > 0.5)
     small, rescued, note = preview_rgb(data, small, rescued, shape)
-    if note is None:
+    if note is None or "instead of the thumbnail" not in note:
+        # only a whole preview: a rotted one joined with the thumbnail placed real stretches
+        # 40 MCU rows too low on a SARIMSAKLI photo (100_0219, error against the preview
+        # 14 -> 35); the enhanced copy still uses the joined one for colours
         return got
     if small is not None:
         return np.asarray(Image.fromarray(small).convert("YCbCr")), None
