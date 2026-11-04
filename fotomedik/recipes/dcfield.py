@@ -69,7 +69,6 @@ def vertical_reference(arr: np.ndarray, okm: np.ndarray) -> tuple[np.ndarray, np
     return val, dist
 
 
-MIX_ROWS = 3  # EXPERIMENT
 MELT = 0.75  # blur (block columns, as sigma) per block row of distance from the real row
 
 
@@ -163,21 +162,6 @@ def build_field(arr: np.ndarray, okm: np.ndarray, q: int, base: np.ndarray | Non
     sv = vertical_noise(arr, okm, q)
     if base is None:
         val, dist = vertical_reference(arr, okm)
-        mode = __import__("os").environ.get("FOTOMEDIK_FIELD", "vertical")  # EXPERIMENT
-        if mode in ("pullpush", "mix") and okm.any():
-            pp = pull_push(arr, okm)
-            if mode == "pullpush":
-                val = np.where(okm, arr, pp)
-            else:
-                rows = arr.shape[0]
-                ridx = np.arange(rows)[:, None]
-                ha = np.maximum.accumulate(np.where(okm, ridx, -1), axis=0) >= 0
-                hb = (np.minimum.accumulate(np.where(okm, ridx, rows)[::-1], axis=0)[::-1]) < rows
-                thin = ha & hb & (dist <= MIX_ROWS)
-                wv = np.clip((MIX_ROWS + 1 - dist) / MIX_ROWS, 0, 1)
-                val = np.where(okm, arr, np.where(thin, wv * val + (1 - wv) * pp, pp))
-            sigma = sv * (1.0 + 0.5 * np.maximum(0.0, dist - 1.0))
-            return Field(val, dist, np.where(np.isfinite(dist), sigma, sv * 4))
         # Known on one side only (e.g. everything below the last real row is lost): a
         # copied row turns into vertical streaks, so fade towards the picture's average
         # colour with the distance instead.
