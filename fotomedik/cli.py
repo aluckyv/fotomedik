@@ -54,7 +54,7 @@ def repair_bytes(data: bytes, name: str, options: dict, ref: CameraProfile | Non
     ctx = Context(data=data, name=name, ref=ref, options=dict(options))
     # levels out of the legal range only (a photo rebuilt after ransomware): the data is whole
     whole = diag.has("dc_out_of_range") and not any(
-        f.kind not in ("dc_out_of_range", "thumbnail_damaged", "no_eoi") for f in diag.findings)
+        f.kind not in ("dc_out_of_range", "damaged_rst", "thumbnail_damaged", "no_eoi") for f in diag.findings)
     if not diag.has("overwritten") and not whole:
         # a file overwritten by a repeated record holds no photo data: a header learned from
         # the set made a grey "photo" of it (build 161: 11 such copies in one folder, several
