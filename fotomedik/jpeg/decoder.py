@@ -226,6 +226,37 @@ def _predecode(data, start: int, end: int, pk, dri: int) -> dict:
     return dict(parallel.pmap(one, starts))
 
 
+def whole_without_dc_test(data: bytes, parse: M.ParseResult, ft: FrameTables) -> bool:
+    """Whether the scan decodes from start to end, every interval exactly and on its own
+    restart marker, once the DC range test is left out: the data is whole and only some
+    levels lie outside the legal range (viewers clamp them). Photos rebuilt after
+    ransomware are like that: a block sets the predictor of the data after the lost part
+    with a guessed level."""
+    if parse.scan_start is None or parse.eoi_offset is None:
+        return False
+    _comps, per_row, rows = _scan_components(ft)
+    total = per_row * rows
+    dri = ft.restart_interval
+    pk = kernel.packed_for(ft)
+    end = parse.eoi_offset + 2
+    pos, mcu, k = parse.scan_start, 0, 0
+    while mcu < total:
+        count = min(dri, total - mcu) if dri else total
+        preds = np.zeros(pk.ncomp, dtype=np.int32)
+        n, ename, *_r, end_off, end_bit, _bs, _dcv = kernel.decode_mcus(data, pos, 0, end, pk, preds, count,
+                                                                       check_dc=False)
+        if n != count or ename is not None:
+            return False
+        p = end_off + (1 if end_bit else 0)
+        mcu += count
+        if mcu >= total:
+            return p >= parse.eoi_offset - 2 or data[p : p + 2] == b"\xff\xd9"
+        if data[p : p + 2] != bytes((0xFF, 0xD0 + (k % 8))):
+            return False
+        pos, k = p + 2, k + 1
+    return True
+
+
 def decode_scan(data, parse: M.ParseResult, ft: FrameTables, *args, **kwargs) -> ScanResult:
     """Decode the scan (see _decode_scan). Whole-file decodes of immutable bytes are
     cached: the scanner and several recipes decode the same data. Callers must treat

@@ -36,6 +36,7 @@ STRINGS = {
             "no_eoi": "nedostaje završni marker",
             "damaged_rst": "oštećeni restart markeri",
             "thumbnail_damaged": "oštećena ugrađena sličica (pregled koji prikazuju galerije)",
+            "dc_out_of_range": "neki nivoi svetline su van dozvoljenog opsega; slika je cela i ostaje kakva jeste",
             "internal_error": "greška u programu pri obradi ovog fajla",
         },
         "recipe": {
@@ -86,6 +87,7 @@ STRINGS = {
             "no_eoi": "end marker missing",
             "damaged_rst": "damaged restart markers",
             "thumbnail_damaged": "damaged embedded thumbnail (the preview galleries show)",
+            "dc_out_of_range": "some brightness levels lie outside the legal range; the picture is whole and left as it is",
             "internal_error": "program error while processing this file",
         },
         "recipe": {

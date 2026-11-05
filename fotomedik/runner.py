@@ -89,7 +89,7 @@ def is_lost(rep: FileReport) -> bool:
     return verdict(rep) in LOST
 
 
-NOT_PICTURE = {"thumbnail_damaged"}  # findings about the header's preview, not the picture
+NOT_PICTURE = {"thumbnail_damaged", "dc_out_of_range"}  # the preview, or levels a viewer clamps: no damage to the picture
 
 
 def picture_damage(rep: FileReport) -> bool:

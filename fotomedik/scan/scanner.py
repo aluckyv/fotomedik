@@ -100,6 +100,14 @@ def scan_bytes(data: bytes, name: str = "") -> Diagnosis:
     d.total_intervals = len(sr.intervals)
     d.recovered_fraction = sr.clean_fraction
     bad = [iv for iv in sr.intervals if not iv.ok]
+    if bad and all(iv.error is not None and iv.error.reason in ("dc_range", "skipped") for iv in bad) \
+            and D.whole_without_dc_test(data, parse, ft):
+        # whole data with levels out of the legal range (a photo rebuilt after ransomware):
+        # nothing to repair - filling "holes" here threw away pictures viewers show whole
+        d.add("dc_out_of_range", "low", bad[0].byte_start,
+              "some brightness levels lie outside the legal range; the picture data is whole")
+        d.recovered_fraction = 1.0
+        bad = []
     d.bad_intervals = len(bad)
 
     errs = [iv.error for iv in bad if iv.error is not None and iv.error.reason != "skipped"]

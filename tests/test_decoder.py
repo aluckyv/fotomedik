@@ -175,3 +175,32 @@ def test_speed_1mp():
     dt = time.perf_counter() - t
     assert sr.error is None
     assert dt < 8.0, f"1 MP decode took {dt:.1f}s"
+
+
+def test_levels_out_of_range_with_whole_data_are_left_alone(healthy_jpeg):
+    """A photo rebuilt after ransomware: a run of blocks a little below black (out of the
+    legal DC range), every MCU decodes. It is not damage: the repair leaves it as it is
+    (before, everything after the first such block was thrown away and filled grey)."""
+    from fotomedik.cli import repair_bytes
+    from fotomedik.jpeg import decoder as D
+    from fotomedik.jpeg import markers as M
+    from fotomedik.jpeg.encoder import encode_flat_mcus
+    from fotomedik.jpeg.tables import FrameTables
+    from fotomedik.jpeg.writer import assemble
+
+    parse = M.parse_segments(healthy_jpeg)
+    ft = FrameTables.from_parse(parse)
+    comps, per_row, rows = D._scan_components(ft)
+    total = per_row * rows
+    q = {c.cid: ft.quant[ft.frame.component(c.cid).tq].dc for c in comps}
+    low = {c.cid: -(1024 + 40) // q[c.cid] if i == 0 else 0 for i, c in enumerate(comps)}  # below black
+    mid = {c.cid: 0 for c in comps}
+    preds = {c.cid: 0 for c in comps}
+    scan = encode_flat_mcus(ft, total // 2, mid, preds) + encode_flat_mcus(ft, total - total // 2, low, preds)
+    data = assemble(healthy_jpeg[: parse.scan_start], scan)
+    p2 = M.parse_segments(data)
+    assert D.decode_scan(data, p2, FrameTables.from_parse(p2)).error.reason == "dc_range"
+    assert D.whole_without_dc_test(data, p2, FrameTables.from_parse(p2))
+    ctx, rep = repair_bytes(data, "x.jpg", {})
+    assert ctx.data == data and rep.recovered_pct == 100.0
+    assert [f["kind"] for f in rep.findings] == ["dc_out_of_range"]
